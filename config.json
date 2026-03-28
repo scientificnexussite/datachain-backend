@@ -1,0 +1,17 @@
+{
+  "network": {
+    "name": "Scientific Nexus DataChain",
+    "p2p_port": 4001,
+    "api_port": 3001,
+    "max_peers": 50
+  },
+  "blockchain": {
+    "reward": 50,
+    "currency_symbol": "SYR",
+    "sub_unit": "Sats",
+    "genesis_date": "03/27/2026"
+  },
+  "peers": [
+    "/ip4/127.0.0.1/tcp/4001"
+  ]
+}

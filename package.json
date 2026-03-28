@@ -1,0 +1,23 @@
+{
+  "name": "datachain-node",
+  "version": "1.0.0",
+  "description": "Scientific Nexus DataChain P2P Node",
+  "main": "api.js",
+  "type": "module",
+  "scripts": {
+    "start": "node api.js",
+    "p2p": "node p2p.js"
+  },
+  "dependencies": {
+    "@libp2p/mdns": "^1.0.0",
+    "@libp2p/mplex": "^1.0.0",
+    "@libp2p/noise": "^1.0.0",
+    "@libp2p/tcp": "^1.0.0",
+    "body-parser": "^1.20.2",
+    "chalk": "^5.3.0",
+    "cors": "^2.8.5",
+    "crypto-js": "^4.2.0",
+    "express": "^4.19.2",
+    "libp2p": "^1.0.0"
+  }
+}

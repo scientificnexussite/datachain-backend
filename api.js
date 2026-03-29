@@ -27,7 +27,7 @@ if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0) {
 }
 
 // ======================== CORS MIDDLEWARE (Explicit) ========================
-app.use(cors()); // Keep the original cors() as well
+app.use(cors()); 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -41,6 +41,11 @@ app.use((req, res, next) => {
 app.use(bodyParser.json());
 
 // ======================== ROUTES ========================
+
+// 1. Root / Health Check (Crucial for Railway/Vercel to not return HTML 404)
+app.get('/', (req, res) => {
+  res.json({ status: "Scientific Nexus DataChain API Node is ONLINE", network: "SYRPTS" });
+});
 
 // Get the full DataChain ledger
 app.get('/blocks', (req, res) => {
@@ -62,41 +67,57 @@ app.get('/supply', (req, res) => {
 
 // Submit a new transaction
 app.post('/tx/new', (req, res) => {
-  const { from, to, amount, type } = req.body;
-  const tx = { from, to, amount, type, timestamp: Date.now() };
+  try {
+      const { from, to, amount, type } = req.body;
+      const tx = { from, to, amount, type, timestamp: Date.now() };
 
-  // Validate against current blockchain state
-  const senderBalance = nexusChain.getBalance(from);
-  if (!validator.validateTransaction(tx, senderBalance)) {
-    return res.status(400).json({ error: "Insufficient balance or invalid transaction." });
-  }
+      // Validate against current blockchain state
+      const senderBalance = nexusChain.getBalance(from);
+      if (!validator.validateTransaction(tx, senderBalance)) {
+        return res.status(400).json({ error: "Insufficient balance or invalid transaction." });
+      }
 
-  const success = mempool.addTransaction(tx);
-  if (success) {
-    res.status(201).json({ message: "Transaction added to mempool", tx });
-  } else {
-    res.status(400).json({ error: "Transaction failed validation" });
+      const success = mempool.addTransaction(tx);
+      if (success) {
+        res.status(201).json({ message: "Transaction added to mempool", tx });
+      } else {
+        res.status(400).json({ error: "Transaction failed validation" });
+      }
+  } catch (error) {
+      console.error(chalk.red("[TX ERROR]"), error);
+      res.status(500).json({ error: "Internal Server Error during transaction processing." });
   }
 });
 
 // Trigger mining of a new block
 app.post('/mine', (req, res) => {
-  const pendingTxs = mempool.getAndClear();
-  if (pendingTxs.length === 0) {
-    return res.status(400).json({ error: "No pending transactions to mine." });
-  }
+  try {
+      const pendingTxs = mempool.getAndClear();
+      if (pendingTxs.length === 0) {
+        return res.status(400).json({ error: "No pending transactions to mine." });
+      }
 
-  const success = nexusChain.addBlock(pendingTxs);
-  if (success) {
-    console.log(chalk.green.bold(`[CHAIN] Block ${nexusChain.getLatestBlock().index} successfully added to DataChain.`));
-    res.json({ message: "Block Mined", block: nexusChain.getLatestBlock() });
-  } else {
-    res.status(500).json({ error: "Fatal Error: Block validation failed during mining." });
+      const success = nexusChain.addBlock(pendingTxs);
+      if (success) {
+        console.log(chalk.green.bold(`[CHAIN] Block ${nexusChain.getLatestBlock().index} successfully added to DataChain.`));
+        res.json({ message: "Block Mined", block: nexusChain.getLatestBlock() });
+      } else {
+        res.status(500).json({ error: "Fatal Error: Block validation failed during mining." });
+      }
+  } catch (error) {
+      console.error(chalk.red("[MINE ERROR]"), error);
+      res.status(500).json({ error: "Internal Server Error during mining processing." });
   }
 });
 
+// JSON 404 Catch-All (Prevents HTML error pages from breaking frontend fetch checks)
+app.use((req, res) => {
+  res.status(404).json({ error: "API Node Endpoint Not Found" });
+});
+
 // ======================== START SERVER ========================
-app.listen(port, () => {
+// Explicitly binding to "0.0.0.0" ensures Railway external networking maps correctly
+app.listen(port, "0.0.0.0", () => {
   console.log(chalk.blue.bold(`--- SCIENTIFIC NEXUS API RUNNING ON PORT ${port} ---`));
-  console.log(chalk.white(`Railway URL: ${process.env.RAILWAY_PUBLIC_DOMAIN || 'localhost'}`));
+  console.log(chalk.white(`Railway URL: ${process.env.RAILWAY_PUBLIC_DOMAIN || 'Active'}`));
 });

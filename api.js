@@ -10,11 +10,10 @@ const app = express();
 const port = process.env.PORT || 3001;
 const nexusChain = new DataChain();
 
-// Initialise global supply
+// ======================== INITIAL SUPPLY ========================
 const MAX_SUPPLY = 3000000000;
 const SYSTEM_ADDRESS = "system";
 
-// Ensure system has the initial supply on startup
 if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0) {
   const initTx = {
     from: SYSTEM_ADDRESS,
@@ -27,10 +26,21 @@ if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0) {
   console.log(chalk.green(`[INIT] Initial supply of ${MAX_SUPPLY} SYR allocated to system address.`));
 }
 
-app.use(cors());
+// ======================== CORS MIDDLEWARE (Explicit) ========================
+app.use(cors()); // Keep the original cors() as well
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 app.use(bodyParser.json());
 
-// --- ROUTES ---
+// ======================== ROUTES ========================
 
 // Get the full DataChain ledger
 app.get('/blocks', (req, res) => {
@@ -44,67 +54,49 @@ app.get('/balance/:address', (req, res) => {
   res.json({ address, balance });
 });
 
-// FIXED: Returns remaining global supply from the system address
+// Get remaining global supply
 app.get('/supply', (req, res) => {
-  const supply = nexusChain.getBalance(SYSTEM_ADDRESS);
-  res.json({ supply });
+  const remaining = nexusChain.getRemainingSupply();
+  res.json({ remainingSupply: remaining });
 });
 
-// ADDED/FIXED: Receives transactions from Syrpts.html
-app.post('/transaction', (req, res) => {
-  const tx = req.body;
-  
-  if (!tx.from || !tx.to || !tx.amount) {
-      return res.status(400).json({ error: "Invalid transaction data. Requires from, to, and amount." });
+// Submit a new transaction
+app.post('/tx/new', (req, res) => {
+  const { from, to, amount, type } = req.body;
+  const tx = { from, to, amount, type, timestamp: Date.now() };
+
+  // Validate against current blockchain state
+  const senderBalance = nexusChain.getBalance(from);
+  if (!validator.validateTransaction(tx, senderBalance)) {
+    return res.status(400).json({ error: "Insufficient balance or invalid transaction." });
   }
 
-  const success = mempool.addTransaction({
-      ...tx,
-      timestamp: Date.now()
-  });
-
+  const success = mempool.addTransaction(tx);
   if (success) {
-      console.log(chalk.cyan(`[API] Transaction received: ${tx.from} -> ${tx.to} (${tx.amount} SYR)`));
-      res.json({ message: "Transaction added to mempool", tx });
+    res.status(201).json({ message: "Transaction added to mempool", tx });
   } else {
-      res.status(400).json({ error: "Transaction failed validation (Insufficient funds or invalid amount)." });
+    res.status(400).json({ error: "Transaction failed validation" });
   }
 });
 
 // Trigger mining of a new block
 app.post('/mine', (req, res) => {
-  mineNewBlock();
-  res.json({ message: "Mining triggered", currentBlock: nexusChain.getLatestBlock().index });
+  const pendingTxs = mempool.getAndClear();
+  if (pendingTxs.length === 0) {
+    return res.status(400).json({ error: "No pending transactions to mine." });
+  }
+
+  const success = nexusChain.addBlock(pendingTxs);
+  if (success) {
+    console.log(chalk.green.bold(`[CHAIN] Block ${nexusChain.getLatestBlock().index} successfully added to DataChain.`));
+    res.json({ message: "Block Mined", block: nexusChain.getLatestBlock() });
+  } else {
+    res.status(500).json({ error: "Fatal Error: Block validation failed during mining." });
+  }
 });
 
-// --- CORE LOGIC ---
-
-// FIXED: Helper function to mine without using internal 'fetch'
-function mineNewBlock() {
-    const pendingTxs = mempool.getAndClear();
-    if (pendingTxs.length === 0) return false;
-
-    const success = nexusChain.addBlock(pendingTxs);
-    if (success) {
-        console.log(chalk.green.bold(`[CHAIN] Block ${nexusChain.getLatestBlock().index} successfully added with ${pendingTxs.length} txs.`));
-        return true;
-    } else {
-        console.log(chalk.red(`[CHAIN] Block validation failed.`));
-        return false;
-    }
-}
-
-// Automatic mining every 10 seconds (Direct call logic)
-setInterval(() => {
-  const pendingCount = mempool.getPendingCount();
-  if (pendingCount > 0) {
-      console.log(chalk.blue(`[AUTO-MINER] Processing ${pendingCount} transactions...`));
-      mineNewBlock();
-  }
-}, 10000);
-
+// ======================== START SERVER ========================
 app.listen(port, () => {
-  console.log(chalk.yellow.bold(`\nDataChain API Online`));
-  console.log(chalk.white(`Railway URL: ${process.env.RAILWAY_STATIC_URL || 'localhost'}`));
-  console.log(chalk.white(`Port: ${port}`));
+  console.log(chalk.blue.bold(`--- SCIENTIFIC NEXUS API RUNNING ON PORT ${port} ---`));
+  console.log(chalk.white(`Railway URL: ${process.env.RAILWAY_PUBLIC_DOMAIN || 'localhost'}`));
 });

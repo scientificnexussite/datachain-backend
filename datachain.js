@@ -1,3 +1,4 @@
+import fs from 'fs';
 import CryptoJS from 'crypto-js';
 import chalk from 'chalk';
 import validator from './validator.js';
@@ -35,14 +36,49 @@ class Block {
 
 class DataChain {
   constructor() {
-    this.chain = [this.createGenesisBlock()];
-    this.difficulty = 2; // Adjust for faster/slower mining
+    this.chainFile = './chain.json';
+    this.difficulty = 2;
     this.state = new State();
-    this.state.rebuild(this.chain); // initial state from genesis
+    this.loadChain();
+  }
+
+  // Load ledger from disk to prevent data loss on restarts
+  loadChain() {
+    try {
+      if (fs.existsSync(this.chainFile)) {
+        const data = fs.readFileSync(this.chainFile, 'utf8');
+        const parsed = JSON.parse(data);
+        
+        this.chain = parsed.map(b => {
+           const block = new Block(b.index, b.timestamp, b.data, b.previousHash);
+           block.nonce = b.nonce;
+           block.hash = b.hash;
+           return block;
+        });
+        this.state.rebuild(this.chain);
+        console.log(chalk.green(`[DATACHAIN] Loaded ${this.chain.length} blocks from persistent storage.`));
+      } else {
+        this.chain = [this.createGenesisBlock()];
+        this.state.rebuild(this.chain);
+        this.saveChain();
+      }
+    } catch (err) {
+      console.log(chalk.red('[DATACHAIN] Error loading chain, starting fresh.'));
+      this.chain = [this.createGenesisBlock()];
+      this.state.rebuild(this.chain);
+    }
+  }
+
+  // Save the ledger to the disk
+  saveChain() {
+    try {
+       fs.writeFileSync(this.chainFile, JSON.stringify(this.chain, null, 2));
+    } catch(e) {
+       console.log(chalk.red('[DATACHAIN] Failed to save chain to disk.'));
+    }
   }
 
   createGenesisBlock() {
-    // Genesis block contains no transactions, just a string.
     return new Block(0, "03/27/2026", "Scientific Nexus Genesis Block", "0");
   }
 
@@ -51,7 +87,6 @@ class DataChain {
   }
 
   addBlock(transactions) {
-    // 1. Validate all transactions against current state (simulate)
     const tempState = new State();
     tempState.balances = { ...this.state.balances };
     for (const tx of transactions) {
@@ -61,7 +96,6 @@ class DataChain {
       }
     }
 
-    // 2. Create and mine block
     const newBlock = new Block(
       this.chain.length,
       Date.now(),
@@ -70,23 +104,20 @@ class DataChain {
     );
     newBlock.mineBlock(this.difficulty);
 
-    // 3. Validate block link
     if (!validator.validateBlock(newBlock, this.getLatestBlock())) {
       return false;
     }
 
-    // 4. Add block and commit state
     this.chain.push(newBlock);
-    this.state = tempState; // commit new state
+    this.state = tempState;
+    this.saveChain(); // Trigger save after successful validation
     return true;
   }
 
-  // Get balance for an address
   getBalance(address) {
     return this.state.getBalance(address);
   }
 
-  // Get remaining supply (balance of the "system" address)
   getRemainingSupply() {
     return this.state.getBalance("system");
   }

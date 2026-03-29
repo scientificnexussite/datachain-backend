@@ -4,6 +4,7 @@ import cors from 'cors';
 import chalk from 'chalk';
 import mempool from './mempool.js';
 import { DataChain } from './datachain.js';
+import validator from './validator.js';
 
 const app = express();
 const port = process.env.PORT || 3001;

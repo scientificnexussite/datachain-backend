@@ -41,7 +41,7 @@ function updateMarketEconomics() {
 updateMarketEconomics();
 
 // ======================== AUTO-MINER (RAILWAY SAFE) ========================
-[span_1](start_span)// Replaces the external fetch loop which fails on Railway[span_1](end_span)
+// Replaces the external fetch loop which fails on Railway
 setInterval(() => {
     const pendingCount = mempool.getPendingCount();
     if (pendingCount > 0) {

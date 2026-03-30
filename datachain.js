@@ -1,4 +1,6 @@
+// datachain.js
 import fs from 'fs';
+import path from 'path';
 import CryptoJS from 'crypto-js';
 import chalk from 'chalk';
 import validator from './validator.js';
@@ -16,11 +18,7 @@ class Block {
 
   calculateHash() {
     return CryptoJS.SHA256(
-      this.index +
-      this.previousHash +
-      this.timestamp +
-      JSON.stringify(this.data) +
-      this.nonce
+      this.index + this.previousHash + this.timestamp + JSON.stringify(this.data) + this.nonce
     ).toString();
   }
 
@@ -36,13 +34,17 @@ class Block {
 
 class DataChain {
   constructor() {
-    this.chainFile = './chain.json';
+    // ENHANCEMENT: Volume Pathing & Auto-Backup System
+    // If Railway provides a volume path, use it. Otherwise, default to local directory.
+    const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || '.';
+    this.chainFile = path.join(volumePath, 'chain.json');
+    this.backupFile = path.join(volumePath, 'chain_backup.json');
+    
     this.difficulty = 2;
     this.state = new State();
     this.loadChain();
   }
 
-  // Load ledger from disk to prevent data loss on restarts
   loadChain() {
     try {
       if (fs.existsSync(this.chainFile)) {
@@ -56,25 +58,48 @@ class DataChain {
            return block;
         });
         this.state.rebuild(this.chain);
-        console.log(chalk.green(`[DATACHAIN] Loaded ${this.chain.length} blocks from persistent storage.`));
+        console.log(chalk.green(`[DATACHAIN] Loaded ${this.chain.length} blocks securely from ${this.chainFile}.`));
       } else {
         this.chain = [this.createGenesisBlock()];
         this.state.rebuild(this.chain);
         this.saveChain();
       }
     } catch (err) {
-      console.log(chalk.red('[DATACHAIN] Error loading chain, starting fresh.'));
-      this.chain = [this.createGenesisBlock()];
-      this.state.rebuild(this.chain);
+      console.log(chalk.red('[DATACHAIN] Error loading main chain. Attempting backup recovery...'));
+      // Fallback to backup file if main file is corrupted
+      try {
+          if (fs.existsSync(this.backupFile)) {
+             const data = fs.readFileSync(this.backupFile, 'utf8');
+             const parsed = JSON.parse(data);
+             this.chain = parsed.map(b => {
+                 const block = new Block(b.index, b.timestamp, b.data, b.previousHash);
+                 block.nonce = b.nonce;
+                 block.hash = b.hash;
+                 return block;
+             });
+             this.state.rebuild(this.chain);
+             console.log(chalk.green('[DATACHAIN] Backup recovered successfully!'));
+          } else {
+             throw new Error("No backup found.");
+          }
+      } catch (backupErr) {
+          console.log(chalk.red('[DATACHAIN] Total failure. Starting fresh ledger.'));
+          this.chain = [this.createGenesisBlock()];
+          this.state.rebuild(this.chain);
+          this.saveChain();
+      }
     }
   }
 
-  // Save the ledger to the disk
   saveChain() {
     try {
+       // ENHANCEMENT: Clone to backup before overwriting the main file
+       if (fs.existsSync(this.chainFile)) {
+           fs.copyFileSync(this.chainFile, this.backupFile);
+       }
        fs.writeFileSync(this.chainFile, JSON.stringify(this.chain, null, 2));
     } catch(e) {
-       console.log(chalk.red('[DATACHAIN] Failed to save chain to disk.'));
+       console.log(chalk.red(`[DATACHAIN] Failed to save chain to disk: ${e.message}`));
     }
   }
 
@@ -110,22 +135,15 @@ class DataChain {
 
     this.chain.push(newBlock);
     this.state = tempState;
-    this.saveChain(); // Trigger save after successful validation
+    this.saveChain(); 
     return true;
   }
 
-  getBalance(address) {
-    return this.state.getBalance(address);
-  }
-
-  getRemainingSupply() {
-    return this.state.getBalance("system");
-  }
-
-  // NEW: Helper added to quickly calculate circulating supply for the API
+  getBalance(address) { return this.state.getBalance(address); }
+  getRemainingSupply() { return this.state.getBalance("system"); }
+  
   getCirculatingSupply(maxSupply = 3000000000) {
-    const remaining = this.getRemainingSupply();
-    return maxSupply - remaining;
+    return maxSupply - this.getRemainingSupply();
   }
 }
 

@@ -10,9 +10,12 @@ const app = express();
 const port = process.env.PORT || 3001;
 const nexusChain = new DataChain();
 
-// ======================== INITIAL SUPPLY ========================
+// ======================== INITIAL SUPPLY & ECONOMICS ========================
 const MAX_SUPPLY = 3000000000;
 const SYSTEM_ADDRESS = "system";
+
+// Base price variables
+let currentPrice = 0.0001; 
 
 if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0) {
   const initTx = {
@@ -26,7 +29,38 @@ if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0) {
   console.log(chalk.green(`[INIT] Initial supply of ${MAX_SUPPLY} SYR allocated to system address.`));
 }
 
-// ======================== CORS MIDDLEWARE (Explicit) ========================
+// Deterministic Price Calculation based on Supply
+function updateMarketEconomics() {
+    const remaining = nexusChain.getRemainingSupply();
+    const circulating = MAX_SUPPLY - remaining;
+    // Price increases slightly for every coin sold
+    currentPrice = 0.0001 + (circulating * 0.00000005); 
+}
+
+// Initial calculation on boot
+updateMarketEconomics();
+
+// ======================== AUTO-MINER (RAILWAY SAFE) ========================
+[span_1](start_span)// Replaces the external fetch loop which fails on Railway[span_1](end_span)
+setInterval(() => {
+    const pendingCount = mempool.getPendingCount();
+    if (pendingCount > 0) {
+        console.log(chalk.yellow(`[AUTO-MINER] Processing ${pendingCount} pending transactions...`));
+        const pendingTxs = mempool.getAndClear();
+        const success = nexusChain.addBlock(pendingTxs);
+        
+        if (success) {
+            console.log(chalk.green.bold(`[CHAIN] Auto-mined Block ${nexusChain.getLatestBlock().index}.`));
+            updateMarketEconomics(); // Update price after block is mined
+        } else {
+            console.log(chalk.red(`[AUTO-MINER] Block validation failed.`));
+            // Return to mempool if failed (simplified handling)
+            pendingTxs.forEach(tx => mempool.addTransaction(tx));
+        }
+    }
+}, 10000); // Mines every 10 seconds if mempool has transactions
+
+// ======================== CORS MIDDLEWARE ========================
 app.use(cors()); 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -42,7 +76,7 @@ app.use(bodyParser.json());
 
 // ======================== ROUTES ========================
 
-// 1. Root / Health Check (Crucial for Railway/Vercel to not return HTML 404)
+// 1. Root / Health Check
 app.get('/', (req, res) => {
   res.json({ status: "Scientific Nexus DataChain API Node is ONLINE", network: "SYRPTS" });
 });
@@ -59,7 +93,22 @@ app.get('/balance/:address', (req, res) => {
   res.json({ address, balance });
 });
 
-// Get remaining global supply
+// NEW: Unified Global Stats Endpoint (Fixes Price & Cap Resets)
+app.get('/stats', (req, res) => {
+  const remaining = nexusChain.getRemainingSupply();
+  const circulating = MAX_SUPPLY - remaining;
+  const marketCap = circulating * currentPrice;
+  
+  res.json({ 
+      maxSupply: MAX_SUPPLY,
+      remainingSupply: remaining,
+      circulatingSupply: circulating,
+      currentPrice: currentPrice,
+      marketCap: marketCap
+  });
+});
+
+// Legacy Endpoint (kept for compatibility)
 app.get('/supply', (req, res) => {
   const remaining = nexusChain.getRemainingSupply();
   res.json({ remainingSupply: remaining });
@@ -79,7 +128,7 @@ app.post('/tx/new', (req, res) => {
 
       const success = mempool.addTransaction(tx);
       if (success) {
-        res.status(201).json({ message: "Transaction added to mempool", tx });
+        res.status(201).json({ message: "Transaction added to mempool. Awaiting Auto-Miner.", tx });
       } else {
         res.status(400).json({ error: "Transaction failed validation" });
       }
@@ -89,7 +138,7 @@ app.post('/tx/new', (req, res) => {
   }
 });
 
-// Trigger mining of a new block
+// Manual Mining Trigger (Fallback)
 app.post('/mine', (req, res) => {
   try {
       const pendingTxs = mempool.getAndClear();
@@ -99,7 +148,8 @@ app.post('/mine', (req, res) => {
 
       const success = nexusChain.addBlock(pendingTxs);
       if (success) {
-        console.log(chalk.green.bold(`[CHAIN] Block ${nexusChain.getLatestBlock().index} successfully added to DataChain.`));
+        updateMarketEconomics();
+        console.log(chalk.green.bold(`[CHAIN] Block ${nexusChain.getLatestBlock().index} successfully added via manual trigger.`));
         res.json({ message: "Block Mined", block: nexusChain.getLatestBlock() });
       } else {
         res.status(500).json({ error: "Fatal Error: Block validation failed during mining." });
@@ -110,13 +160,12 @@ app.post('/mine', (req, res) => {
   }
 });
 
-// JSON 404 Catch-All (Prevents HTML error pages from breaking frontend fetch checks)
+// JSON 404 Catch-All
 app.use((req, res) => {
   res.status(404).json({ error: "API Node Endpoint Not Found" });
 });
 
 // ======================== START SERVER ========================
-// Explicitly binding to "0.0.0.0" ensures Railway external networking maps correctly
 app.listen(port, "0.0.0.0", () => {
   console.log(chalk.blue.bold(`--- SCIENTIFIC NEXUS API RUNNING ON PORT ${port} ---`));
   console.log(chalk.white(`Railway URL: ${process.env.RAILWAY_PUBLIC_DOMAIN || 'Active'}`));

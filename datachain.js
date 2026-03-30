@@ -121,6 +121,12 @@ class DataChain {
   getRemainingSupply() {
     return this.state.getBalance("system");
   }
+
+  // NEW: Helper added to quickly calculate circulating supply for the API
+  getCirculatingSupply(maxSupply = 3000000000) {
+    const remaining = this.getRemainingSupply();
+    return maxSupply - remaining;
+  }
 }
 
 export { Block, DataChain };

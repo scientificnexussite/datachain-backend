@@ -1,3 +1,4 @@
+// api.js
 import express from 'express';
 import bodyParser from 'body-parser';
 import cors from 'cors';
@@ -14,8 +15,8 @@ const nexusChain = new DataChain();
 const MAX_SUPPLY = 3000000000;
 const SYSTEM_ADDRESS = "system";
 
-// Base price variables
-let currentPrice = 0.0001; 
+// UPDATED: Base price lowered to 0.000001
+let currentPrice = 0.000001; 
 
 if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0) {
   const initTx = {
@@ -33,15 +34,13 @@ if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0) {
 function updateMarketEconomics() {
     const remaining = nexusChain.getRemainingSupply();
     const circulating = MAX_SUPPLY - remaining;
-    // Price increases slightly for every coin sold
-    currentPrice = 0.0001 + (circulating * 0.00000005); 
+    // UPDATED: Base price lowered here as well
+    currentPrice = 0.000001 + (circulating * 0.00000005); 
 }
 
-// Initial calculation on boot
 updateMarketEconomics();
 
 // ======================== AUTO-MINER (RAILWAY SAFE) ========================
-// Replaces the external fetch loop which fails on Railway
 setInterval(() => {
     const pendingCount = mempool.getPendingCount();
     if (pendingCount > 0) {
@@ -54,11 +53,10 @@ setInterval(() => {
             updateMarketEconomics(); // Update price after block is mined
         } else {
             console.log(chalk.red(`[AUTO-MINER] Block validation failed.`));
-            // Return to mempool if failed (simplified handling)
             pendingTxs.forEach(tx => mempool.addTransaction(tx));
         }
     }
-}, 10000); // Mines every 10 seconds if mempool has transactions
+}, 10000); 
 
 // ======================== CORS MIDDLEWARE ========================
 app.use(cors()); 
@@ -71,29 +69,17 @@ app.use((req, res, next) => {
   }
   next();
 });
-
 app.use(bodyParser.json());
 
 // ======================== ROUTES ========================
-
-// 1. Root / Health Check
-app.get('/', (req, res) => {
-  res.json({ status: "Scientific Nexus DataChain API Node is ONLINE", network: "SYRPTS" });
-});
-
-// Get the full DataChain ledger
-app.get('/blocks', (req, res) => {
-  res.json(nexusChain.chain);
-});
-
-// Get balance for an address
+app.get('/', (req, res) => { res.json({ status: "Scientific Nexus DataChain API Node is ONLINE", network: "SYRPTS" }); });
+app.get('/blocks', (req, res) => { res.json(nexusChain.chain); });
 app.get('/balance/:address', (req, res) => {
   const address = req.params.address;
   const balance = nexusChain.getBalance(address);
   res.json({ address, balance });
 });
 
-// NEW: Unified Global Stats Endpoint (Fixes Price & Cap Resets)
 app.get('/stats', (req, res) => {
   const remaining = nexusChain.getRemainingSupply();
   const circulating = MAX_SUPPLY - remaining;
@@ -108,19 +94,13 @@ app.get('/stats', (req, res) => {
   });
 });
 
-// Legacy Endpoint (kept for compatibility)
-app.get('/supply', (req, res) => {
-  const remaining = nexusChain.getRemainingSupply();
-  res.json({ remainingSupply: remaining });
-});
+app.get('/supply', (req, res) => { res.json({ remainingSupply: nexusChain.getRemainingSupply() }); });
 
-// Submit a new transaction
 app.post('/tx/new', (req, res) => {
   try {
       const { from, to, amount, type } = req.body;
       const tx = { from, to, amount, type, timestamp: Date.now() };
 
-      // Validate against current blockchain state
       const senderBalance = nexusChain.getBalance(from);
       if (!validator.validateTransaction(tx, senderBalance)) {
         return res.status(400).json({ error: "Insufficient balance or invalid transaction." });
@@ -134,36 +114,30 @@ app.post('/tx/new', (req, res) => {
       }
   } catch (error) {
       console.error(chalk.red("[TX ERROR]"), error);
-      res.status(500).json({ error: "Internal Server Error during transaction processing." });
+      res.status(500).json({ error: "Internal Server Error." });
   }
 });
 
-// Manual Mining Trigger (Fallback)
 app.post('/mine', (req, res) => {
   try {
       const pendingTxs = mempool.getAndClear();
-      if (pendingTxs.length === 0) {
-        return res.status(400).json({ error: "No pending transactions to mine." });
-      }
+      if (pendingTxs.length === 0) return res.status(400).json({ error: "No pending transactions." });
 
       const success = nexusChain.addBlock(pendingTxs);
       if (success) {
         updateMarketEconomics();
-        console.log(chalk.green.bold(`[CHAIN] Block ${nexusChain.getLatestBlock().index} successfully added via manual trigger.`));
+        console.log(chalk.green.bold(`[CHAIN] Block ${nexusChain.getLatestBlock().index} successfully added.`));
         res.json({ message: "Block Mined", block: nexusChain.getLatestBlock() });
       } else {
-        res.status(500).json({ error: "Fatal Error: Block validation failed during mining." });
+        res.status(500).json({ error: "Fatal Error: Block validation failed." });
       }
   } catch (error) {
       console.error(chalk.red("[MINE ERROR]"), error);
-      res.status(500).json({ error: "Internal Server Error during mining processing." });
+      res.status(500).json({ error: "Internal Server Error." });
   }
 });
 
-// JSON 404 Catch-All
-app.use((req, res) => {
-  res.status(404).json({ error: "API Node Endpoint Not Found" });
-});
+app.use((req, res) => { res.status(404).json({ error: "API Node Endpoint Not Found" }); });
 
 // ======================== START SERVER ========================
 app.listen(port, "0.0.0.0", () => {

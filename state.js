@@ -6,16 +6,18 @@ class State {
 
   // Apply a single transaction, return false if invalid
   applyTransaction(tx) {
-    const { from, to, amount } = tx;
+    const { from, to, amount, type } = tx;
     
-    // Special case: mining reward or initial supply
-    if (from === "system") {
+    // FIX: Only allow creation of coins out of thin air during the initial Genesis MINT
+    if (type === "MINT" && from === "system" && to === "system") {
       this.balances[to] = (this.balances[to] || 0) + amount;
       return true;
     }
 
+    // FIX: For all other transactions (including buying from system), properly deduct balance
     const senderBalance = this.balances[from] || 0;
     if (senderBalance < amount) return false;
+    
     this.balances[from] = senderBalance - amount;
     this.balances[to] = (this.balances[to] || 0) + amount;
     return true;

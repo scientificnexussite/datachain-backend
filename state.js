@@ -1,20 +1,36 @@
 // state.js
 class State {
   constructor() {
-    this.balances = {};  // address -> balance (in SYR)
+    this.balances = {};     // address -> balance (in SYR)
+    this.usd_balances = {}; // NEW: address -> balance (in USD)
   }
 
+  // ======================== NEW: USD METHODS ========================
+  getUsd(address) {
+    return this.usd_balances[address] || 0;
+  }
+
+  addUsd(address, amount) {
+    const current = this.getUsd(address);
+    this.usd_balances[address] = current + parseFloat(amount);
+  }
+
+  setUsd(address, amount) {
+    this.usd_balances[address] = parseFloat(amount);
+  }
+
+  // ======================== SYR TRANSACTIONS ========================
   // Apply a single transaction, return false if invalid
   applyTransaction(tx) {
     const { from, to, amount, type } = tx;
     
-    // FIX: Only allow creation of coins out of thin air during the initial Genesis MINT
+    // Only allow creation of coins out of thin air during the initial Genesis MINT
     if (type === "MINT" && from === "system" && to === "system") {
       this.balances[to] = (this.balances[to] || 0) + amount;
       return true;
     }
 
-    // FIX: For all other transactions (including buying from system), properly deduct balance
+    // For all other transactions (including buying from system), properly deduct balance
     const senderBalance = this.balances[from] || 0;
     if (senderBalance < amount) return false;
     

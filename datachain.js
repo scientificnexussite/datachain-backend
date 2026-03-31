@@ -34,8 +34,7 @@ class Block {
 
 class DataChain {
   constructor() {
-    // ENHANCEMENT: Volume Pathing & Auto-Backup System
-    // If Railway provides a volume path, use it. Otherwise, default to local directory.
+    // Volume Pathing & Auto-Backup System
     const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || '.';
     this.chainFile = path.join(volumePath, 'chain.json');
     this.backupFile = path.join(volumePath, 'chain_backup.json');
@@ -51,13 +50,28 @@ class DataChain {
         const data = fs.readFileSync(this.chainFile, 'utf8');
         const parsed = JSON.parse(data);
         
-        this.chain = parsed.map(b => {
+        let chainArray;
+        let loadedUsd = {};
+
+        // NEW: Handle legacy chain arrays vs new persistent object format
+        if (Array.isArray(parsed)) {
+            chainArray = parsed; // Legacy format migration
+        } else {
+            chainArray = parsed.chain || [];
+            loadedUsd = parsed.usdBalances || {}; // Load persistent USD
+        }
+
+        this.chain = chainArray.map(b => {
            const block = new Block(b.index, b.timestamp, b.data, b.previousHash);
            block.nonce = b.nonce;
            block.hash = b.hash;
            return block;
         });
+        
         this.state.rebuild(this.chain);
+        // Inject persistent USD back into state memory
+        this.state.usd_balances = loadedUsd;
+
         console.log(chalk.green(`[DATACHAIN] Loaded ${this.chain.length} blocks securely from ${this.chainFile}.`));
       } else {
         this.chain = [this.createGenesisBlock()];
@@ -66,18 +80,23 @@ class DataChain {
       }
     } catch (err) {
       console.log(chalk.red('[DATACHAIN] Error loading main chain. Attempting backup recovery...'));
-      // Fallback to backup file if main file is corrupted
       try {
           if (fs.existsSync(this.backupFile)) {
              const data = fs.readFileSync(this.backupFile, 'utf8');
              const parsed = JSON.parse(data);
-             this.chain = parsed.map(b => {
+             
+             let chainArray = Array.isArray(parsed) ? parsed : (parsed.chain || []);
+             let loadedUsd = Array.isArray(parsed) ? {} : (parsed.usdBalances || {});
+
+             this.chain = chainArray.map(b => {
                  const block = new Block(b.index, b.timestamp, b.data, b.previousHash);
                  block.nonce = b.nonce;
                  block.hash = b.hash;
                  return block;
              });
              this.state.rebuild(this.chain);
+             this.state.usd_balances = loadedUsd;
+             
              console.log(chalk.green('[DATACHAIN] Backup recovered successfully!'));
           } else {
              throw new Error("No backup found.");
@@ -93,11 +112,16 @@ class DataChain {
 
   saveChain() {
     try {
-       // ENHANCEMENT: Clone to backup before overwriting the main file
+       // Clone to backup before overwriting the main file
        if (fs.existsSync(this.chainFile)) {
            fs.copyFileSync(this.chainFile, this.backupFile);
        }
-       fs.writeFileSync(this.chainFile, JSON.stringify(this.chain, null, 2));
+       // NEW: Save both the blockchain array and the USD object
+       const dataToSave = {
+           chain: this.chain,
+           usdBalances: this.state.usd_balances
+       };
+       fs.writeFileSync(this.chainFile, JSON.stringify(dataToSave, null, 2));
     } catch(e) {
        console.log(chalk.red(`[DATACHAIN] Failed to save chain to disk: ${e.message}`));
     }
@@ -114,6 +138,9 @@ class DataChain {
   addBlock(transactions) {
     const tempState = new State();
     tempState.balances = { ...this.state.balances };
+    // Preserve USD balances during block temp-state checks
+    tempState.usd_balances = { ...this.state.usd_balances }; 
+    
     for (const tx of transactions) {
       if (!tempState.applyTransaction(tx)) {
         console.log(chalk.red(`[VALIDATION] Transaction invalid: ${JSON.stringify(tx)}`));

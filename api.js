@@ -15,8 +15,8 @@ const nexusChain = new DataChain();
 const MAX_SUPPLY = 3000000000;
 const SYSTEM_ADDRESS = "system";
 
-// UPDATED: Base price lowered to 0.000001
-let currentPrice = 0.000001; 
+// FIX: Base price officially lowered to 0.00000001
+let currentPrice = 0.00000001; 
 
 if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0) {
   const initTx = {
@@ -34,8 +34,8 @@ if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0) {
 function updateMarketEconomics() {
     const remaining = nexusChain.getRemainingSupply();
     const circulating = MAX_SUPPLY - remaining;
-    // UPDATED: Base price lowered here as well
-    currentPrice = 0.000001 + (circulating * 0.00000005); 
+    // FIX: Base price lowered here as well to maintain accurate market scaling
+    currentPrice = 0.00000001 + (circulating * 0.00000005); 
 }
 
 updateMarketEconomics();

@@ -50,7 +50,7 @@ const requireAuth = async (req, res, next) => {
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
         return res.status(401).json({ error: "Unauthorized: Missing Bearer Token" });
     }
-    [cite_start]const token = authHeader.split('Bearer ')[1];
+    const token = authHeader.split('Bearer ')[1];
     try {
         const decodedToken = await admin.auth().verifyIdToken(token);
         req.user = decodedToken; 
@@ -78,7 +78,7 @@ const pendingCryptoPayments = {};
 // ======================== INITIAL SUPPLY & ECONOMICS ========================
 const MAX_SUPPLY = 3000000000;
 const SYSTEM_ADDRESS = "system";
-let currentPrice = 0.00000001; 
+let currentPrice = 0; 
 
 if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0) {
   const initTx = { from: SYSTEM_ADDRESS, to: SYSTEM_ADDRESS, amount: MAX_SUPPLY, type: "MINT", timestamp: Date.now() };
@@ -89,7 +89,7 @@ if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0) {
 function updateMarketEconomics() {
     const remaining = nexusChain.getRemainingSupply();
     const circulating = MAX_SUPPLY - remaining;
-    const systemPrice = 0.00000001 + (circulating * 0.00000005); 
+    const systemPrice = 0 + (circulating * 0.00000005); 
     
     // NEW: Price is now Market-Driven. Bond curve math is kept as fallback.
     if (menuBook.lastTradePrice > 0) {

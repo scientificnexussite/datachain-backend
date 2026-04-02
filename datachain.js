@@ -34,10 +34,10 @@ class Block {
 
 class DataChain {
   constructor() {
-    // Volume Pathing & Auto-Backup System
     const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || '.';
     this.chainFile = path.join(volumePath, 'chain.json');
     this.backupFile = path.join(volumePath, 'chain_backup.json');
+    this.tempFile = path.join(volumePath, 'chain.json.tmp'); // Security: Atomic Writes
     
     this.difficulty = 2;
     this.state = new State();
@@ -50,16 +50,8 @@ class DataChain {
         const data = fs.readFileSync(this.chainFile, 'utf8');
         const parsed = JSON.parse(data);
         
-        let chainArray;
-        let loadedUsd = {};
-
-        // NEW: Handle legacy chain arrays vs new persistent object format
-        if (Array.isArray(parsed)) {
-            chainArray = parsed; // Legacy format migration
-        } else {
-            chainArray = parsed.chain || [];
-            loadedUsd = parsed.usdBalances || {}; // Load persistent USD
-        }
+        let chainArray = Array.isArray(parsed) ? parsed : (parsed.chain || []);
+        let loadedUsd = Array.isArray(parsed) ? {} : (parsed.usdBalances || {});
 
         this.chain = chainArray.map(b => {
            const block = new Block(b.index, b.timestamp, b.data, b.previousHash);
@@ -69,17 +61,14 @@ class DataChain {
         });
         
         this.state.rebuild(this.chain);
-        // Inject persistent USD back into state memory
         this.state.usd_balances = loadedUsd;
-
-        console.log(chalk.green(`[DATACHAIN] Loaded ${this.chain.length} blocks securely from ${this.chainFile}.`));
       } else {
         this.chain = [this.createGenesisBlock()];
         this.state.rebuild(this.chain);
         this.saveChain();
       }
     } catch (err) {
-      console.log(chalk.red('[DATACHAIN] Error loading main chain. Attempting backup recovery...'));
+      console.log(chalk.red('[DATACHAIN] Main chain load failed. Attempting backup recovery...'));
       try {
           if (fs.existsSync(this.backupFile)) {
              const data = fs.readFileSync(this.backupFile, 'utf8');
@@ -96,8 +85,6 @@ class DataChain {
              });
              this.state.rebuild(this.chain);
              this.state.usd_balances = loadedUsd;
-             
-             console.log(chalk.green('[DATACHAIN] Backup recovered successfully!'));
           } else {
              throw new Error("No backup found.");
           }
@@ -112,53 +99,40 @@ class DataChain {
 
   saveChain() {
     try {
-       // Clone to backup before overwriting the main file
-       if (fs.existsSync(this.chainFile)) {
-           fs.copyFileSync(this.chainFile, this.backupFile);
-       }
-       // NEW: Save both the blockchain array and the USD object
-       const dataToSave = {
-           chain: this.chain,
-           usdBalances: this.state.usd_balances
-       };
-       fs.writeFileSync(this.chainFile, JSON.stringify(dataToSave, null, 2));
+       // Backup old chain
+       if (fs.existsSync(this.chainFile)) fs.copyFileSync(this.chainFile, this.backupFile);
+       
+       const dataToSave = { chain: this.chain, usdBalances: this.state.usd_balances };
+       
+       // SECURITY: Atomic File Writing. Write to temp, then rename.
+       // Prevents JSON corruption if the node crashes exactly during fs.writeFileSync
+       fs.writeFileSync(this.tempFile, JSON.stringify(dataToSave, null, 2));
+       fs.renameSync(this.tempFile, this.chainFile);
+       
     } catch(e) {
-       console.log(chalk.red(`[DATACHAIN] Failed to save chain to disk: ${e.message}`));
+       console.log(chalk.red(`[DATACHAIN] Failed to save chain: ${e.message}`));
     }
   }
 
-  createGenesisBlock() {
-    return new Block(0, "03/27/2026", "Scientific Nexus Genesis Block", "0");
-  }
+  createGenesisBlock() { return new Block(0, "03/27/2026", "Scientific Nexus Genesis Block", "0"); }
+  getLatestBlock() { return this.chain[this.chain.length - 1]; }
 
-  getLatestBlock() {
-    return this.chain[this.chain.length - 1];
-  }
-
-  addBlock(transactions) {
+  addBlock(transactions, currentPrice = 0) {
     const tempState = new State();
     tempState.balances = { ...this.state.balances };
-    // Preserve USD balances during block temp-state checks
     tempState.usd_balances = { ...this.state.usd_balances }; 
     
     for (const tx of transactions) {
-      if (!tempState.applyTransaction(tx)) {
-        console.log(chalk.red(`[VALIDATION] Transaction invalid: ${JSON.stringify(tx)}`));
+      if (!tempState.applyTransaction(tx, currentPrice)) {
+        console.log(chalk.red(`[VALIDATION] Transaction rejected in state simulation: ${JSON.stringify(tx)}`));
         return false;
       }
     }
 
-    const newBlock = new Block(
-      this.chain.length,
-      Date.now(),
-      transactions,
-      this.getLatestBlock().hash
-    );
+    const newBlock = new Block(this.chain.length, Date.now(), transactions, this.getLatestBlock().hash);
     newBlock.mineBlock(this.difficulty);
 
-    if (!validator.validateBlock(newBlock, this.getLatestBlock())) {
-      return false;
-    }
+    if (!validator.validateBlock(newBlock, this.getLatestBlock())) return false;
 
     this.chain.push(newBlock);
     this.state = tempState;
@@ -168,10 +142,6 @@ class DataChain {
 
   getBalance(address) { return this.state.getBalance(address); }
   getRemainingSupply() { return this.state.getBalance("system"); }
-  
-  getCirculatingSupply(maxSupply = 3000000000) {
-    return maxSupply - this.getRemainingSupply();
-  }
 }
 
 export { Block, DataChain };

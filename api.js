@@ -27,6 +27,10 @@ try {
 }
 
 const app = express();
+
+// NEW FIX: Trust Railway's proxy to allow express-rate-limit to function correctly
+app.set('trust proxy', 1);
+
 const port = process.env.PORT || 3001;
 const nexusChain = new DataChain();
 
@@ -50,7 +54,7 @@ const requireAuth = async (req, res, next) => {
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
         return res.status(401).json({ error: "Unauthorized: Missing Bearer Token" });
     }
-    const token = authHeader.split('Bearer ')[1];
+    [cite_start]const token = authHeader.split('Bearer ')[1];
     try {
         const decodedToken = await admin.auth().verifyIdToken(token);
         req.user = decodedToken; 

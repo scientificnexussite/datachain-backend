@@ -5,7 +5,7 @@ class MenuBook {
   constructor() {
     this.bids = []; 
     this.asks = []; 
-    this.lastTradePrice = 0.00000001; // FIX: Strict 0.00000001 start
+    this.lastTradePrice = 0.00000001; 
     this.orderCounter = 0;
   }
 
@@ -18,8 +18,8 @@ class MenuBook {
   }
 
   getSpread() {
-    const highestBid = this.bids.length > 0 ? this.bids.priceUsd : 0;
-    const lowestAsk = this.asks.length > 0 ? this.asks.priceUsd : 0;
+    const highestBid = this.bids.length > 0 ? this.bids[0].priceUsd : 0;
+    const lowestAsk = this.asks.length > 0 ? this.asks[0].priceUsd : 0;
     const spread = (highestBid > 0 && lowestAsk > 0) ? (lowestAsk - highestBid) : 0;
     return { highestBid, lowestAsk, spread, lastTradePrice: this.lastTradePrice };
   }
@@ -41,13 +41,12 @@ class MenuBook {
     let remaining = amountSyr;
     let totalUsdCost = 0;
     let trades = [];
-    let initialPrice = 0;
-
+    
     const book = side === 'BUY' ? this.asks : this.bids;
-    if (book.length > 0) initialPrice = book.priceUsd;
+    let initialPrice = book.length > 0 ? book[0].priceUsd : this.lastTradePrice;
 
     while (remaining > 0 && book.length > 0) {
-      const topOrder = book;
+      const topOrder = book[0]; 
       
       if (topOrder.uid === uid && topOrder.uid !== 'system') break; 
 
@@ -68,7 +67,7 @@ class MenuBook {
         price: topOrder.priceUsd
       });
 
-      this.lastTradePrice = topOrder.priceUsd;
+      this.lastTradePrice = topOrder.priceUsd; // Persistent price tracking synced with API
       totalUsdCost += tradeUsd;
       remaining -= tradeAmount;
       topOrder.amountSyr -= tradeAmount;

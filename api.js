@@ -80,9 +80,9 @@ const pendingCryptoPayments = {};
 // ======================== INITIAL SUPPLY & ECONOMICS ========================
 const MAX_SUPPLY = 3000000000;
 const SYSTEM_ADDRESS = "system";
-let currentPrice = 0.00000001; // FIX: Baseline mathematical start
+let currentPrice = 0.00000001; 
 
-if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0) {
+if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0 && nexusChain.chain.length <= 1) {
   const initTx = { from: SYSTEM_ADDRESS, to: SYSTEM_ADDRESS, amount: MAX_SUPPLY, type: "MINT", timestamp: Date.now() };
   nexusChain.addBlock([initTx]);
   console.log(chalk.green(`[INIT] Initial supply of ${MAX_SUPPLY} SYR allocated.`));
@@ -92,16 +92,21 @@ function updateMarketEconomics() {
     const remaining = nexusChain.getRemainingSupply();
     const circulating = MAX_SUPPLY - remaining;
     
-    // FIX: Math exactly follows the 0.00000001 starting point
-    const systemPrice = 0.00000001 + (circulating * 0.00000005); 
+    // Dynamic AMM Bonding Curve (Accelerated Growth Model)
+    const growthFactor = circulating / MAX_SUPPLY;
+    const baseline = 0.00000001;
+    const scarcityMultiplier = 150; 
     
-    if (menuBook.lastTradePrice > 0.00000001) {
-        currentPrice = menuBook.lastTradePrice;
-    } else {
-        currentPrice = systemPrice;
+    // Utilizes exponential math for a realistic market curve
+    const systemPrice = baseline + (scarcityMultiplier * Math.pow(growthFactor, 2)); 
+    
+    // PRICE MEMORY GUARD: Forces synchronization, preventing the price from dropping to baseline on reboot
+    currentPrice = Math.max(systemPrice, currentPrice, menuBook.lastTradePrice);
+    if (menuBook.lastTradePrice < currentPrice) {
+        menuBook.lastTradePrice = currentPrice;
     }
 
-    // FIX: Inject system supply into Menu Book to solve "No Liquidity" errors
+    // Inject system supply into Menu Book 
     menuBook.asks = menuBook.asks.filter(a => a.uid !== "system");
     if (remaining > 0) {
         menuBook.asks.push({

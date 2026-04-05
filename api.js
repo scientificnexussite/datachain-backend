@@ -10,7 +10,7 @@ import admin from 'firebase-admin';
 import mempool from './mempool.js';
 import { DataChain } from './datachain.js';
 import validator from './validator.js';
-import menuBook from './menubook.js'; // NEW: Menu Book Integration
+import menuBook from './menubook.js'; 
 import { Client, Environment, LogLevel, OrdersController } from '@paypal/paypal-server-sdk';
 
 // ======================== FIREBASE ADMIN SETUP ========================
@@ -27,8 +27,6 @@ try {
 }
 
 const app = express();
-
-// NEW FIX: Trust Railway's proxy to allow express-rate-limit to function correctly
 app.set('trust proxy', 1);
 
 const port = process.env.PORT || 3001;
@@ -54,7 +52,7 @@ const requireAuth = async (req, res, next) => {
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
         return res.status(401).json({ error: "Unauthorized: Missing Bearer Token" });
     }
-    const token = authHeader.split('Bearer ')[1];
+    [cite_start]const token = authHeader.split('Bearer ')[1];
     try {
         const decodedToken = await admin.auth().verifyIdToken(token);
         req.user = decodedToken; 
@@ -82,7 +80,7 @@ const pendingCryptoPayments = {};
 // ======================== INITIAL SUPPLY & ECONOMICS ========================
 const MAX_SUPPLY = 3000000000;
 const SYSTEM_ADDRESS = "system";
-let currentPrice = 0; 
+let currentPrice = 0.00000001; // FIX: Baseline mathematical start
 
 if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0) {
   const initTx = { from: SYSTEM_ADDRESS, to: SYSTEM_ADDRESS, amount: MAX_SUPPLY, type: "MINT", timestamp: Date.now() };
@@ -93,13 +91,27 @@ if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0) {
 function updateMarketEconomics() {
     const remaining = nexusChain.getRemainingSupply();
     const circulating = MAX_SUPPLY - remaining;
-    const systemPrice = 0 + (circulating * 0.00000005); 
     
-    // NEW: Price is now Market-Driven. Bond curve math is kept as fallback.
-    if (menuBook.lastTradePrice > 0) {
+    // FIX: Math exactly follows the 0.00000001 starting point
+    const systemPrice = 0.00000001 + (circulating * 0.00000005); 
+    
+    if (menuBook.lastTradePrice > 0.00000001) {
         currentPrice = menuBook.lastTradePrice;
     } else {
         currentPrice = systemPrice;
+    }
+
+    // FIX: Inject system supply into Menu Book to solve "No Liquidity" errors
+    menuBook.asks = menuBook.asks.filter(a => a.uid !== "system");
+    if (remaining > 0) {
+        menuBook.asks.push({
+            id: 'sys-liquidity',
+            uid: 'system',
+            amountSyr: remaining,
+            priceUsd: currentPrice,
+            timestamp: Date.now()
+        });
+        menuBook.asks.sort((a, b) => a.priceUsd - b.priceUsd || a.timestamp - b.timestamp);
     }
 }
 updateMarketEconomics();
@@ -122,7 +134,7 @@ setInterval(() => {
     }
 }, 10000); 
 
-// ======================== MENU BOOK ROUTES (NEW) ========================
+// ======================== MENU BOOK ROUTES ========================
 app.get('/menubook', (req, res) => {
     res.json({
         bids: menuBook.bids,
@@ -170,14 +182,12 @@ app.post('/menubook/market', txLimiter, requireAuth, (req, res) => {
         const availableSyr = nexusChain.getBalance(uid) - menuBook.getLockedSyr(uid);
         const fundsToCheck = side === 'BUY' ? availableUsd : availableSyr;
 
-        // Execute off-chain matching
         const matchResult = menuBook.matchMarketOrder(uid, side, parseFloat(amountSyr), fundsToCheck);
 
         if (matchResult.trades.length === 0) {
             return res.status(400).json({ error: "No liquidity available in Menu Book to match order." });
         }
 
-        // Generate P2P Market transactions for the DataChain mempool
         for (const trade of matchResult.trades) {
             const tx = {
                 from: trade.seller,
@@ -207,7 +217,7 @@ app.post('/menubook/market', txLimiter, requireAuth, (req, res) => {
     }
 });
 
-// ======================== EXISTING ROUTES (UPDATED WITH LOCKS) ========================
+// ======================== EXISTING ROUTES ========================
 app.get('/', (req, res) => { res.json({ status: "Scientific Nexus DataChain API Node is ONLINE" }); });
 app.get('/blocks', (req, res) => { res.json(nexusChain.chain); });
 app.get('/balance/:address', (req, res) => { 
@@ -230,7 +240,6 @@ app.post('/tx/new', txLimiter, requireAuth, (req, res) => {
 
       if (!validator.validateTransactionPayload(tx)) return res.status(400).json({ error: "Malformed transaction payload." });
 
-      // Economy Enforcement (Factoring in Menu Book locked funds)
       if (type === 'BUY') {
           const totalCost = tx.amount * currentPrice;
           const userUsd = nexusChain.state.getUsd(to) - menuBook.getLockedUsd(to);

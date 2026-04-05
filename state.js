@@ -21,6 +21,23 @@ class State {
     return true;
   }
 
+  // FIX: Bypasses USD checks during server reboot to restore your 5.98B SilverCash
+  applyHistoricalTransaction(tx) {
+    const { from, to, amount, type } = tx;
+    
+    if (type === "MINT" && from === "system" && to === "system") {
+      this.balances[to] = (this.balances[to] || 0) + amount;
+      return true;
+    }
+
+    if (type === "MARKET_TRADE" || type === "BUY" || type === "SELL" || type === "TRANSFER") {
+        this.balances[from] = (this.balances[from] || 0) - amount;
+        this.balances[to] = (this.balances[to] || 0) + amount;
+        return true;
+    }
+    return true;
+  }
+
   // Apply a single transaction, return false if invalid.
   // Passed currentPrice to handle the fiat/crypto exchange properly.
   applyTransaction(tx, currentPrice = 0) {
@@ -31,10 +48,9 @@ class State {
       return true;
     }
 
-    // NEW: Handle Menu Book Market Trades (Peer-to-Peer)
+    // Handle Menu Book Market Trades (Peer-to-Peer)
     if (type === "MARKET_TRADE") {
         const { amountUsd } = tx;
-        // In P2P trades, from = seller, to = buyer.
         if (!this.deductUsd(to, amountUsd)) return false; 
         
         const sellerBalance = this.balances[from] || 0;
@@ -86,8 +102,8 @@ class State {
     for (const block of chain) {
       if (typeof block.data === 'string') continue;
       for (const tx of block.data) {
-        // We pass 0 here because historical rebuilding doesn't re-deduct fiat
-        this.applyTransaction(tx, 0); 
+        // FIX: Use the historical applier so your past balances are correctly loaded
+        this.applyHistoricalTransaction(tx); 
       }
     }
   }

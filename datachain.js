@@ -37,7 +37,7 @@ class DataChain {
     const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || '.';
     this.chainFile = path.join(volumePath, 'chain.json');
     this.backupFile = path.join(volumePath, 'chain_backup.json');
-    this.tempFile = path.join(volumePath, 'chain.json.tmp'); // Security: Atomic Writes
+    this.tempFile = path.join(volumePath, 'chain.json.tmp'); 
     
     this.difficulty = 2;
     this.state = new State();
@@ -99,13 +99,10 @@ class DataChain {
 
   saveChain() {
     try {
-       // Backup old chain
        if (fs.existsSync(this.chainFile)) fs.copyFileSync(this.chainFile, this.backupFile);
        
        const dataToSave = { chain: this.chain, usdBalances: this.state.usd_balances };
        
-       // SECURITY: Atomic File Writing. Write to temp, then rename.
-       // Prevents JSON corruption if the node crashes exactly during fs.writeFileSync
        fs.writeFileSync(this.tempFile, JSON.stringify(dataToSave, null, 2));
        fs.renameSync(this.tempFile, this.chainFile);
        

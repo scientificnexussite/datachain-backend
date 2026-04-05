@@ -1,3 +1,4 @@
+// validator.js
 import chalk from 'chalk';
 
 class Validator {
@@ -13,17 +14,14 @@ class Validator {
     return true;
   }
 
-  // Security: Ensure payload properties match exact expected types
   validateTransactionPayload(tx) {
     if (!tx || typeof tx !== 'object') return false;
     if (typeof tx.from !== 'string' || tx.from.length > 64) return false;
     if (typeof tx.to !== 'string' || tx.to.length > 64) return false;
     if (typeof tx.amount !== 'number' || isNaN(tx.amount) || tx.amount <= 0) return false;
     
-    // NEW: Allow MARKET_TRADE to pass
     if (!['BUY', 'SELL', 'TRANSFER', 'MINT', 'MARKET_TRADE'].includes(tx.type)) return false;
     
-    // NEW: Validate the USD amount requirement for market trades
     if (tx.type === 'MARKET_TRADE' && (typeof tx.amountUsd !== 'number' || isNaN(tx.amountUsd) || tx.amountUsd <= 0)) {
         return false;
     }
@@ -35,7 +33,6 @@ class Validator {
       console.log(chalk.red('[VALIDATOR] Error: Malformed Payload.'));
       return false;
     }
-    // Only check basic balance for non-BUY market actions (BUY checks are handled in State/API)
     if (balance < tx.amount && tx.type !== 'BUY' && tx.type !== 'MARKET_TRADE') {
       console.log(chalk.red('[VALIDATOR] Error: Insufficient SilverCash balance.'));
       return false;

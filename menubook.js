@@ -3,13 +3,12 @@ import chalk from 'chalk';
 
 class MenuBook {
   constructor() {
-    this.bids = []; // Buyers (USD ready to spend)
-    this.asks = []; // Sellers (SYR ready to sell)
-    this.lastTradePrice = 0;
+    this.bids = []; 
+    this.asks = []; 
+    this.lastTradePrice = 0.00000001; // FIX: Strict 0.00000001 start
     this.orderCounter = 0;
   }
 
-  // Calculate funds tied up in open limit orders
   getLockedUsd(uid) {
     return this.bids.filter(b => b.uid === uid).reduce((sum, b) => sum + (b.amountSyr * b.priceUsd), 0);
   }
@@ -18,7 +17,6 @@ class MenuBook {
     return this.asks.filter(a => a.uid === uid).reduce((sum, a) => sum + a.amountSyr, 0);
   }
 
-  // Determine the Bid/Ask Spread
   getSpread() {
     const highestBid = this.bids.length > 0 ? this.bids.priceUsd : 0;
     const lowestAsk = this.asks.length > 0 ? this.asks.priceUsd : 0;
@@ -30,18 +28,15 @@ class MenuBook {
     const order = { id: ++this.orderCounter, uid, amountSyr, priceUsd, timestamp: Date.now() };
     if (side === 'BUY') {
       this.bids.push(order);
-      // Sort Bids descending (highest price first)
       this.bids.sort((a, b) => b.priceUsd - a.priceUsd || a.timestamp - b.timestamp); 
     } else if (side === 'SELL') {
       this.asks.push(order);
-      // Sort Asks ascending (lowest price first)
       this.asks.sort((a, b) => a.priceUsd - b.priceUsd || a.timestamp - b.timestamp); 
     }
     console.log(chalk.cyan(`[MENU BOOK] Limit ${side} added: ${amountSyr} SYR @ $${priceUsd}`));
     return order;
   }
 
-  // Matches a market order against the Menu Book and calculates slippage
   matchMarketOrder(uid, side, amountSyr, availableFunds) {
     let remaining = amountSyr;
     let totalUsdCost = 0;
@@ -54,13 +49,11 @@ class MenuBook {
     while (remaining > 0 && book.length > 0) {
       const topOrder = book;
       
-      // Prevent wash trading (matching against your own orders)
-      if (topOrder.uid === uid) break; 
+      if (topOrder.uid === uid && topOrder.uid !== 'system') break; 
 
       let tradeAmount = Math.min(remaining, topOrder.amountSyr);
       let tradeUsd = tradeAmount * topOrder.priceUsd;
 
-      // Ensure buyer doesn't exceed available USD during execution
       if (side === 'BUY' && (totalUsdCost + tradeUsd) > availableFunds) {
           tradeAmount = (availableFunds - totalUsdCost) / topOrder.priceUsd;
           tradeUsd = tradeAmount * topOrder.priceUsd;
@@ -81,7 +74,7 @@ class MenuBook {
       topOrder.amountSyr -= tradeAmount;
 
       if (topOrder.amountSyr <= 0) {
-        book.shift(); // Remove filled order from the book
+        book.shift(); 
       }
 
       if (side === 'BUY' && totalUsdCost >= availableFunds) break;

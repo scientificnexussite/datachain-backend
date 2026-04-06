@@ -22,8 +22,8 @@ class MenuBook {
   }
 
   getSpread() {
-    const highestBid = this.bids.length > 0 ? this.bids[0].priceUsd : 0;
-    const lowestAsk = this.asks.length > 0 ? this.asks[0].priceUsd : 0;
+    const highestBid = this.bids.length > 0 ? this.bids.priceUsd : 0;
+    const lowestAsk = this.asks.length > 0 ? this.asks.priceUsd : 0;
     const spread = (highestBid > 0 && lowestAsk > 0) ? (lowestAsk - highestBid) : 0;
     return { highestBid, lowestAsk, spread, lastTradePrice: this.lastTradePrice };
   }
@@ -41,18 +41,24 @@ class MenuBook {
     return order;
   }
 
-  matchMarketOrder(uid, side, amountSyr, availableFunds) {
+  matchMarketOrder(uid, side, amountSyr, availableFunds, limitPrice = null) {
     let remaining = amountSyr;
     let totalUsdCost = 0;
     let trades = [];
     
     const book = side === 'BUY' ? this.asks : this.bids;
-    let initialPrice = book.length > 0 ? book[0].priceUsd : this.lastTradePrice;
+    let initialPrice = book.length > 0 ? book.priceUsd : this.lastTradePrice;
 
     while (remaining > 0 && book.length > 0) {
-      const topOrder = book[0]; 
+      const topOrder = book; 
       
       if (topOrder.uid === uid && topOrder.uid !== 'system') break; 
+
+      // Boundary execution check for limits crossing the spread
+      if (limitPrice !== null) {
+          if (side === 'BUY' && topOrder.priceUsd > limitPrice) break;
+          if (side === 'SELL' && topOrder.priceUsd < limitPrice) break;
+      }
 
       let tradeAmount = Math.min(remaining, topOrder.amountSyr);
       let tradeUsd = tradeAmount * topOrder.priceUsd;

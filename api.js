@@ -56,7 +56,7 @@ const requireAuth = async (req, res, next) => {
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
         return res.status(401).json({ error: "Unauthorized: Missing Bearer Token" });
     }
-    const token = authHeader.split('Bearer ')[1];
+    [cite_start]const token = authHeader.split('Bearer ')[1];
     try {
         const decodedToken = await admin.auth().verifyIdToken(token);
         req.user = decodedToken; 
@@ -104,23 +104,37 @@ function updateMarketEconomics() {
     // Utilizes exponential math for a realistic market curve
     const systemPrice = baseline + (scarcityMultiplier * Math.pow(growthFactor, 2)); 
     
-    // PRICE MEMORY GUARD: Forces synchronization, preventing the price from dropping to baseline on reboot
-    currentPrice = Math.max(systemPrice, currentPrice, menuBook.lastTradePrice);
+    // Ensures price can fluctuate downward organically by removing `currentPrice` from Math.max
+    currentPrice = Math.max(systemPrice, menuBook.lastTradePrice);
     if (menuBook.lastTradePrice < currentPrice) {
         menuBook.lastTradePrice = currentPrice;
     }
 
     // Inject system supply into Menu Book 
     menuBook.asks = menuBook.asks.filter(a => a.uid !== "system");
+    menuBook.bids = menuBook.bids.filter(a => a.uid !== "system");
+
     if (remaining > 0) {
         menuBook.asks.push({
-            id: 'sys-liquidity',
+            id: 'sys-liquidity-ask',
             uid: 'system',
             amountSyr: remaining,
             priceUsd: currentPrice,
             timestamp: Date.now()
         });
         menuBook.asks.sort((a, b) => a.priceUsd - b.priceUsd || a.timestamp - b.timestamp);
+    }
+
+    // Ensures liquidity always exists for users to execute MARKET SELL orders
+    if (circulating > 0) {
+        menuBook.bids.push({
+            id: 'sys-liquidity-bid',
+            uid: 'system',
+            amountSyr: circulating,
+            priceUsd: currentPrice,
+            timestamp: Date.now()
+        });
+        menuBook.bids.sort((a, b) => b.priceUsd - a.priceUsd || a.timestamp - b.timestamp);
     }
 }
 updateMarketEconomics();
@@ -161,18 +175,47 @@ app.post('/menubook/limit', txLimiter, requireAuth, (req, res) => {
             return res.status(400).json({ error: "Invalid limit order parameters." });
         }
 
+        const parsedAmount = parseFloat(amountSyr);
+        const parsedPrice = parseFloat(priceUsd);
+
         if (side === 'BUY') {
-            const totalCost = amountSyr * priceUsd;
+            const totalCost = parsedAmount * parsedPrice;
             const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid);
             if (availableUsd < totalCost) return res.status(400).json({ error: "Insufficient available USD." });
         } else {
             const availableSyr = nexusChain.getBalance(uid) - menuBook.getLockedSyr(uid);
-            if (availableSyr < amountSyr) return res.status(400).json({ error: "Insufficient available SilverCash." });
+            if (availableSyr < parsedAmount) return res.status(400).json({ error: "Insufficient available SilverCash." });
         }
 
-        const order = menuBook.addLimitOrder(uid, side, parseFloat(amountSyr), parseFloat(priceUsd));
+        // Immediate limit order spread crossing check
+        let remainingAmount = parsedAmount;
+        let executedTrades = [];
+        
+        const fundsToCheck = side === 'BUY' ? (nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid)) : (nexusChain.getBalance(uid) - menuBook.getLockedSyr(uid));
+        const matchResult = menuBook.matchMarketOrder(uid, side, remainingAmount, fundsToCheck, parsedPrice);
+        
+        executedTrades = matchResult.trades;
+        remainingAmount = matchResult.remaining;
+
+        for (const trade of executedTrades) {
+            const tx = {
+                from: trade.seller,
+                to: trade.buyer,
+                amount: trade.amountSyr,
+                amountUsd: trade.amountUsd,
+                type: 'MARKET_TRADE',
+                timestamp: Date.now()
+            };
+            mempool.addTransaction(tx);
+        }
+
+        let order = null;
+        if (remainingAmount > 0) {
+            order = menuBook.addLimitOrder(uid, side, remainingAmount, parsedPrice);
+        }
+        
         updateMarketEconomics();
-        res.status(201).json({ message: "Limit order active in Menu Book", order });
+        res.status(201).json({ message: "Limit order processed.", order, executedTrades });
     } catch (error) {
         res.status(500).json({ error: "Internal Server Error" });
     }
@@ -229,9 +272,15 @@ app.post('/menubook/market', txLimiter, requireAuth, (req, res) => {
 // ======================== EXISTING ROUTES ========================
 app.get('/', (req, res) => { res.json({ status: "Scientific Nexus DataChain API Node is ONLINE" }); });
 app.get('/blocks', (req, res) => { res.json(nexusChain.chain); });
+
+// Returns net balance ensuring UI drops instantly upon placing an order
 app.get('/balance/:address', (req, res) => { 
-    res.json({ address: req.params.address, balance: nexusChain.getBalance(req.params.address) }); 
+    const address = req.params.address;
+    const totalSyr = nexusChain.getBalance(address);
+    const lockedSyr = menuBook.getLockedSyr(address);
+    res.json({ address: address, balance: totalSyr - lockedSyr, total: totalSyr, locked: lockedSyr }); 
 });
+
 app.get('/stats', (req, res) => {
   const remaining = nexusChain.getRemainingSupply();
   res.json({ maxSupply: MAX_SUPPLY, remainingSupply: remaining, circulatingSupply: MAX_SUPPLY - remaining, currentPrice, marketCap: (MAX_SUPPLY - remaining) * currentPrice });
@@ -292,9 +341,13 @@ app.post('/mine', (req, res) => {
 });
 
 // ======================== USD & PAYMENT ENDPOINTS ========================
+// Returns net balance ensuring UI drops instantly upon placing an order
 app.get('/usd/balance/:uid', requireAuth, (req, res) => {
     if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
-    res.json({ address: req.params.uid, balance: nexusChain.state.getUsd(req.params.uid) });
+    const address = req.params.uid;
+    const totalUsd = nexusChain.state.getUsd(address);
+    const lockedUsd = menuBook.getLockedUsd(address);
+    res.json({ address: address, balance: totalUsd - lockedUsd, total: totalUsd, locked: lockedUsd });
 });
 
 app.post('/usd/deposit', (req, res) => {

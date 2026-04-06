@@ -5,8 +5,12 @@ class MenuBook {
   constructor() {
     this.bids = []; 
     this.asks = []; 
-    this.lastTradePrice = 0.00000001; 
+    this.lastTradePrice = 198; // Professional starting default
     this.orderCounter = 0;
+  }
+
+  setInitialPrice(price) {
+      this.lastTradePrice = price;
   }
 
   getLockedUsd(uid) {

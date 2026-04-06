@@ -16,12 +16,13 @@ class State {
   deductUsd(address, amount) {
     if (typeof amount !== 'number' || amount <= 0) return false;
     const current = this.getUsd(address);
-    if (current < amount) return false;
+    // Allow system to have infinite USD liquidity for matching if needed
+    if (address !== 'system' && current < amount) return false;
     this.usd_balances[address] = current - amount;
     return true;
   }
 
-  // FIX: Bypasses USD checks during server reboot to restore your 5.98B SilverCash
+  // FIX: Bypasses strict checks during server reboot to restore your 5.98B SilverCash
   applyHistoricalTransaction(tx) {
     const { from, to, amount, type } = tx;
     
@@ -33,6 +34,12 @@ class State {
     if (type === "MARKET_TRADE" || type === "BUY" || type === "SELL" || type === "TRANSFER") {
         this.balances[from] = (this.balances[from] || 0) - amount;
         this.balances[to] = (this.balances[to] || 0) + amount;
+        
+        // Reconstruct USD state historically for MARKET_TRADE if present
+        if (type === "MARKET_TRADE" && tx.amountUsd) {
+            this.deductUsd(to, tx.amountUsd);
+            this.addUsd(from, tx.amountUsd);
+        }
         return true;
     }
     return true;
@@ -99,6 +106,7 @@ class State {
 
   rebuild(chain) {
     this.balances = {};
+    this.usd_balances = {};
     for (const block of chain) {
       if (typeof block.data === 'string') continue;
       for (const tx of block.data) {

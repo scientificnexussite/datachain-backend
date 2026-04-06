@@ -32,6 +32,10 @@ app.set('trust proxy', 1);
 const port = process.env.PORT || 3001;
 const nexusChain = new DataChain();
 
+// PROFESSIONAL PRICE SYNC
+const professionalStartingPrice = nexusChain.getLastMarketPrice(198);
+menuBook.setInitialPrice(professionalStartingPrice);
+
 // ======================== SECURITY MIDDLEWARE ========================
 app.use(helmet()); 
 app.use(cors({
@@ -80,7 +84,7 @@ const pendingCryptoPayments = {};
 // ======================== INITIAL SUPPLY & ECONOMICS ========================
 const MAX_SUPPLY = 3000000000;
 const SYSTEM_ADDRESS = "system";
-let currentPrice = 0.00000001; 
+let currentPrice = professionalStartingPrice; 
 
 if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0 && nexusChain.chain.length <= 1) {
   const initTx = { from: SYSTEM_ADDRESS, to: SYSTEM_ADDRESS, amount: MAX_SUPPLY, type: "MINT", timestamp: Date.now() };
@@ -94,7 +98,7 @@ function updateMarketEconomics() {
     
     // Dynamic AMM Bonding Curve (Accelerated Growth Model)
     const growthFactor = circulating / MAX_SUPPLY;
-    const baseline = 0.00000001;
+    const baseline = 198; // PROFESSIONAL BASELINE
     const scarcityMultiplier = 150; 
     
     // Utilizes exponential math for a realistic market curve

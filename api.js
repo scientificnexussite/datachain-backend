@@ -269,6 +269,32 @@ app.post('/menubook/market', txLimiter, requireAuth, (req, res) => {
     }
 });
 
+// ======================== NEW: OPEN ORDER ROUTES ========================
+app.get('/api/orders/:uid', requireAuth, (req, res) => {
+    if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
+    try {
+        res.json(menuBook.getUserOrders(req.params.uid));
+    } catch (err) {
+        res.status(500).json({ error: "Failed to fetch orders." });
+    }
+});
+
+app.post('/api/orders/cancel', requireAuth, (req, res) => {
+    try {
+        const { uid, orderId } = req.body;
+        if (req.user.uid !== uid) return res.status(403).json({ error: "Forbidden" });
+        
+        const success = menuBook.cancelOrder(uid, orderId);
+        if (success) {
+            res.json({ success: true, message: "Order cancelled successfully." });
+        } else {
+            res.status(404).json({ error: "Order not found or already executed." });
+        }
+    } catch (err) {
+        res.status(500).json({ error: "Failed to cancel order." });
+    }
+});
+
 // ======================== EXISTING ROUTES ========================
 app.get('/', (req, res) => { res.json({ status: "Scientific Nexus DataChain API Node is ONLINE" }); });
 app.get('/blocks', (req, res) => { res.json(nexusChain.chain); });

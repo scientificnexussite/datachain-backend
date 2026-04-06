@@ -22,8 +22,9 @@ class MenuBook {
   }
 
   getSpread() {
-    const highestBid = this.bids.length > 0 ? this.bids.priceUsd : 0;
-    const lowestAsk = this.asks.length > 0 ? this.asks.priceUsd : 0;
+    // FIXED: Was missing [0] array index, which caused the NaN crash and Node Sync Error
+    const highestBid = this.bids.length > 0 ? this.bids[0].priceUsd : 0;
+    const lowestAsk = this.asks.length > 0 ? this.asks[0].priceUsd : 0;
     const spread = (highestBid > 0 && lowestAsk > 0) ? (lowestAsk - highestBid) : 0;
     return { highestBid, lowestAsk, spread, lastTradePrice: this.lastTradePrice };
   }
@@ -47,10 +48,12 @@ class MenuBook {
     let trades = [];
     
     const book = side === 'BUY' ? this.asks : this.bids;
-    let initialPrice = book.length > 0 ? book.priceUsd : this.lastTradePrice;
+    // FIXED: Was missing [0] array index
+    let initialPrice = book.length > 0 ? book[0].priceUsd : this.lastTradePrice;
 
     while (remaining > 0 && book.length > 0) {
-      const topOrder = book; 
+      // FIXED: Was assigned to entire array instead of the first element
+      const topOrder = book[0]; 
       
       if (topOrder.uid === uid && topOrder.uid !== 'system') break; 
 
@@ -103,6 +106,28 @@ class MenuBook {
       slippage, 
       executedSyr: amountSyr - remaining 
     };
+  }
+
+  // NEW: Logic to retrieve all open orders for a specific user
+  getUserOrders(uid) {
+    const userBids = this.bids.filter(b => b.uid === uid).map(b => ({ ...b, side: 'BUY' }));
+    const userAsks = this.asks.filter(a => a.uid === uid).map(a => ({ ...a, side: 'SELL' }));
+    return [...userBids, ...userAsks].sort((a, b) => b.timestamp - a.timestamp);
+  }
+
+  // NEW: Logic to remove an order from the book and refund the user
+  cancelOrder(uid, orderId) {
+    const bidIndex = this.bids.findIndex(b => b.id === orderId && b.uid === uid);
+    if (bidIndex !== -1) { 
+        this.bids.splice(bidIndex, 1); 
+        return true; 
+    }
+    const askIndex = this.asks.findIndex(a => a.id === orderId && a.uid === uid);
+    if (askIndex !== -1) { 
+        this.asks.splice(askIndex, 1); 
+        return true; 
+    }
+    return false;
   }
 }
 

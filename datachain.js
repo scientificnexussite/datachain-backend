@@ -114,7 +114,6 @@ class DataChain {
   createGenesisBlock() { return new Block(0, "03/27/2026", "Scientific Nexus Genesis Block", "0"); }
   getLatestBlock() { return this.chain[this.chain.length - 1]; }
 
-  // PROFESSIONAL PRICE DISCOVERY: Ensures API bootstraps to exact ledger state
   getLastMarketPrice(defaultPrice = 198) {
     for (let i = this.chain.length - 1; i >= 0; i--) {
       const block = this.chain[i];
@@ -130,6 +129,8 @@ class DataChain {
   }
 
   addBlock(transactions, currentPrice = 0) {
+    if (!transactions || transactions.length === 0) return false;
+
     const tempState = new State();
     tempState.balances = { ...this.state.balances };
     tempState.usd_balances = { ...this.state.usd_balances }; 

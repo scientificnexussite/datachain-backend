@@ -93,53 +93,52 @@ if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0 && nexusChain.chain.length <= 1)
 }
 
 function updateMarketEconomics() {
-    const remaining = nexusChain.getRemainingSupply();
-    const circulating = MAX_SUPPLY - remaining;
-    
-    // Dynamic AMM Bonding Curve (Accelerated Growth Model)
-    const growthFactor = circulating / MAX_SUPPLY;
-    const baseline = 198; // PROFESSIONAL BASELINE
-    const scarcityMultiplier = 150; 
-    
-    // Utilizes exponential math for a realistic market curve
-    const systemPrice = baseline + (scarcityMultiplier * Math.pow(growthFactor, 2)); 
-    
-    // Ensures price can fluctuate downward organically by removing `currentPrice` from Math.max
-    currentPrice = Math.max(systemPrice, menuBook.lastTradePrice);
-    if (menuBook.lastTradePrice < currentPrice) {
-        menuBook.lastTradePrice = currentPrice;
-    }
+    try {
+        const remaining = nexusChain.getRemainingSupply();
+        const circulating = MAX_SUPPLY - remaining;
+        
+        const growthFactor = circulating / MAX_SUPPLY;
+        const baseline = 198; 
+        const scarcityMultiplier = 150; 
+        
+        const systemPrice = baseline + (scarcityMultiplier * Math.pow(growthFactor, 2)); 
+        
+        currentPrice = Math.max(systemPrice, menuBook.lastTradePrice);
+        if (menuBook.lastTradePrice < currentPrice) {
+            menuBook.lastTradePrice = currentPrice;
+        }
 
-    // Inject system supply into Menu Book 
-    menuBook.asks = menuBook.asks.filter(a => a.uid !== "system");
-    menuBook.bids = menuBook.bids.filter(a => a.uid !== "system");
+        menuBook.asks = menuBook.asks.filter(a => a.uid !== "system");
+        menuBook.bids = menuBook.bids.filter(a => a.uid !== "system");
 
-    if (remaining > 0) {
-        menuBook.asks.push({
-            id: 'sys-liquidity-ask',
-            uid: 'system',
-            amountSyr: remaining,
-            priceUsd: currentPrice,
-            timestamp: Date.now()
-        });
-        menuBook.asks.sort((a, b) => a.priceUsd - b.priceUsd || a.timestamp - b.timestamp);
-    }
+        if (remaining > 0) {
+            menuBook.asks.push({
+                id: 'sys-liquidity-ask',
+                uid: 'system',
+                amountSyr: remaining,
+                priceUsd: currentPrice,
+                timestamp: Date.now()
+            });
+            menuBook.asks.sort((a, b) => a.priceUsd - b.priceUsd || a.timestamp - b.timestamp);
+        }
 
-    // Ensures liquidity always exists for users to execute MARKET SELL orders
-    if (circulating > 0) {
-        menuBook.bids.push({
-            id: 'sys-liquidity-bid',
-            uid: 'system',
-            amountSyr: circulating,
-            priceUsd: currentPrice,
-            timestamp: Date.now()
-        });
-        menuBook.bids.sort((a, b) => b.priceUsd - a.priceUsd || a.timestamp - b.timestamp);
+        if (circulating > 0) {
+            menuBook.bids.push({
+                id: 'sys-liquidity-bid',
+                uid: 'system',
+                amountSyr: circulating,
+                priceUsd: currentPrice,
+                timestamp: Date.now()
+            });
+            menuBook.bids.sort((a, b) => b.priceUsd - a.priceUsd || a.timestamp - b.timestamp);
+        }
+    } catch (e) {
+        console.error(chalk.red("[ECONOMICS ERROR]"), e);
     }
 }
 updateMarketEconomics();
 
-// ======================== AUTO-MINER ========================
+// ======================== AUTO-MINER (Fallback) ========================
 setInterval(() => {
     const pendingCount = mempool.getPendingCount();
     if (pendingCount > 0) {
@@ -187,7 +186,6 @@ app.post('/menubook/limit', txLimiter, requireAuth, (req, res) => {
             if (availableSyr < parsedAmount) return res.status(400).json({ error: "Insufficient available SilverCash." });
         }
 
-        // Immediate limit order spread crossing check
         let remainingAmount = parsedAmount;
         let executedTrades = [];
         
@@ -214,9 +212,15 @@ app.post('/menubook/limit', txLimiter, requireAuth, (req, res) => {
             order = menuBook.addLimitOrder(uid, side, remainingAmount, parsedPrice);
         }
         
+        // INSTANT MINING: Prevent ghost transactions
+        if (executedTrades.length > 0) {
+            nexusChain.addBlock(mempool.getAndClear(), currentPrice);
+        }
+
         updateMarketEconomics();
         res.status(201).json({ message: "Limit order processed.", order, executedTrades });
     } catch (error) {
+        console.error(error);
         res.status(500).json({ error: "Internal Server Error" });
     }
 });
@@ -252,6 +256,11 @@ app.post('/menubook/market', txLimiter, requireAuth, (req, res) => {
             mempool.addTransaction(tx);
         }
 
+        // INSTANT MINING: Prevent ghost transactions
+        if (matchResult.trades.length > 0) {
+            nexusChain.addBlock(mempool.getAndClear(), currentPrice);
+        }
+
         updateMarketEconomics();
 
         res.status(201).json({
@@ -269,7 +278,6 @@ app.post('/menubook/market', txLimiter, requireAuth, (req, res) => {
     }
 });
 
-// ======================== NEW: OPEN ORDER ROUTES ========================
 app.get('/api/orders/:uid', requireAuth, (req, res) => {
     if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
     try {
@@ -295,11 +303,9 @@ app.post('/api/orders/cancel', requireAuth, (req, res) => {
     }
 });
 
-// ======================== EXISTING ROUTES ========================
 app.get('/', (req, res) => { res.json({ status: "Scientific Nexus DataChain API Node is ONLINE" }); });
 app.get('/blocks', (req, res) => { res.json(nexusChain.chain); });
 
-// Returns net balance ensuring UI drops instantly upon placing an order
 app.get('/balance/:address', (req, res) => { 
     const address = req.params.address;
     const totalSyr = nexusChain.getBalance(address);
@@ -335,7 +341,9 @@ app.post('/tx/new', txLimiter, requireAuth, (req, res) => {
 
       const success = mempool.addTransaction(tx);
       if (success) {
-        res.status(201).json({ message: "Transaction added to mempool.", tx });
+        // INSTANT MINING for normal transfers
+        nexusChain.addBlock(mempool.getAndClear(), currentPrice);
+        res.status(201).json({ message: "Transaction added to mempool and mined.", tx });
       } else {
         res.status(400).json({ error: "Transaction failed mempool admission." });
       }
@@ -366,8 +374,6 @@ app.post('/mine', (req, res) => {
     }
 });
 
-// ======================== USD & PAYMENT ENDPOINTS ========================
-// Returns net balance ensuring UI drops instantly upon placing an order
 app.get('/usd/balance/:uid', requireAuth, (req, res) => {
     if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
     const address = req.params.uid;

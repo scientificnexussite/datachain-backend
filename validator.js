@@ -1,4 +1,3 @@
-// validator.js
 import chalk from 'chalk';
 
 class Validator {

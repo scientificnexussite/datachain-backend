@@ -3,7 +3,7 @@ import chalk from 'chalk';
 class Mempool {
   constructor() {
     this.pendingTransactions = [];
-    this.MAX_MEMPOOL_SIZE = 1000; // Security: Prevent Memory DDoS
+    this.MAX_MEMPOOL_SIZE = 1000; 
   }
 
   addTransaction(tx) {
@@ -17,7 +17,6 @@ class Mempool {
       return false;
     }
 
-    // Security: Basic duplicate prevention
     const isDuplicate = this.pendingTransactions.some(p => 
         p.from === tx.from && p.to === tx.to && p.amount === tx.amount && p.timestamp === tx.timestamp
     );

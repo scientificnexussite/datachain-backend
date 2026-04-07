@@ -8,21 +8,19 @@ class State {
   getUsd(address) { return this.usd_balances[address] || 0; }
 
   addUsd(address, amount) {
-    if (typeof amount !== 'number' || amount <= 0) return;
+    if (typeof amount !== 'number' || isNaN(amount) || amount <= 0) return;
     const current = this.getUsd(address);
     this.usd_balances[address] = current + amount;
   }
 
   deductUsd(address, amount) {
-    if (typeof amount !== 'number' || amount <= 0) return false;
+    if (typeof amount !== 'number' || isNaN(amount) || amount <= 0) return false;
     const current = this.getUsd(address);
-    // Allow system to have infinite USD liquidity for matching if needed
     if (address !== 'system' && current < amount) return false;
     this.usd_balances[address] = current - amount;
     return true;
   }
 
-  // FIX: Bypasses strict checks during server reboot to restore your 5.98B SilverCash
   applyHistoricalTransaction(tx) {
     const { from, to, amount, type } = tx;
     
@@ -35,8 +33,7 @@ class State {
         this.balances[from] = (this.balances[from] || 0) - amount;
         this.balances[to] = (this.balances[to] || 0) + amount;
         
-        // Reconstruct USD state historically for MARKET_TRADE if present
-        if (type === "MARKET_TRADE" && tx.amountUsd) {
+        if (type === "MARKET_TRADE" && tx.amountUsd && !isNaN(tx.amountUsd)) {
             this.deductUsd(to, tx.amountUsd);
             this.addUsd(from, tx.amountUsd);
         }
@@ -45,8 +42,6 @@ class State {
     return true;
   }
 
-  // Apply a single transaction, return false if invalid.
-  // Passed currentPrice to handle the fiat/crypto exchange properly.
   applyTransaction(tx, currentPrice = 0) {
     const { from, to, amount, type } = tx;
     
@@ -55,7 +50,6 @@ class State {
       return true;
     }
 
-    // Handle Menu Book Market Trades (Peer-to-Peer)
     if (type === "MARKET_TRADE") {
         const { amountUsd } = tx;
         if (!this.deductUsd(to, amountUsd)) return false; 
@@ -69,7 +63,6 @@ class State {
         return true;
     }
 
-    // Legacy: Handle USD state for BUY orders (System Liquidity)
     if (type === "BUY") {
         const cost = amount * currentPrice;
         if (!this.deductUsd(to, cost)) return false; 
@@ -82,7 +75,6 @@ class State {
         return true;
     }
 
-    // Legacy: Handle USD state for SELL orders (System Liquidity)
     if (type === "SELL") {
         const senderBalance = this.balances[from] || 0;
         if (senderBalance < amount) return false;
@@ -95,7 +87,6 @@ class State {
         return true;
     }
 
-    // Standard Transfer
     const senderBalance = this.balances[from] || 0;
     if (senderBalance < amount) return false;
     
@@ -110,7 +101,6 @@ class State {
     for (const block of chain) {
       if (typeof block.data === 'string') continue;
       for (const tx of block.data) {
-        // FIX: Use the historical applier so your past balances are correctly loaded
         this.applyHistoricalTransaction(tx); 
       }
     }

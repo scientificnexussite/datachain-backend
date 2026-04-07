@@ -5,7 +5,7 @@ class MenuBook {
   constructor() {
     this.bids = []; 
     this.asks = []; 
-    this.lastTradePrice = 198; // Professional starting default
+    this.lastTradePrice = 198; 
     this.orderCounter = 0;
   }
 
@@ -22,7 +22,6 @@ class MenuBook {
   }
 
   getSpread() {
-    // FIXED: Was missing [0] array index, which caused the NaN crash and Node Sync Error
     const highestBid = this.bids.length > 0 ? this.bids[0].priceUsd : 0;
     const lowestAsk = this.asks.length > 0 ? this.asks[0].priceUsd : 0;
     const spread = (highestBid > 0 && lowestAsk > 0) ? (lowestAsk - highestBid) : 0;
@@ -48,16 +47,13 @@ class MenuBook {
     let trades = [];
     
     const book = side === 'BUY' ? this.asks : this.bids;
-    // FIXED: Was missing [0] array index
     let initialPrice = book.length > 0 ? book[0].priceUsd : this.lastTradePrice;
 
-    while (remaining > 0 && book.length > 0) {
-      // FIXED: Was assigned to entire array instead of the first element
+    while (remaining > 1e-8 && book.length > 0) {
       const topOrder = book[0]; 
       
       if (topOrder.uid === uid && topOrder.uid !== 'system') break; 
 
-      // Boundary execution check for limits crossing the spread
       if (limitPrice !== null) {
           if (side === 'BUY' && topOrder.priceUsd > limitPrice) break;
           if (side === 'SELL' && topOrder.priceUsd < limitPrice) break;
@@ -69,7 +65,7 @@ class MenuBook {
       if (side === 'BUY' && (totalUsdCost + tradeUsd) > availableFunds) {
           tradeAmount = (availableFunds - totalUsdCost) / topOrder.priceUsd;
           tradeUsd = tradeAmount * topOrder.priceUsd;
-          if (tradeAmount <= 0) break;
+          if (tradeAmount <= 1e-8) break; // Dust protection
       }
 
       trades.push({
@@ -80,12 +76,13 @@ class MenuBook {
         price: topOrder.priceUsd
       });
 
-      this.lastTradePrice = topOrder.priceUsd; // Persistent price tracking synced with API
+      this.lastTradePrice = topOrder.priceUsd; 
       totalUsdCost += tradeUsd;
       remaining -= tradeAmount;
       topOrder.amountSyr -= tradeAmount;
 
-      if (topOrder.amountSyr <= 0) {
+      // Dust protection check for dead orders
+      if (topOrder.amountSyr <= 1e-8) {
         book.shift(); 
       }
 
@@ -108,14 +105,12 @@ class MenuBook {
     };
   }
 
-  // NEW: Logic to retrieve all open orders for a specific user
   getUserOrders(uid) {
     const userBids = this.bids.filter(b => b.uid === uid).map(b => ({ ...b, side: 'BUY' }));
     const userAsks = this.asks.filter(a => a.uid === uid).map(a => ({ ...a, side: 'SELL' }));
     return [...userBids, ...userAsks].sort((a, b) => b.timestamp - a.timestamp);
   }
 
-  // NEW: Logic to remove an order from the book and refund the user
   cancelOrder(uid, orderId) {
     const bidIndex = this.bids.findIndex(b => b.id === orderId && b.uid === uid);
     if (bidIndex !== -1) { 

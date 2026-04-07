@@ -32,7 +32,7 @@ app.set('trust proxy', 1);
 const port = process.env.PORT || 3001;
 const nexusChain = new DataChain();
 
-// PROFESSIONAL PRICE SYNC
+// 100% DECENTRALIZED PRICE SYNC: Driven ONLY by the last historical trade.
 const professionalStartingPrice = nexusChain.getLastMarketPrice(198);
 menuBook.setInitialPrice(professionalStartingPrice);
 
@@ -81,7 +81,7 @@ const client = new Client({
 const ordersController = new OrdersController(client);
 const pendingCryptoPayments = {};
 
-// ======================== INITIAL SUPPLY & ECONOMICS ========================
+// ======================== INITIAL SUPPLY ========================
 const MAX_SUPPLY = 3000000000;
 const SYSTEM_ADDRESS = "system";
 let currentPrice = professionalStartingPrice; 
@@ -92,42 +92,46 @@ if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0 && nexusChain.chain.length <= 1)
   console.log(chalk.green(`[INIT] Initial supply of ${MAX_SUPPLY} SYR allocated.`));
 }
 
+// ======================== DECENTRALIZED MARKET ECONOMICS ========================
 function updateMarketEconomics() {
     try {
+        // The price is strictly whatever the last P2P trade executed at.
+        const chainPrice = nexusChain.getLastMarketPrice(198);
+        currentPrice = Math.max(chainPrice, menuBook.lastTradePrice);
+        menuBook.setInitialPrice(currentPrice);
+
         const remaining = nexusChain.getRemainingSupply();
         const circulating = MAX_SUPPLY - remaining;
-        
-        const growthFactor = circulating / MAX_SUPPLY;
-        const baseline = 198; 
-        const scarcityMultiplier = 150; 
-        
-        const systemPrice = baseline + (scarcityMultiplier * Math.pow(growthFactor, 2)); 
-        
-        currentPrice = Math.max(systemPrice, menuBook.lastTradePrice);
-        if (menuBook.lastTradePrice < currentPrice) {
-            menuBook.lastTradePrice = currentPrice;
-        }
 
+        // Clear outdated system liquidity
         menuBook.asks = menuBook.asks.filter(a => a.uid !== "system");
         menuBook.bids = menuBook.bids.filter(a => a.uid !== "system");
 
-        if (remaining > 0) {
+        // Organic Price Growth Mechanism: If no real users are selling, the system provides liquidity.
+        // It releases coins in small 5,000 SYR chunks at a 2% premium. 
+        // When big buyers buy, they eat multiple chunks, naturally driving the price up ("The Boom").
+        const hasUserAsks = menuBook.asks.some(a => a.uid !== "system");
+        if (remaining > 0 && !hasUserAsks) {
+            const premiumPrice = currentPrice > 0 ? currentPrice * 1.02 : 198; 
             menuBook.asks.push({
                 id: 'sys-liquidity-ask',
                 uid: 'system',
-                amountSyr: remaining,
-                priceUsd: currentPrice,
+                amountSyr: Math.min(remaining, 5000), 
+                priceUsd: premiumPrice,
                 timestamp: Date.now()
             });
             menuBook.asks.sort((a, b) => a.priceUsd - b.priceUsd || a.timestamp - b.timestamp);
         }
 
-        if (circulating > 0) {
+        // Buyer of last resort: System catches panic sellers at a 50% discount to maintain a floor.
+        const hasUserBids = menuBook.bids.some(b => b.uid !== "system");
+        if (circulating > 0 && !hasUserBids) {
+            const floorPrice = currentPrice > 0 ? currentPrice * 0.50 : 99;
             menuBook.bids.push({
                 id: 'sys-liquidity-bid',
                 uid: 'system',
-                amountSyr: circulating,
-                priceUsd: currentPrice,
+                amountSyr: Math.min(circulating, 1000), 
+                priceUsd: floorPrice,
                 timestamp: Date.now()
             });
             menuBook.bids.sort((a, b) => b.priceUsd - a.priceUsd || a.timestamp - b.timestamp);
@@ -136,6 +140,7 @@ function updateMarketEconomics() {
         console.error(chalk.red("[ECONOMICS ERROR]"), e);
     }
 }
+// Init the order book with organic liquidity on boot
 updateMarketEconomics();
 
 // ======================== AUTO-MINER (Fallback) ========================
@@ -177,6 +182,7 @@ app.post('/menubook/limit', txLimiter, requireAuth, (req, res) => {
         const parsedAmount = parseFloat(amountSyr);
         const parsedPrice = parseFloat(priceUsd);
 
+        // Balance Check & Locking
         if (side === 'BUY') {
             const totalCost = parsedAmount * parsedPrice;
             const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid);
@@ -190,6 +196,8 @@ app.post('/menubook/limit', txLimiter, requireAuth, (req, res) => {
         let executedTrades = [];
         
         const fundsToCheck = side === 'BUY' ? (nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid)) : (nexusChain.getBalance(uid) - menuBook.getLockedSyr(uid));
+        
+        // Push through the Match Engine
         const matchResult = menuBook.matchMarketOrder(uid, side, remainingAmount, fundsToCheck, parsedPrice);
         
         executedTrades = matchResult.trades;
@@ -212,7 +220,7 @@ app.post('/menubook/limit', txLimiter, requireAuth, (req, res) => {
             order = menuBook.addLimitOrder(uid, side, remainingAmount, parsedPrice);
         }
         
-        // INSTANT MINING: Prevent ghost transactions
+        // INSTANT MINING for immediate decentralization confirmation
         if (executedTrades.length > 0) {
             nexusChain.addBlock(mempool.getAndClear(), currentPrice);
         }
@@ -256,7 +264,6 @@ app.post('/menubook/market', txLimiter, requireAuth, (req, res) => {
             mempool.addTransaction(tx);
         }
 
-        // INSTANT MINING: Prevent ghost transactions
         if (matchResult.trades.length > 0) {
             nexusChain.addBlock(mempool.getAndClear(), currentPrice);
         }
@@ -319,29 +326,28 @@ app.get('/stats', (req, res) => {
 });
 app.get('/supply', (req, res) => { res.json({ remainingSupply: nexusChain.getRemainingSupply() }); });
 
+// RAW TRANSFER ROUTE - Locked down to prevent order book bypassing
 app.post('/tx/new', txLimiter, requireAuth, (req, res) => {
   try {
       const { from, to, amount, type } = req.body;
       const tx = { from, to, amount: parseFloat(amount), type, timestamp: Date.now() };
 
       const requesterUid = req.user.uid;
-      if (type === 'BUY' && to !== requesterUid) return res.status(403).json({ error: "Forbidden: Cannot buy on behalf of another user." });
-      if ((type === 'SELL' || type === 'TRANSFER') && from !== requesterUid) return res.status(403).json({ error: "Forbidden: You do not own the originating address." });
+      
+      // Enforce the Order Book! Users cannot raw "BUY" or "SELL" anymore.
+      if (type === 'BUY' || type === 'SELL') {
+          return res.status(400).json({ error: "Protocol Exception: Trades must be routed through the /menubook/limit endpoint for price discovery." });
+      }
+
+      if (type === 'TRANSFER' && from !== requesterUid) return res.status(403).json({ error: "Forbidden: You do not own the originating address." });
 
       if (!validator.validateTransactionPayload(tx)) return res.status(400).json({ error: "Malformed transaction payload." });
 
-      if (type === 'BUY') {
-          const totalCost = tx.amount * currentPrice;
-          const userUsd = nexusChain.state.getUsd(to) - menuBook.getLockedUsd(to);
-          if (userUsd < totalCost) return res.status(400).json({ error: `Insufficient available USD.` });
-      } else if (type === 'SELL' || type === 'TRANSFER') {
-          const senderBalance = nexusChain.getBalance(from) - menuBook.getLockedSyr(from);
-          if (senderBalance < tx.amount) return res.status(400).json({ error: "Insufficient available SilverCash balance." });
-      }
+      const senderBalance = nexusChain.getBalance(from) - menuBook.getLockedSyr(from);
+      if (senderBalance < tx.amount) return res.status(400).json({ error: "Insufficient available SilverCash balance." });
 
       const success = mempool.addTransaction(tx);
       if (success) {
-        // INSTANT MINING for normal transfers
         nexusChain.addBlock(mempool.getAndClear(), currentPrice);
         res.status(201).json({ message: "Transaction added to mempool and mined.", tx });
       } else {

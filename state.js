@@ -1,11 +1,12 @@
-// state.js
 class State {
   constructor() {
     this.balances = {};     
     this.usd_balances = {}; 
   }
 
-  getUsd(address) { return this.usd_balances[address] || 0; }
+  getUsd(address) { 
+    return this.usd_balances[address] || 0; 
+  }
 
   addUsd(address, amount) {
     if (typeof amount !== 'number' || isNaN(amount) || amount <= 0) return;
@@ -106,7 +107,9 @@ class State {
     }
   }
 
-  getBalance(address) { return this.balances[address] || 0; }
+  getBalance(address) { 
+    return this.balances[address] || 0; 
+  }
 }
 
 export default State;

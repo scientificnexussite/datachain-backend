@@ -1,4 +1,3 @@
-// api.js
 import express from 'express';
 import bodyParser from 'body-parser';
 import cors from 'cors';
@@ -28,11 +27,11 @@ try {
 
 const app = express();
 app.set('trust proxy', 1);
-
 const port = process.env.PORT || 3001;
+
 const nexusChain = new DataChain();
 
-// 100% DECENTRALIZED PRICE SYNC: Driven ONLY by the last historical trade.
+// 100% DECENTRALIZED PRICE SYNC
 const professionalStartingPrice = nexusChain.getLastMarketPrice(198);
 menuBook.setInitialPrice(professionalStartingPrice);
 
@@ -95,7 +94,6 @@ if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0 && nexusChain.chain.length <= 1)
 // ======================== DECENTRALIZED MARKET ECONOMICS ========================
 function updateMarketEconomics() {
     try {
-        // The price is strictly whatever the last P2P trade executed at.
         const chainPrice = nexusChain.getLastMarketPrice(198);
         currentPrice = Math.max(chainPrice, menuBook.lastTradePrice);
         menuBook.setInitialPrice(currentPrice);
@@ -103,13 +101,9 @@ function updateMarketEconomics() {
         const remaining = nexusChain.getRemainingSupply();
         const circulating = MAX_SUPPLY - remaining;
 
-        // Clear outdated system liquidity
         menuBook.asks = menuBook.asks.filter(a => a.uid !== "system");
         menuBook.bids = menuBook.bids.filter(a => a.uid !== "system");
 
-        // Organic Price Growth Mechanism: If no real users are selling, the system provides liquidity.
-        // It releases coins in small 5,000 SYR chunks at a 2% premium. 
-        // When big buyers buy, they eat multiple chunks, naturally driving the price up ("The Boom").
         const hasUserAsks = menuBook.asks.some(a => a.uid !== "system");
         if (remaining > 0 && !hasUserAsks) {
             const premiumPrice = currentPrice > 0 ? currentPrice * 1.02 : 198; 
@@ -123,7 +117,6 @@ function updateMarketEconomics() {
             menuBook.asks.sort((a, b) => a.priceUsd - b.priceUsd || a.timestamp - b.timestamp);
         }
 
-        // Buyer of last resort: System catches panic sellers at a 50% discount to maintain a floor.
         const hasUserBids = menuBook.bids.some(b => b.uid !== "system");
         if (circulating > 0 && !hasUserBids) {
             const floorPrice = currentPrice > 0 ? currentPrice * 0.50 : 99;
@@ -140,10 +133,9 @@ function updateMarketEconomics() {
         console.error(chalk.red("[ECONOMICS ERROR]"), e);
     }
 }
-// Init the order book with organic liquidity on boot
 updateMarketEconomics();
 
-// ======================== AUTO-MINER (Fallback) ========================
+// ======================== AUTO-MINER ========================
 setInterval(() => {
     const pendingCount = mempool.getPendingCount();
     if (pendingCount > 0) {
@@ -163,11 +155,7 @@ setInterval(() => {
 
 // ======================== MENU BOOK ROUTES ========================
 app.get('/menubook', (req, res) => {
-    res.json({
-        bids: menuBook.bids,
-        asks: menuBook.asks,
-        marketData: menuBook.getSpread()
-    });
+    res.json({ bids: menuBook.bids, asks: menuBook.asks, marketData: menuBook.getSpread() });
 });
 
 app.post('/menubook/limit', txLimiter, requireAuth, (req, res) => {
@@ -182,7 +170,6 @@ app.post('/menubook/limit', txLimiter, requireAuth, (req, res) => {
         const parsedAmount = parseFloat(amountSyr);
         const parsedPrice = parseFloat(priceUsd);
 
-        // Balance Check & Locking
         if (side === 'BUY') {
             const totalCost = parsedAmount * parsedPrice;
             const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid);
@@ -194,10 +181,8 @@ app.post('/menubook/limit', txLimiter, requireAuth, (req, res) => {
 
         let remainingAmount = parsedAmount;
         let executedTrades = [];
-        
         const fundsToCheck = side === 'BUY' ? (nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid)) : (nexusChain.getBalance(uid) - menuBook.getLockedSyr(uid));
         
-        // Push through the Match Engine
         const matchResult = menuBook.matchMarketOrder(uid, side, remainingAmount, fundsToCheck, parsedPrice);
         
         executedTrades = matchResult.trades;
@@ -220,7 +205,6 @@ app.post('/menubook/limit', txLimiter, requireAuth, (req, res) => {
             order = menuBook.addLimitOrder(uid, side, remainingAmount, parsedPrice);
         }
         
-        // INSTANT MINING for immediate decentralization confirmation
         if (executedTrades.length > 0) {
             nexusChain.addBlock(mempool.getAndClear(), currentPrice);
         }
@@ -310,6 +294,7 @@ app.post('/api/orders/cancel', requireAuth, (req, res) => {
     }
 });
 
+// ======================== CORE BLOCKCHAIN ROUTES ========================
 app.get('/', (req, res) => { res.json({ status: "Scientific Nexus DataChain API Node is ONLINE" }); });
 app.get('/blocks', (req, res) => { res.json(nexusChain.chain); });
 
@@ -322,25 +307,28 @@ app.get('/balance/:address', (req, res) => {
 
 app.get('/stats', (req, res) => {
   const remaining = nexusChain.getRemainingSupply();
-  res.json({ maxSupply: MAX_SUPPLY, remainingSupply: remaining, circulatingSupply: MAX_SUPPLY - remaining, currentPrice, marketCap: (MAX_SUPPLY - remaining) * currentPrice });
+  res.json({ 
+      maxSupply: MAX_SUPPLY, 
+      remainingSupply: remaining, 
+      circulatingSupply: MAX_SUPPLY - remaining, 
+      currentPrice, 
+      marketCap: (MAX_SUPPLY - remaining) * currentPrice 
+  });
 });
+
 app.get('/supply', (req, res) => { res.json({ remainingSupply: nexusChain.getRemainingSupply() }); });
 
-// RAW TRANSFER ROUTE - Locked down to prevent order book bypassing
 app.post('/tx/new', txLimiter, requireAuth, (req, res) => {
   try {
       const { from, to, amount, type } = req.body;
       const tx = { from, to, amount: parseFloat(amount), type, timestamp: Date.now() };
-
       const requesterUid = req.user.uid;
       
-      // Enforce the Order Book! Users cannot raw "BUY" or "SELL" anymore.
       if (type === 'BUY' || type === 'SELL') {
           return res.status(400).json({ error: "Protocol Exception: Trades must be routed through the /menubook/limit endpoint for price discovery." });
       }
 
       if (type === 'TRANSFER' && from !== requesterUid) return res.status(403).json({ error: "Forbidden: You do not own the originating address." });
-
       if (!validator.validateTransactionPayload(tx)) return res.status(400).json({ error: "Malformed transaction payload." });
 
       const senderBalance = nexusChain.getBalance(from) - menuBook.getLockedSyr(from);
@@ -380,6 +368,7 @@ app.post('/mine', (req, res) => {
     }
 });
 
+// ======================== USD GATEWAY ROUTES ========================
 app.get('/usd/balance/:uid', requireAuth, (req, res) => {
     if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
     const address = req.params.uid;

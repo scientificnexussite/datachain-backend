@@ -18,8 +18,12 @@ class Mempool {
     }
 
     const isDuplicate = this.pendingTransactions.some(p => 
-        p.from === tx.from && p.to === tx.to && p.amount === tx.amount && p.timestamp === tx.timestamp
+        p.from === tx.from && 
+        p.to === tx.to && 
+        p.amount === tx.amount && 
+        p.timestamp === tx.timestamp
     );
+    
     if (isDuplicate) return false;
 
     this.pendingTransactions.push(tx);
@@ -33,7 +37,9 @@ class Mempool {
     return txs;
   }
 
-  getPendingCount() { return this.pendingTransactions.length; }
+  getPendingCount() { 
+    return this.pendingTransactions.length; 
+  }
 }
 
 export default new Mempool();

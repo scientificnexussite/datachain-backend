@@ -1,4 +1,3 @@
-// datachain.js
 import fs from 'fs';
 import path from 'path';
 import CryptoJS from 'crypto-js';
@@ -34,7 +33,9 @@ class Block {
 
 class DataChain {
   constructor() {
-    const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || '.';
+    // Railway.app resilient volume resolution
+    const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd();
+    
     this.chainFile = path.join(volumePath, 'chain.json');
     this.backupFile = path.join(volumePath, 'chain_backup.json');
     this.tempFile = path.join(volumePath, 'chain.json.tmp'); 
@@ -99,10 +100,12 @@ class DataChain {
 
   saveChain() {
     try {
-       if (fs.existsSync(this.chainFile)) fs.copyFileSync(this.chainFile, this.backupFile);
+       // Safe atomic write operations to prevent file corruption during server restarts
+       if (fs.existsSync(this.chainFile)) {
+           fs.copyFileSync(this.chainFile, this.backupFile);
+       }
        
        const dataToSave = { chain: this.chain, usdBalances: this.state.usd_balances };
-       
        fs.writeFileSync(this.tempFile, JSON.stringify(dataToSave, null, 2));
        fs.renameSync(this.tempFile, this.chainFile);
        
@@ -111,8 +114,13 @@ class DataChain {
     }
   }
 
-  createGenesisBlock() { return new Block(0, "03/27/2026", "Scientific Nexus Genesis Block", "0"); }
-  getLatestBlock() { return this.chain[this.chain.length - 1]; }
+  createGenesisBlock() { 
+      return new Block(0, "03/27/2026", "Scientific Nexus Genesis Block", "0"); 
+  }
+  
+  getLatestBlock() { 
+      return this.chain[this.chain.length - 1]; 
+  }
 
   getLastMarketPrice(defaultPrice = 198) {
     for (let i = this.chain.length - 1; i >= 0; i--) {

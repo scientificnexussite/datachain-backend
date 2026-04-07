@@ -1,11 +1,9 @@
-// menubook.js
 import chalk from 'chalk';
 
 class MenuBook {
   constructor() {
     this.bids = []; 
     this.asks = []; 
-    // Defaults to 198, but will be overwritten by DataChain history on boot
     this.lastTradePrice = 198; 
     this.orderCounter = 0;
   }
@@ -33,11 +31,9 @@ class MenuBook {
     const order = { id: ++this.orderCounter, uid, amountSyr, priceUsd, timestamp: Date.now() };
     if (side === 'BUY') {
       this.bids.push(order);
-      // Sort Highest Price first (Buyers want to pay the least, but highest bid wins)
       this.bids.sort((a, b) => b.priceUsd - a.priceUsd || a.timestamp - b.timestamp); 
     } else if (side === 'SELL') {
       this.asks.push(order);
-      // Sort Lowest Price first (Sellers want the most, but lowest ask wins)
       this.asks.sort((a, b) => a.priceUsd - b.priceUsd || a.timestamp - b.timestamp); 
     }
     console.log(chalk.cyan(`[MENU BOOK] Limit ${side} added: ${amountSyr} SYR @ $${priceUsd}`));
@@ -49,18 +45,15 @@ class MenuBook {
     let totalUsdCost = 0;
     let trades = [];
     
-    // If buying, we look at the Sells (Asks). If selling, we look at Buys (Bids).
     const book = side === 'BUY' ? this.asks : this.bids;
     let initialPrice = book.length > 0 ? book[0].priceUsd : this.lastTradePrice;
 
-    // 1e-8 acts as Dust Protection against floating-point infinite loops
+    // Dust Protection & Core Match Engine
     while (remaining > 1e-8 && book.length > 0) {
       const topOrder = book[0]; 
       
-      // Prevent self-trading (unless it's the system liquidity pool)
       if (topOrder.uid === uid && topOrder.uid !== 'system') break; 
 
-      // Limit Protection: Stop if the next order is outside the user's requested price bounds
       if (limitPrice !== null) {
           if (side === 'BUY' && topOrder.priceUsd > limitPrice) break;
           if (side === 'SELL' && topOrder.priceUsd < limitPrice) break;
@@ -69,7 +62,7 @@ class MenuBook {
       let tradeAmount = Math.min(remaining, topOrder.amountSyr);
       let tradeUsd = tradeAmount * topOrder.priceUsd;
 
-      // Bound checks to ensure user doesn't overdraft their USD balance during a Market Buy
+      // Safe bounds checking
       if (side === 'BUY' && (totalUsdCost + tradeUsd) > availableFunds) {
           tradeAmount = (availableFunds - totalUsdCost) / topOrder.priceUsd;
           tradeUsd = tradeAmount * topOrder.priceUsd;
@@ -84,14 +77,12 @@ class MenuBook {
         price: topOrder.priceUsd
       });
 
-      // DECENTRALIZED TICKER UPDATE: The final price of the trade becomes the global market price.
       this.lastTradePrice = topOrder.priceUsd; 
       
       totalUsdCost += tradeUsd;
       remaining -= tradeAmount;
       topOrder.amountSyr -= tradeAmount;
 
-      // Remove the order from the book if it has been fully consumed
       if (topOrder.amountSyr <= 1e-8) {
         book.shift(); 
       }

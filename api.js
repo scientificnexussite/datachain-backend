@@ -10,7 +10,6 @@ import mempool from './mempool.js';
 import { DataChain } from './datachain.js';
 import validator from './validator.js';
 import menuBook from './menubook.js'; 
-import { Client, Environment, LogLevel, OrdersController } from '@paypal/paypal-server-sdk';
 
 // ======================== FIREBASE ADMIN SETUP ========================
 try {
@@ -68,17 +67,27 @@ const requireAuth = async (req, res, next) => {
 
 // ======================== ENV VARIABLES & API KEYS ========================
 const INTERNAL_SECRET = process.env.INTERNAL_SECRET || "nexus_secret_key";
-const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || "PLACEHOLDER_CLIENT_ID";
-const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || "PLACEHOLDER_SECRET";
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || "ARHFzdeVRE7O1Bn_TY7VidtNuK0O_oOGYgfZEqmq3zQTdsGRWHigMgDdjkiJ8c9CFmRc9610Rn5Mke8A";
+const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || "EAo7EoXoW0hy5QWsyxDT6wmLrAbN5DHNGColEtI38vddyisCz0H1aELuDxgpfZVz4cyT02YWJgosLxgd";
+const PAYPAL_API_BASE = "https://api-m.sandbox.paypal.com"; // Use https://api-m.paypal.com for Production
 
-const client = new Client({
-    clientCredentialsAuthCredentials: { oAuthClientId: PAYPAL_CLIENT_ID, oAuthClientSecret: PAYPAL_CLIENT_SECRET },
-    timeout: 0,
-    environment: Environment.Sandbox, 
-    logging: { logLevel: LogLevel.Info, logRequest: { logBody: true }, logResponse: { logHeaders: true } },
-});
-const ordersController = new OrdersController(client);
 const pendingCryptoPayments = {};
+
+// ======================== PAYPAL AUTHENTICATION (NEW IMPLEMENTATION) ========================
+async function getPayPalAccessToken() {
+    const auth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString("base64");
+    const response = await fetch(`${PAYPAL_API_BASE}/v1/oauth2/token`, {
+        method: "POST",
+        body: "grant_type=client_credentials",
+        headers: {
+            Authorization: `Basic ${auth}`,
+            "Content-Type": "application/x-www-form-urlencoded"
+        },
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error("Failed to get PayPal Access Token");
+    return data.access_token;
+}
 
 // ======================== INITIAL SUPPLY ========================
 const MAX_SUPPLY = 3000000000;
@@ -391,17 +400,42 @@ app.post('/usd/deposit', (req, res) => {
     }
 });
 
+// ======================== PAYPAL NEW API INTEGRATION ========================
 app.post('/create-paypal-order', requireAuth, async (req, res) => {
     try {
         const amount = parseFloat(req.body.amount);
         if (isNaN(amount) || amount <= 0 || amount > 10000) return res.status(400).json({ error: "Invalid amount" });
         
-        const collect = {
-            body: { intent: 'CAPTURE', purchaseUnits: [{ amount: { currencyCode: 'USD', value: amount.toFixed(2) } }] },
-            prefer: 'return=minimal',
+        const accessToken = await getPayPalAccessToken();
+        
+        const payload = {
+            intent: "CAPTURE",
+            purchase_units: [
+                {
+                    amount: {
+                        currency_code: "USD",
+                        value: amount.toFixed(2)
+                    }
+                }
+            ]
         };
-        const { body } = await ordersController.ordersCreate(collect);
-        res.json({ id: body.id });
+
+        const response = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${accessToken}`,
+            },
+            body: JSON.stringify(payload)
+        });
+
+        const data = await response.json();
+        
+        if (!response.ok) {
+            throw new Error(data.message || "Failed to create order on PayPal API");
+        }
+
+        res.json({ id: data.id });
     } catch (error) {
         console.error(chalk.red("[PAYPAL CREATE ERROR]"), error);
         res.status(500).json({ error: "Failed to communicate with PayPal Sandbox." });
@@ -413,13 +447,29 @@ app.post('/capture-paypal-order', requireAuth, async (req, res) => {
         const { orderID, uid } = req.body;
         if (uid !== req.user.uid) return res.status(403).json({ error: "Forbidden" });
 
-        const collect = { id: orderID, prefer: 'return=minimal' };
+        const accessToken = await getPayPalAccessToken();
 
-        const { body } = await ordersController.ordersCapture(collect);
-        const capturedAmount = parseFloat(body.purchaseUnits.payments.captures.amount.value);
+        const response = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders/${orderID}/capture`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${accessToken}`,
+            }
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+            throw new Error(data.message || "Failed to capture order via PayPal API");
+        }
+
+        // Properly drill down into the captured amount based on PayPal's standard response
+        const capturedAmount = parseFloat(data.purchase_units[0].payments.captures[0].amount.value);
 
         nexusChain.state.addUsd(uid, capturedAmount);
         nexusChain.saveChain();
+        
+        // Return exactly what the frontend is expecting
         res.json({ status: 'COMPLETED', amount: capturedAmount });
     } catch (error) {
         console.error(chalk.red("[PAYPAL CAPTURE ERROR]"), error);

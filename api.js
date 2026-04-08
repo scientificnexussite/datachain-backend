@@ -403,8 +403,8 @@ app.post('/create-paypal-order', requireAuth, async (req, res) => {
         const { body } = await ordersController.ordersCreate(collect);
         res.json({ id: body.id });
     } catch (error) {
-        const mockOrderId = "MOCK_ORDER_" + crypto.randomBytes(4).toString('hex');
-        res.json({ id: mockOrderId });
+        console.error(chalk.red("[PAYPAL CREATE ERROR]"), error);
+        res.status(500).json({ error: "Failed to communicate with PayPal Sandbox." });
     }
 });
 
@@ -414,19 +414,15 @@ app.post('/capture-paypal-order', requireAuth, async (req, res) => {
         if (uid !== req.user.uid) return res.status(403).json({ error: "Forbidden" });
 
         const collect = { id: orderID, prefer: 'return=minimal' };
-        let capturedAmount = 50.00; 
 
-        try {
-            const { body } = await ordersController.ordersCapture(collect);
-            capturedAmount = parseFloat(body.purchaseUnits.payments.captures.amount.value);
-        } catch (sdkError) {
-             if(!orderID.startsWith("MOCK_ORDER_")) throw sdkError;
-        }
+        const { body } = await ordersController.ordersCapture(collect);
+        const capturedAmount = parseFloat(body.purchaseUnits.payments.captures.amount.value);
 
         nexusChain.state.addUsd(uid, capturedAmount);
         nexusChain.saveChain();
         res.json({ status: 'COMPLETED', amount: capturedAmount });
     } catch (error) {
+        console.error(chalk.red("[PAYPAL CAPTURE ERROR]"), error);
         res.status(500).json({ error: "Failed to capture PayPal order." });
     }
 });

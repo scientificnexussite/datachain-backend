@@ -1,14 +1,25 @@
 import { createLibp2p } from 'libp2p';
-import { tcp } from '@libp2p/tcp';
-import { mplex } from '@libp2p/mplex';
-import { noise } from '@libp2p/noise';
-import { mdns } from '@libp2p/mdns';
 import chalk from 'chalk';
+
+// Professional Fix: Use wildcard imports to bypass ESM/CommonJS named export conflicts
+import * as tcpPkg from '@libp2p/tcp';
+const tcp = tcpPkg.tcp || tcpPkg.default || tcpPkg;
+
+import * as mplexPkg from '@libp2p/mplex';
+const mplex = mplexPkg.mplex || mplexPkg.default || mplexPkg;
+
+import * as noisePkg from '@libp2p/noise';
+const noise = noisePkg.noise || noisePkg.default || noisePkg;
+
+import * as mdnsPkg from '@libp2p/mdns';
+const mdns = mdnsPkg.mdns || mdnsPkg.multicastDNS || mdnsPkg.default || mdnsPkg;
 
 const createNode = async () => {
   try {
       const node = await createLibp2p({
-        addresses: { listen: ['/ip4/0.0.0.0/tcp/0'] },
+        addresses: { 
+            listen: ['/ip4/0.0.0.0/tcp/0'] 
+        },
         transports: [tcp()],
         streamMuxers: [mplex()],
         connectionEncryption: [noise()],
@@ -34,4 +45,5 @@ const createNode = async () => {
   }
 };
 
+// Start the node immediately on launch as required by api.js
 createNode();

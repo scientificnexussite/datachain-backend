@@ -9,11 +9,11 @@ import mempool from './mempool.js';
 import { DataChain } from './datachain.js';
 import validator from './validator.js';
 import menuBook from './menubook.js'; 
-import './p2p.js'; [span_30](start_span)// Start P2P on launch[span_30](end_span)
-import config from './config.json' assert { type: "json" };
+import './p2p.js'; // Start P2P on launch
+import config from './config.json' with { type: "json" };
 
 // ======================== SECURITY & ENV VARIABLES ========================
-// Removed hardcoded defaults. [span_31](start_span)[span_32](start_span)The server will now safely crash/log if you deploy without configuring these[span_31](end_span)[span_32](end_span).
+// Removed hardcoded defaults. The server will now safely crash/log if you deploy without configuring these.
 const INTERNAL_SECRET = process.env.INTERNAL_SECRET;
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
@@ -130,7 +130,7 @@ function updateMarketEconomics() {
 
         const hasUserBids = menuBook.bids.some(b => b.uid !== "system");
         if (circulating > 0 && !hasUserBids) {
-            [span_33](start_span)// Tightened spread floor to 90%[span_33](end_span)
+            // Tightened spread floor to 90%
             const floorPrice = currentPrice > 0 ? currentPrice * 0.90 : config.blockchain.starting_price * 0.9;
             menuBook.bids.push({
                 id: 'sys-liquidity-bid',
@@ -149,7 +149,7 @@ function updateMarketEconomics() {
 updateMarketEconomics();
 
 // ======================== ISOLATED AUTO-MINER ========================
-[span_34](start_span)[span_35](start_span)// Prevents race conditions by making the auto-miner the ONLY component that calls addBlock[span_34](end_span)[span_35](end_span).
+// Prevents race conditions by making the auto-miner the ONLY component that calls addBlock.
 let isMining = false;
 setInterval(() => {
     if (isMining) return;
@@ -178,7 +178,7 @@ app.get('/menubook', (req, res) => {
     res.json({ bids: menuBook.bids, asks: menuBook.asks, marketData: menuBook.getSpread() });
 });
 
-[span_36](start_span)// Network Stats Endpoint[span_36](end_span)
+// Network Stats Endpoint
 app.get('/network', (req, res) => {
     res.json({
         chainLength: nexusChain.chain.length,
@@ -187,7 +187,7 @@ app.get('/network', (req, res) => {
     });
 });
 
-[span_37](start_span)// Price History Chart Endpoint[span_37](end_span)
+// Price History Chart Endpoint
 app.get('/pricehistory', (req, res) => {
     const history = [];
     for (const block of nexusChain.chain) {
@@ -201,7 +201,7 @@ app.get('/pricehistory', (req, res) => {
     res.json(history);
 });
 
-[span_38](start_span)// Positions Extraction Endpoint[span_38](end_span)
+// Positions Extraction Endpoint
 app.get('/positions/:uid', requireAuth, (req, res) => {
     if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
     const uid = req.params.uid;
@@ -354,7 +354,7 @@ app.post('/tx/new', txLimiter, requireAuth, (req, res) => {
       const tx = { from, to, amount: parseFloat(amount), type, timestamp: Date.now() };
       const requesterUid = req.user.uid;
       
-      [span_39](start_span)[span_40](start_span)// Cryptographic signature logic placeholder for when mobile client is updated[span_39](end_span)[span_40](end_span)
+      // Cryptographic signature logic placeholder for when mobile client is updated
       // if (!verifySignature(tx, req.body.signature)) return res.status(401).json({ error: "Invalid TX Signature" });
 
       if (type === 'BUY' || type === 'SELL') return res.status(400).json({ error: "Trades must be routed through /menubook/limit." });
@@ -387,7 +387,7 @@ app.get('/usd/balance/:uid', requireAuth, (req, res) => {
 app.post('/create-paypal-order', requireAuth, async (req, res) => {
     try {
         const amount = parseFloat(req.body.amount);
-        [span_41](start_span)if (isNaN(amount) || amount < 10 || amount > 10000) return res.status(400).json({ error: "Invalid amount" }); //[span_41](end_span)
+        if (isNaN(amount) || amount < 10 || amount > 10000) return res.status(400).json({ error: "Invalid amount" }); 
         
         const accessToken = await getPayPalAccessToken();
         const response = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders`, {
@@ -418,9 +418,9 @@ app.post('/capture-paypal-order', requireAuth, async (req, res) => {
         const data = await response.json();
         if (!response.ok) throw new Error(data.message);
 
-        const capturedAmount = parseFloat(data.purchase_units[0].payments.captures[0].amount.value);
+        const capturedAmount = parseFloat(data.purchase_units.payments.captures.amount.value);
 
-        [span_42](start_span)// Immutably record the deposit on-chain[span_42](end_span)
+        // Immutably record the deposit on-chain
         const depositTx = { from: "paypal-gateway", to: uid, amount: capturedAmount, type: 'USD_DEPOSIT', timestamp: Date.now() };
         mempool.addTransaction(depositTx);
 
@@ -431,7 +431,7 @@ app.post('/capture-paypal-order', requireAuth, async (req, res) => {
     }
 });
 
-[span_43](start_span)// Implement USD Withdrawals[span_43](end_span)
+// Implement USD Withdrawals
 app.post('/usd/withdraw', requireAuth, (req, res) => {
     try {
         const { uid, amount } = req.body;

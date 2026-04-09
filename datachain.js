@@ -4,7 +4,7 @@ import CryptoJS from 'crypto-js';
 import chalk from 'chalk';
 import validator from './validator.js';
 import State from './state.js';
-import config from './config.json' assert { type: "json" };
+import config from './config.json' with { type: "json" };
 
 class Block {
   constructor(index, timestamp, data, previousHash = '') {
@@ -41,7 +41,7 @@ class DataChain {
     this.tempFile = path.join(volumePath, 'chain.json.tmp'); 
     
     this.difficulty = 2;
-    this.difficultyAdjustmentInterval = 100; [span_16](start_span)// Blocks[span_16](end_span)
+    this.difficultyAdjustmentInterval = 100; // Blocks
     this.targetBlockTime = 10000; // 10 seconds 
     this.state = new State();
     
@@ -56,7 +56,7 @@ class DataChain {
         
         let chainArray = Array.isArray(parsed) ? parsed : (parsed.chain || []);
         
-        [span_17](start_span)// Restore difficulty[span_17](end_span)
+        // Restore difficulty
         if (!Array.isArray(parsed) && parsed.difficulty) {
             this.difficulty = parsed.difficulty;
         }
@@ -94,7 +94,7 @@ class DataChain {
        fs.writeFileSync(this.tempFile, JSON.stringify(dataToSave, null, 2));
        fs.renameSync(this.tempFile, this.chainFile);
        
-       [span_18](start_span)// Snapshots every 1000 blocks[span_18](end_span)
+       // Snapshots every 1000 blocks
        if (this.chain.length % 1000 === 0) {
            this.state.saveSnapshot(this.chain.length - 1);
        }
@@ -126,7 +126,7 @@ class DataChain {
   }
 
   adjustDifficulty() {
-      [span_19](start_span)[span_20](start_span)// Dynamic difficulty adjustment[span_19](end_span)[span_20](end_span)
+      // Dynamic difficulty adjustment
       if (this.chain.length % this.difficultyAdjustmentInterval === 0 && this.chain.length >= this.difficultyAdjustmentInterval) {
           const previousAdjustmentBlock = this.chain[this.chain.length - this.difficultyAdjustmentInterval];
           const latestBlock = this.getLatestBlock();
@@ -146,7 +146,7 @@ class DataChain {
   addBlock(transactions, currentPrice = 0) {
     if (!transactions || transactions.length === 0) return false;
 
-    [span_21](start_span)// Add block reward transaction[span_21](end_span)
+    // Add block reward transaction
     const rewardTx = {
         from: "system",
         to: config.blockchain.miner_address,

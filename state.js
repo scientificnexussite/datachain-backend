@@ -27,7 +27,7 @@ class State {
     return true;
   }
 
-  [span_10](start_span)// Unified validation for both live and historical transactions[span_10](end_span)
+  // Unified validation for both live and historical transactions
   applyTransaction(tx, currentPrice = 0) {
     const { from, to, amount, type } = tx;
     
@@ -96,7 +96,7 @@ class State {
     this.usd_balances = {};
     let startIndex = 0;
 
-    [span_11](start_span)// Snapshot restoration[span_11](end_span)
+    // Snapshot restoration
     try {
         if (fs.existsSync(this.snapshotFile)) {
             const snapshot = JSON.parse(fs.readFileSync(this.snapshotFile, 'utf8'));

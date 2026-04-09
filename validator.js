@@ -18,12 +18,12 @@ class Validator {
     if (typeof tx.from !== 'string' || tx.from.length > 64) return false;
     if (typeof tx.to !== 'string' || tx.to.length > 64) return false;
     
-    [span_6](start_span)// Strict input sanitization[span_6](end_span)
+    // Strict input sanitization
     if (typeof tx.amount !== 'number' || !Number.isFinite(tx.amount) || tx.amount <= 0 || tx.amount > 3000000000) {
         return false;
     }
     
-    [span_7](start_span)// Support for on-chain USD tracking[span_7](end_span)
+    // Support for on-chain USD tracking
     if (!['BUY', 'SELL', 'TRANSFER', 'MINT', 'MARKET_TRADE', 'USD_DEPOSIT', 'USD_WITHDRAWAL'].includes(tx.type)) {
         return false;
     }

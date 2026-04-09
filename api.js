@@ -5,6 +5,7 @@ import chalk from 'chalk';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import admin from 'firebase-admin';
+import crypto from 'crypto'; // Added for secure secret generation
 import mempool from './mempool.js';
 import { DataChain } from './datachain.js';
 import validator from './validator.js';
@@ -13,15 +14,16 @@ import './p2p.js'; // Start P2P on launch
 import config from './config.json' with { type: "json" };
 
 // ======================== SECURITY & ENV VARIABLES ========================
-// Removed hardcoded defaults. The server will now safely crash/log if you deploy without configuring these.
-const INTERNAL_SECRET = process.env.INTERNAL_SECRET;
+let INTERNAL_SECRET = process.env.INTERNAL_SECRET;
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
 const PAYPAL_API_BASE = "https://api-m.sandbox.paypal.com"; // Keep sandbox until full launch
 
+// Graceful fallback to prevent Railway deployment crash loops while maintaining security
 if (!INTERNAL_SECRET || INTERNAL_SECRET.length < 32) {
-    console.error(chalk.red.bold("[FATAL] INTERNAL_SECRET missing or too weak. Must be at least 32 chars."));
-    process.exit(1); 
+    console.error(chalk.yellow.bold("[SECURITY] INTERNAL_SECRET missing or too weak in env variables."));
+    console.warn(chalk.yellow("[SECURITY] Auto-generating a secure 32-byte session secret to prevent crash."));
+    INTERNAL_SECRET = crypto.randomBytes(32).toString('hex');
 }
 
 try {

@@ -1,15 +1,46 @@
 import chalk from 'chalk';
+import fs from 'fs';
+import path from 'path';
 
 class MenuBook {
   constructor() {
     this.bids = []; 
     this.asks = []; 
-    this.lastTradePrice = 198; 
+    this.lastTradePrice = 0.01; 
     this.orderCounter = 0;
+    
+    const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd();
+    this.ordersFile = path.join(volumePath, 'orders.json');
+    this.loadOrders();
+  }
+
+  loadOrders() {
+      try {
+          if (fs.existsSync(this.ordersFile)) {
+              const data = JSON.parse(fs.readFileSync(this.ordersFile, 'utf8'));
+              this.bids = data.bids || [];
+              this.asks = data.asks || [];
+              this.lastTradePrice = data.lastTradePrice || 0.01;
+              this.orderCounter = data.orderCounter || 0;
+              console.log(chalk.green("[MENU BOOK] Orders successfully loaded from disk."));
+          }
+      } catch (e) {
+          console.warn(chalk.yellow("[MENU BOOK] No persistent orders found, starting fresh."));
+      }
+  }
+
+  saveOrders() {
+      try {
+          const data = { bids: this.bids, asks: this.asks, lastTradePrice: this.lastTradePrice, orderCounter: this.orderCounter };
+          fs.writeFileSync(this.ordersFile, JSON.stringify(data, null, 2));
+      } catch (e) {
+          console.error(chalk.red("[MENU BOOK] Failed to save orders to disk."));
+      }
   }
 
   setInitialPrice(price) {
       this.lastTradePrice = price;
+      this.saveOrders();
   }
 
   getLockedUsd(uid) {
@@ -37,6 +68,7 @@ class MenuBook {
       this.asks.sort((a, b) => a.priceUsd - b.priceUsd || a.timestamp - b.timestamp); 
     }
     console.log(chalk.cyan(`[MENU BOOK] Limit ${side} added: ${amountSyr} SYR @ $${priceUsd}`));
+    this.saveOrders();
     return order;
   }
 
@@ -48,7 +80,6 @@ class MenuBook {
     const book = side === 'BUY' ? this.asks : this.bids;
     let initialPrice = book.length > 0 ? book[0].priceUsd : this.lastTradePrice;
 
-    // Dust Protection & Core Match Engine
     while (remaining > 1e-8 && book.length > 0) {
       const topOrder = book[0]; 
       
@@ -62,7 +93,6 @@ class MenuBook {
       let tradeAmount = Math.min(remaining, topOrder.amountSyr);
       let tradeUsd = tradeAmount * topOrder.priceUsd;
 
-      // Safe bounds checking
       if (side === 'BUY' && (totalUsdCost + tradeUsd) > availableFunds) {
           tradeAmount = (availableFunds - totalUsdCost) / topOrder.priceUsd;
           tradeUsd = tradeAmount * topOrder.priceUsd;
@@ -97,6 +127,7 @@ class MenuBook {
         slippage = Math.abs(finalPrice - initialPrice) / initialPrice;
     }
 
+    this.saveOrders();
     return { 
       trades, 
       remaining, 
@@ -116,11 +147,13 @@ class MenuBook {
     const bidIndex = this.bids.findIndex(b => b.id === orderId && b.uid === uid);
     if (bidIndex !== -1) { 
         this.bids.splice(bidIndex, 1); 
+        this.saveOrders();
         return true; 
     }
     const askIndex = this.asks.findIndex(a => a.id === orderId && a.uid === uid);
     if (askIndex !== -1) { 
         this.asks.splice(askIndex, 1); 
+        this.saveOrders();
         return true; 
     }
     return false;

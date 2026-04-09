@@ -17,11 +17,18 @@ class Validator {
     if (!tx || typeof tx !== 'object') return false;
     if (typeof tx.from !== 'string' || tx.from.length > 64) return false;
     if (typeof tx.to !== 'string' || tx.to.length > 64) return false;
-    if (typeof tx.amount !== 'number' || isNaN(tx.amount) || tx.amount <= 0) return false;
     
-    if (!['BUY', 'SELL', 'TRANSFER', 'MINT', 'MARKET_TRADE'].includes(tx.type)) return false;
+    [span_6](start_span)// Strict input sanitization[span_6](end_span)
+    if (typeof tx.amount !== 'number' || !Number.isFinite(tx.amount) || tx.amount <= 0 || tx.amount > 3000000000) {
+        return false;
+    }
     
-    if (tx.type === 'MARKET_TRADE' && (typeof tx.amountUsd !== 'number' || isNaN(tx.amountUsd) || tx.amountUsd <= 0)) {
+    [span_7](start_span)// Support for on-chain USD tracking[span_7](end_span)
+    if (!['BUY', 'SELL', 'TRANSFER', 'MINT', 'MARKET_TRADE', 'USD_DEPOSIT', 'USD_WITHDRAWAL'].includes(tx.type)) {
+        return false;
+    }
+    
+    if (tx.type === 'MARKET_TRADE' && (typeof tx.amountUsd !== 'number' || !Number.isFinite(tx.amountUsd) || tx.amountUsd <= 0)) {
         return false;
     }
     return true;
@@ -32,7 +39,7 @@ class Validator {
       console.log(chalk.red('[VALIDATOR] Error: Malformed Payload.'));
       return false;
     }
-    if (balance < tx.amount && tx.type !== 'BUY' && tx.type !== 'MARKET_TRADE') {
+    if (balance < tx.amount && tx.type !== 'BUY' && tx.type !== 'MARKET_TRADE' && tx.type !== 'USD_DEPOSIT' && tx.type !== 'USD_WITHDRAWAL') {
       console.log(chalk.red('[VALIDATOR] Error: Insufficient SilverCash balance.'));
       return false;
     }

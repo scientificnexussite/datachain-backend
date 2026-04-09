@@ -1,7 +1,12 @@
+import fs from 'fs';
+import path from 'path';
+
 class State {
   constructor() {
     this.balances = {};     
     this.usd_balances = {}; 
+    const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd();
+    this.snapshotFile = path.join(volumePath, 'state_snapshot.json');
   }
 
   getUsd(address) { 
@@ -22,33 +27,22 @@ class State {
     return true;
   }
 
-  applyHistoricalTransaction(tx) {
-    const { from, to, amount, type } = tx;
-    
-    if (type === "MINT" && from === "system" && to === "system") {
-      this.balances[to] = (this.balances[to] || 0) + amount;
-      return true;
-    }
-
-    if (type === "MARKET_TRADE" || type === "BUY" || type === "SELL" || type === "TRANSFER") {
-        this.balances[from] = (this.balances[from] || 0) - amount;
-        this.balances[to] = (this.balances[to] || 0) + amount;
-        
-        if (type === "MARKET_TRADE" && tx.amountUsd && !isNaN(tx.amountUsd)) {
-            this.deductUsd(to, tx.amountUsd);
-            this.addUsd(from, tx.amountUsd);
-        }
-        return true;
-    }
-    return true;
-  }
-
+  [span_10](start_span)// Unified validation for both live and historical transactions[span_10](end_span)
   applyTransaction(tx, currentPrice = 0) {
     const { from, to, amount, type } = tx;
     
-    if (type === "MINT" && from === "system" && to === "system") {
+    if (type === "MINT" && from === "system") {
       this.balances[to] = (this.balances[to] || 0) + amount;
       return true;
+    }
+
+    if (type === "USD_DEPOSIT") {
+        this.addUsd(to, amount);
+        return true;
+    }
+
+    if (type === "USD_WITHDRAWAL") {
+        return this.deductUsd(from, amount);
     }
 
     if (type === "MARKET_TRADE") {
@@ -88,6 +82,7 @@ class State {
         return true;
     }
 
+    // Standard Transfer
     const senderBalance = this.balances[from] || 0;
     if (senderBalance < amount) return false;
     
@@ -99,12 +94,36 @@ class State {
   rebuild(chain) {
     this.balances = {};
     this.usd_balances = {};
-    for (const block of chain) {
+    let startIndex = 0;
+
+    [span_11](start_span)// Snapshot restoration[span_11](end_span)
+    try {
+        if (fs.existsSync(this.snapshotFile)) {
+            const snapshot = JSON.parse(fs.readFileSync(this.snapshotFile, 'utf8'));
+            this.balances = snapshot.balances || {};
+            this.usd_balances = snapshot.usd_balances || {};
+            startIndex = snapshot.lastIndex + 1;
+        }
+    } catch (e) {
+        console.warn("Failed to load state snapshot, running full replay.");
+    }
+
+    for (let i = startIndex; i < chain.length; i++) {
+      const block = chain[i];
       if (typeof block.data === 'string') continue;
       for (const tx of block.data) {
-        this.applyHistoricalTransaction(tx); 
+        this.applyTransaction(tx); 
       }
     }
+  }
+
+  saveSnapshot(lastIndex) {
+      try {
+          const snapshot = { balances: this.balances, usd_balances: this.usd_balances, lastIndex };
+          fs.writeFileSync(this.snapshotFile, JSON.stringify(snapshot));
+      } catch (e) {
+          console.error("Snapshot save failed:", e);
+      }
   }
 
   getBalance(address) { 

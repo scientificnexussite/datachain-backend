@@ -9,7 +9,9 @@
     "reward": 50,
     "currency_symbol": "SYR",
     "sub_unit": "Sats",
-    "genesis_date": "03/27/2026"
+    "genesis_date": "03/27/2026",
+    "miner_address": "nexus-system-miner",
+    "starting_price": 0.01
   },
   "peers": [
     "/ip4/127.0.0.1/tcp/4001"

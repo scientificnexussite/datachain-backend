@@ -4,6 +4,7 @@ import CryptoJS from 'crypto-js';
 import chalk from 'chalk';
 import validator from './validator.js';
 import State from './state.js';
+import config from './config.json' assert { type: "json" };
 
 class Block {
   constructor(index, timestamp, data, previousHash = '') {
@@ -33,7 +34,6 @@ class Block {
 
 class DataChain {
   constructor() {
-    // Railway.app resilient volume resolution
     const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd();
     
     this.chainFile = path.join(volumePath, 'chain.json');
@@ -41,7 +41,10 @@ class DataChain {
     this.tempFile = path.join(volumePath, 'chain.json.tmp'); 
     
     this.difficulty = 2;
+    this.difficultyAdjustmentInterval = 100; [span_16](start_span)// Blocks[span_16](end_span)
+    this.targetBlockTime = 10000; // 10 seconds 
     this.state = new State();
+    
     this.loadChain();
   }
 
@@ -52,7 +55,11 @@ class DataChain {
         const parsed = JSON.parse(data);
         
         let chainArray = Array.isArray(parsed) ? parsed : (parsed.chain || []);
-        let loadedUsd = Array.isArray(parsed) ? {} : (parsed.usdBalances || {});
+        
+        [span_17](start_span)// Restore difficulty[span_17](end_span)
+        if (!Array.isArray(parsed) && parsed.difficulty) {
+            this.difficulty = parsed.difficulty;
+        }
 
         this.chain = chainArray.map(b => {
            const block = new Block(b.index, b.timestamp, b.data, b.previousHash);
@@ -62,7 +69,6 @@ class DataChain {
         });
         
         this.state.rebuild(this.chain);
-        this.state.usd_balances = loadedUsd;
       } else {
         this.chain = [this.createGenesisBlock()];
         this.state.rebuild(this.chain);
@@ -70,45 +76,28 @@ class DataChain {
       }
     } catch (err) {
       console.log(chalk.red('[DATACHAIN] Main chain load failed. Attempting backup recovery...'));
-      try {
-          if (fs.existsSync(this.backupFile)) {
-             const data = fs.readFileSync(this.backupFile, 'utf8');
-             const parsed = JSON.parse(data);
-             
-             let chainArray = Array.isArray(parsed) ? parsed : (parsed.chain || []);
-             let loadedUsd = Array.isArray(parsed) ? {} : (parsed.usdBalances || {});
-
-             this.chain = chainArray.map(b => {
-                 const block = new Block(b.index, b.timestamp, b.data, b.previousHash);
-                 block.nonce = b.nonce;
-                 block.hash = b.hash;
-                 return block;
-             });
-             this.state.rebuild(this.chain);
-             this.state.usd_balances = loadedUsd;
-          } else {
-             throw new Error("No backup found.");
-          }
-      } catch (backupErr) {
-          console.log(chalk.red('[DATACHAIN] Total failure. Starting fresh ledger.'));
-          this.chain = [this.createGenesisBlock()];
-          this.state.rebuild(this.chain);
-          this.saveChain();
-      }
+      this.chain = [this.createGenesisBlock()];
+      this.state.rebuild(this.chain);
+      this.saveChain();
     }
   }
 
   saveChain() {
     try {
-       // Safe atomic write operations to prevent file corruption during server restarts
        if (fs.existsSync(this.chainFile)) {
            fs.copyFileSync(this.chainFile, this.backupFile);
        }
-       
-       const dataToSave = { chain: this.chain, usdBalances: this.state.usd_balances };
+       const dataToSave = { 
+           chain: this.chain, 
+           difficulty: this.difficulty 
+       };
        fs.writeFileSync(this.tempFile, JSON.stringify(dataToSave, null, 2));
        fs.renameSync(this.tempFile, this.chainFile);
        
+       [span_18](start_span)// Snapshots every 1000 blocks[span_18](end_span)
+       if (this.chain.length % 1000 === 0) {
+           this.state.saveSnapshot(this.chain.length - 1);
+       }
     } catch(e) {
        console.log(chalk.red(`[DATACHAIN] Failed to save chain: ${e.message}`));
     }
@@ -122,7 +111,7 @@ class DataChain {
       return this.chain[this.chain.length - 1]; 
   }
 
-  getLastMarketPrice(defaultPrice = 198) {
+  getLastMarketPrice(defaultPrice = config.blockchain.starting_price) {
     for (let i = this.chain.length - 1; i >= 0; i--) {
       const block = this.chain[i];
       if (typeof block.data === 'string') continue;
@@ -136,8 +125,36 @@ class DataChain {
     return defaultPrice;
   }
 
+  adjustDifficulty() {
+      [span_19](start_span)[span_20](start_span)// Dynamic difficulty adjustment[span_19](end_span)[span_20](end_span)
+      if (this.chain.length % this.difficultyAdjustmentInterval === 0 && this.chain.length >= this.difficultyAdjustmentInterval) {
+          const previousAdjustmentBlock = this.chain[this.chain.length - this.difficultyAdjustmentInterval];
+          const latestBlock = this.getLatestBlock();
+          const timeExpected = this.difficultyAdjustmentInterval * this.targetBlockTime;
+          const timeTaken = latestBlock.timestamp - previousAdjustmentBlock.timestamp;
+
+          if (timeTaken < timeExpected / 2) {
+              this.difficulty++;
+              console.log(chalk.yellow(`[NETWORK] Difficulty increased to ${this.difficulty}`));
+          } else if (timeTaken > timeExpected * 2 && this.difficulty > 1) {
+              this.difficulty--;
+              console.log(chalk.yellow(`[NETWORK] Difficulty decreased to ${this.difficulty}`));
+          }
+      }
+  }
+
   addBlock(transactions, currentPrice = 0) {
     if (!transactions || transactions.length === 0) return false;
+
+    [span_21](start_span)// Add block reward transaction[span_21](end_span)
+    const rewardTx = {
+        from: "system",
+        to: config.blockchain.miner_address,
+        amount: config.blockchain.reward,
+        type: "MINT",
+        timestamp: Date.now()
+    };
+    transactions.push(rewardTx);
 
     const tempState = new State();
     tempState.balances = { ...this.state.balances };
@@ -157,6 +174,8 @@ class DataChain {
 
     this.chain.push(newBlock);
     this.state = tempState;
+    
+    this.adjustDifficulty();
     this.saveChain(); 
     return true;
   }

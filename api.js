@@ -2,7 +2,6 @@ import express from 'express';
 import bodyParser from 'body-parser';
 import cors from 'cors';
 import chalk from 'chalk';
-import crypto from 'crypto';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import admin from 'firebase-admin';
@@ -10,14 +9,27 @@ import mempool from './mempool.js';
 import { DataChain } from './datachain.js';
 import validator from './validator.js';
 import menuBook from './menubook.js'; 
+import './p2p.js'; [span_30](start_span)// Start P2P on launch[span_30](end_span)
+import config from './config.json' assert { type: "json" };
 
-// ======================== FIREBASE ADMIN SETUP ========================
+// ======================== SECURITY & ENV VARIABLES ========================
+// Removed hardcoded defaults. [span_31](start_span)[span_32](start_span)The server will now safely crash/log if you deploy without configuring these[span_31](end_span)[span_32](end_span).
+const INTERNAL_SECRET = process.env.INTERNAL_SECRET;
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
+const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
+const PAYPAL_API_BASE = "https://api-m.sandbox.paypal.com"; // Keep sandbox until full launch
+
+if (!INTERNAL_SECRET || INTERNAL_SECRET.length < 32) {
+    console.error(chalk.red.bold("[FATAL] INTERNAL_SECRET missing or too weak. Must be at least 32 chars."));
+    process.exit(1); 
+}
+
 try {
     if (process.env.FIREBASE_SERVICE_ACCOUNT) {
         const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
         admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     } else {
-        console.warn(chalk.yellow("[SECURITY] FIREBASE_SERVICE_ACCOUNT env var missing. Auth verification will fail."));
+        console.warn(chalk.yellow("[SECURITY] FIREBASE_SERVICE_ACCOUNT env var missing. Auth verification may fail."));
         admin.initializeApp(); 
     }
 } catch (e) {
@@ -26,15 +38,14 @@ try {
 
 const app = express();
 app.set('trust proxy', 1);
-const port = process.env.PORT || 3001;
+const port = process.env.PORT || config.network.api_port;
 
 const nexusChain = new DataChain();
 
-// 100% DECENTRALIZED PRICE SYNC
-const professionalStartingPrice = nexusChain.getLastMarketPrice(198);
+const professionalStartingPrice = nexusChain.getLastMarketPrice(config.blockchain.starting_price);
 menuBook.setInitialPrice(professionalStartingPrice);
 
-// ======================== SECURITY MIDDLEWARE ========================
+// ======================== MIDDLEWARE ========================
 app.use(helmet()); 
 app.use(cors({
     origin: '*', 
@@ -60,21 +71,15 @@ const requireAuth = async (req, res, next) => {
         req.user = decodedToken; 
         next();
     } catch (error) {
-        console.error(chalk.red("[AUTH ERROR]"), error.message);
         return res.status(401).json({ error: "Unauthorized: Invalid or Expired Token" });
     }
 };
 
-// ======================== ENV VARIABLES & API KEYS ========================
-const INTERNAL_SECRET = process.env.INTERNAL_SECRET || "nexus_secret_key";
-const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || "ARHFzdeVRE7O1Bn_TY7VidtNuK0O_oOGYgfZEqmq3zQTdsGRWHigMgDdjkiJ8c9CFmRc9610Rn5Mke8A";
-const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || "EAo7EoXoW0hy5QWsyxDT6wmLrAbN5DHNGColEtI38vddyisCz0H1aELuDxgpfZVz4cyT02YWJgosLxgd";
-const PAYPAL_API_BASE = "https://api-m.sandbox.paypal.com"; // Use https://api-m.paypal.com for Production
-
-const pendingCryptoPayments = {};
-
-// ======================== PAYPAL AUTHENTICATION (NEW IMPLEMENTATION) ========================
+// ======================== PAYPAL AUTH ========================
 async function getPayPalAccessToken() {
+    if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
+        throw new Error("PayPal credentials not configured on server.");
+    }
     const auth = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString("base64");
     const response = await fetch(`${PAYPAL_API_BASE}/v1/oauth2/token`, {
         method: "POST",
@@ -89,21 +94,18 @@ async function getPayPalAccessToken() {
     return data.access_token;
 }
 
-// ======================== INITIAL SUPPLY ========================
+// ======================== MARKET ECONOMICS ========================
 const MAX_SUPPLY = 3000000000;
-const SYSTEM_ADDRESS = "system";
 let currentPrice = professionalStartingPrice; 
 
-if (nexusChain.getBalance(SYSTEM_ADDRESS) === 0 && nexusChain.chain.length <= 1) {
-  const initTx = { from: SYSTEM_ADDRESS, to: SYSTEM_ADDRESS, amount: MAX_SUPPLY, type: "MINT", timestamp: Date.now() };
+if (nexusChain.getBalance("system") === 0 && nexusChain.chain.length <= 1) {
+  const initTx = { from: "system", to: "system", amount: MAX_SUPPLY, type: "MINT", timestamp: Date.now() };
   nexusChain.addBlock([initTx]);
-  console.log(chalk.green(`[INIT] Initial supply of ${MAX_SUPPLY} SYR allocated.`));
 }
 
-// ======================== DECENTRALIZED MARKET ECONOMICS ========================
 function updateMarketEconomics() {
     try {
-        const chainPrice = nexusChain.getLastMarketPrice(198);
+        const chainPrice = nexusChain.getLastMarketPrice(config.blockchain.starting_price);
         currentPrice = Math.max(chainPrice, menuBook.lastTradePrice);
         menuBook.setInitialPrice(currentPrice);
 
@@ -115,7 +117,7 @@ function updateMarketEconomics() {
 
         const hasUserAsks = menuBook.asks.some(a => a.uid !== "system");
         if (remaining > 0 && !hasUserAsks) {
-            const premiumPrice = currentPrice > 0 ? currentPrice * 1.02 : 198; 
+            const premiumPrice = currentPrice > 0 ? currentPrice * 1.02 : config.blockchain.starting_price; 
             menuBook.asks.push({
                 id: 'sys-liquidity-ask',
                 uid: 'system',
@@ -128,7 +130,8 @@ function updateMarketEconomics() {
 
         const hasUserBids = menuBook.bids.some(b => b.uid !== "system");
         if (circulating > 0 && !hasUserBids) {
-            const floorPrice = currentPrice > 0 ? currentPrice * 0.50 : 99;
+            [span_33](start_span)// Tightened spread floor to 90%[span_33](end_span)
+            const floorPrice = currentPrice > 0 ? currentPrice * 0.90 : config.blockchain.starting_price * 0.9;
             menuBook.bids.push({
                 id: 'sys-liquidity-bid',
                 uid: 'system',
@@ -138,33 +141,89 @@ function updateMarketEconomics() {
             });
             menuBook.bids.sort((a, b) => b.priceUsd - a.priceUsd || a.timestamp - b.timestamp);
         }
+        menuBook.saveOrders();
     } catch (e) {
         console.error(chalk.red("[ECONOMICS ERROR]"), e);
     }
 }
 updateMarketEconomics();
 
-// ======================== AUTO-MINER ========================
+// ======================== ISOLATED AUTO-MINER ========================
+[span_34](start_span)[span_35](start_span)// Prevents race conditions by making the auto-miner the ONLY component that calls addBlock[span_34](end_span)[span_35](end_span).
+let isMining = false;
 setInterval(() => {
+    if (isMining) return;
     const pendingCount = mempool.getPendingCount();
     if (pendingCount > 0) {
-        console.log(chalk.yellow(`[AUTO-MINER] Processing ${pendingCount} pending transactions...`));
+        isMining = true;
         const pendingTxs = mempool.getAndClear();
         const success = nexusChain.addBlock(pendingTxs, currentPrice);
         
         if (success) {
-            console.log(chalk.green.bold(`[CHAIN] Auto-mined Block ${nexusChain.getLatestBlock().index}.`));
             updateMarketEconomics();
         } else {
             console.log(chalk.red(`[AUTO-MINER] Block validation failed.`));
             pendingTxs.forEach(tx => mempool.addTransaction(tx));
         }
+        isMining = false;
     }
-}, 10000); 
+}, 5000); 
 
-// ======================== MENU BOOK ROUTES ========================
+// ======================== FRONTEND ENDPOINTS ========================
+app.get('/config', (req, res) => {
+    res.json({ paypalClientId: PAYPAL_CLIENT_ID });
+});
+
 app.get('/menubook', (req, res) => {
     res.json({ bids: menuBook.bids, asks: menuBook.asks, marketData: menuBook.getSpread() });
+});
+
+[span_36](start_span)// Network Stats Endpoint[span_36](end_span)
+app.get('/network', (req, res) => {
+    res.json({
+        chainLength: nexusChain.chain.length,
+        difficulty: nexusChain.difficulty,
+        mempoolCount: mempool.getPendingCount()
+    });
+});
+
+[span_37](start_span)// Price History Chart Endpoint[span_37](end_span)
+app.get('/pricehistory', (req, res) => {
+    const history = [];
+    for (const block of nexusChain.chain) {
+        if (typeof block.data === 'string') continue;
+        for (const tx of block.data) {
+            if (tx.type === 'MARKET_TRADE' && tx.amountUsd && tx.amount) {
+                history.push({ timestamp: tx.timestamp, price: tx.amountUsd / tx.amount });
+            }
+        }
+    }
+    res.json(history);
+});
+
+[span_38](start_span)// Positions Extraction Endpoint[span_38](end_span)
+app.get('/positions/:uid', requireAuth, (req, res) => {
+    if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
+    const uid = req.params.uid;
+    let totalSpent = 0;
+    let totalBought = 0;
+
+    for (const block of nexusChain.chain) {
+        if (typeof block.data === 'string') continue;
+        for (const tx of block.data) {
+            if (tx.to === uid && (tx.type === 'MARKET_TRADE' || tx.type === 'BUY')) {
+                totalSpent += tx.amountUsd || (tx.amount * currentPrice);
+                totalBought += tx.amount;
+            }
+        }
+    }
+    
+    const avgPrice = totalBought > 0 ? (totalSpent / totalBought) : 0;
+    const currentBal = nexusChain.getBalance(uid);
+    
+    res.json({
+        positions: currentBal > 0 ? [{ asset: "SYR", qty: currentBal, avgPrice: avgPrice }] : []
+    });
 });
 
 app.post('/menubook/limit', txLimiter, requireAuth, (req, res) => {
@@ -198,14 +257,7 @@ app.post('/menubook/limit', txLimiter, requireAuth, (req, res) => {
         remainingAmount = matchResult.remaining;
 
         for (const trade of executedTrades) {
-            const tx = {
-                from: trade.seller,
-                to: trade.buyer,
-                amount: trade.amountSyr,
-                amountUsd: trade.amountUsd,
-                type: 'MARKET_TRADE',
-                timestamp: Date.now()
-            };
+            const tx = { from: trade.seller, to: trade.buyer, amount: trade.amountSyr, amountUsd: trade.amountUsd, type: 'MARKET_TRADE', timestamp: Date.now() };
             mempool.addTransaction(tx);
         }
 
@@ -213,15 +265,10 @@ app.post('/menubook/limit', txLimiter, requireAuth, (req, res) => {
         if (remainingAmount > 0) {
             order = menuBook.addLimitOrder(uid, side, remainingAmount, parsedPrice);
         }
-        
-        if (executedTrades.length > 0) {
-            nexusChain.addBlock(mempool.getAndClear(), currentPrice);
-        }
 
         updateMarketEconomics();
         res.status(201).json({ message: "Limit order processed.", order, executedTrades });
     } catch (error) {
-        console.error(error);
         res.status(500).json({ error: "Internal Server Error" });
     }
 });
@@ -231,9 +278,7 @@ app.post('/menubook/market', txLimiter, requireAuth, (req, res) => {
         const { side, amountSyr } = req.body;
         const uid = req.user.uid;
 
-        if (!['BUY', 'SELL'].includes(side) || amountSyr <= 0) {
-            return res.status(400).json({ error: "Invalid market order parameters." });
-        }
+        if (!['BUY', 'SELL'].includes(side) || amountSyr <= 0) return res.status(400).json({ error: "Invalid market order parameters." });
 
         const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid);
         const availableSyr = nexusChain.getBalance(uid) - menuBook.getLockedSyr(uid);
@@ -246,45 +291,24 @@ app.post('/menubook/market', txLimiter, requireAuth, (req, res) => {
         }
 
         for (const trade of matchResult.trades) {
-            const tx = {
-                from: trade.seller,
-                to: trade.buyer,
-                amount: trade.amountSyr,
-                amountUsd: trade.amountUsd,
-                type: 'MARKET_TRADE',
-                timestamp: Date.now()
-            };
+            const tx = { from: trade.seller, to: trade.buyer, amount: trade.amountSyr, amountUsd: trade.amountUsd, type: 'MARKET_TRADE', timestamp: Date.now() };
             mempool.addTransaction(tx);
         }
 
-        if (matchResult.trades.length > 0) {
-            nexusChain.addBlock(mempool.getAndClear(), currentPrice);
-        }
-
         updateMarketEconomics();
-
         res.status(201).json({
-            message: "Market order executed",
-            executedSyr: matchResult.executedSyr,
-            remainingUnfilled: matchResult.remaining,
-            totalUsdCost: matchResult.totalUsdCost,
-            slippagePercentage: (matchResult.slippage * 100).toFixed(2) + "%",
-            trades: matchResult.trades
+            message: "Market order executed", executedSyr: matchResult.executedSyr,
+            remainingUnfilled: matchResult.remaining, totalUsdCost: matchResult.totalUsdCost,
+            slippagePercentage: (matchResult.slippage * 100).toFixed(2) + "%", trades: matchResult.trades
         });
-
     } catch (error) {
-        console.error(chalk.red("[MARKET ORDER ERROR]"), error);
         res.status(500).json({ error: "Internal Server Error" });
     }
 });
 
 app.get('/api/orders/:uid', requireAuth, (req, res) => {
     if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
-    try {
-        res.json(menuBook.getUserOrders(req.params.uid));
-    } catch (err) {
-        res.status(500).json({ error: "Failed to fetch orders." });
-    }
+    res.json(menuBook.getUserOrders(req.params.uid));
 });
 
 app.post('/api/orders/cancel', requireAuth, (req, res) => {
@@ -303,7 +327,7 @@ app.post('/api/orders/cancel', requireAuth, (req, res) => {
     }
 });
 
-// ======================== CORE BLOCKCHAIN ROUTES ========================
+// ======================== CORE BLOCKCHAIN & TRANSACTIONS ========================
 app.get('/', (req, res) => { res.json({ status: "Scientific Nexus DataChain API Node is ONLINE" }); });
 app.get('/blocks', (req, res) => { res.json(nexusChain.chain); });
 
@@ -317,11 +341,8 @@ app.get('/balance/:address', (req, res) => {
 app.get('/stats', (req, res) => {
   const remaining = nexusChain.getRemainingSupply();
   res.json({ 
-      maxSupply: MAX_SUPPLY, 
-      remainingSupply: remaining, 
-      circulatingSupply: MAX_SUPPLY - remaining, 
-      currentPrice, 
-      marketCap: (MAX_SUPPLY - remaining) * currentPrice 
+      maxSupply: MAX_SUPPLY, remainingSupply: remaining, circulatingSupply: MAX_SUPPLY - remaining, 
+      currentPrice, marketCap: (MAX_SUPPLY - remaining) * currentPrice 
   });
 });
 
@@ -333,10 +354,10 @@ app.post('/tx/new', txLimiter, requireAuth, (req, res) => {
       const tx = { from, to, amount: parseFloat(amount), type, timestamp: Date.now() };
       const requesterUid = req.user.uid;
       
-      if (type === 'BUY' || type === 'SELL') {
-          return res.status(400).json({ error: "Protocol Exception: Trades must be routed through the /menubook/limit endpoint for price discovery." });
-      }
+      [span_39](start_span)[span_40](start_span)// Cryptographic signature logic placeholder for when mobile client is updated[span_39](end_span)[span_40](end_span)
+      // if (!verifySignature(tx, req.body.signature)) return res.status(401).json({ error: "Invalid TX Signature" });
 
+      if (type === 'BUY' || type === 'SELL') return res.status(400).json({ error: "Trades must be routed through /menubook/limit." });
       if (type === 'TRANSFER' && from !== requesterUid) return res.status(403).json({ error: "Forbidden: You do not own the originating address." });
       if (!validator.validateTransactionPayload(tx)) return res.status(400).json({ error: "Malformed transaction payload." });
 
@@ -345,39 +366,16 @@ app.post('/tx/new', txLimiter, requireAuth, (req, res) => {
 
       const success = mempool.addTransaction(tx);
       if (success) {
-        nexusChain.addBlock(mempool.getAndClear(), currentPrice);
-        res.status(201).json({ message: "Transaction added to mempool and mined.", tx });
+        res.status(201).json({ message: "Transaction added to mempool.", tx });
       } else {
-        res.status(400).json({ error: "Transaction failed mempool admission." });
+        res.status(400).json({ error: "MEMPOOL_FULL" });
       }
   } catch (error) {
-      console.error(chalk.red("[TX ERROR]"), error);
       res.status(500).json({ error: "Internal Server Error." });
   }
 });
 
-app.post('/mine', (req, res) => {
-    const authHeader = req.headers.authorization;
-    if (authHeader !== `Bearer ${INTERNAL_SECRET}` && req.hostname !== 'localhost') {
-        return res.status(403).json({ error: "Forbidden" });
-    }
-    try {
-        const pendingTxs = mempool.getAndClear();
-        if (pendingTxs.length === 0) return res.status(400).json({ error: "No pending transactions." });
-
-        const success = nexusChain.addBlock(pendingTxs, currentPrice);
-        if (success) {
-            updateMarketEconomics();
-            res.json({ message: "Block Mined", block: nexusChain.getLatestBlock() });
-        } else {
-            res.status(500).json({ error: "Fatal Error: Block validation failed." });
-        }
-    } catch (error) {
-        res.status(500).json({ error: "Internal Server Error." });
-    }
-});
-
-// ======================== USD GATEWAY ROUTES ========================
+// ======================== USD & PAYPAL GATEWAY ========================
 app.get('/usd/balance/:uid', requireAuth, (req, res) => {
     if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
     const address = req.params.uid;
@@ -386,59 +384,23 @@ app.get('/usd/balance/:uid', requireAuth, (req, res) => {
     res.json({ address: address, balance: totalUsd - lockedUsd, total: totalUsd, locked: lockedUsd });
 });
 
-app.post('/usd/deposit', (req, res) => {
-    const authHeader = req.headers.authorization;
-    if (authHeader !== `Bearer ${INTERNAL_SECRET}` && req.hostname !== 'localhost') return res.status(403).json({ error: "Forbidden" });
-    try {
-        const { uid, amount } = req.body;
-        if (!uid || typeof amount !== 'number' || amount <= 0) return res.status(400).json({ error: "Invalid payload" });
-        nexusChain.state.addUsd(uid, amount);
-        nexusChain.saveChain(); 
-        res.json({ address: uid, newBalance: nexusChain.state.getUsd(uid) });
-    } catch (error) {
-        res.status(500).json({ error: "Internal Server Error" });
-    }
-});
-
-// ======================== PAYPAL NEW API INTEGRATION ========================
 app.post('/create-paypal-order', requireAuth, async (req, res) => {
     try {
         const amount = parseFloat(req.body.amount);
-        if (isNaN(amount) || amount <= 0 || amount > 10000) return res.status(400).json({ error: "Invalid amount" });
+        [span_41](start_span)if (isNaN(amount) || amount < 10 || amount > 10000) return res.status(400).json({ error: "Invalid amount" }); //[span_41](end_span)
         
         const accessToken = await getPayPalAccessToken();
-        
-        const payload = {
-            intent: "CAPTURE",
-            purchase_units: [
-                {
-                    amount: {
-                        currency_code: "USD",
-                        value: amount.toFixed(2)
-                    }
-                }
-            ]
-        };
-
         const response = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders`, {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${accessToken}`,
-            },
-            body: JSON.stringify(payload)
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+            body: JSON.stringify({ intent: "CAPTURE", purchase_units: [{ amount: { currency_code: "USD", value: amount.toFixed(2) } }] })
         });
-
         const data = await response.json();
-        
-        if (!response.ok) {
-            throw new Error(data.message || "Failed to create order on PayPal API");
-        }
-
+        if (!response.ok) throw new Error(data.message);
         res.json({ id: data.id });
     } catch (error) {
         console.error(chalk.red("[PAYPAL CREATE ERROR]"), error);
-        res.status(500).json({ error: "Failed to communicate with PayPal Sandbox." });
+        res.status(500).json({ error: "[Sys-err] Payment system offline. Check configuration." });
     }
 });
 
@@ -448,62 +410,47 @@ app.post('/capture-paypal-order', requireAuth, async (req, res) => {
         if (uid !== req.user.uid) return res.status(403).json({ error: "Forbidden" });
 
         const accessToken = await getPayPalAccessToken();
-
         const response = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders/${orderID}/capture`, {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${accessToken}`,
-            }
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` }
         });
 
         const data = await response.json();
+        if (!response.ok) throw new Error(data.message);
 
-        if (!response.ok) {
-            throw new Error(data.message || "Failed to capture order via PayPal API");
-        }
-
-        // Properly drill down into the captured amount based on PayPal's standard response
         const capturedAmount = parseFloat(data.purchase_units[0].payments.captures[0].amount.value);
 
-        nexusChain.state.addUsd(uid, capturedAmount);
-        nexusChain.saveChain();
-        
-        // Return exactly what the frontend is expecting
+        [span_42](start_span)// Immutably record the deposit on-chain[span_42](end_span)
+        const depositTx = { from: "paypal-gateway", to: uid, amount: capturedAmount, type: 'USD_DEPOSIT', timestamp: Date.now() };
+        mempool.addTransaction(depositTx);
+
         res.json({ status: 'COMPLETED', amount: capturedAmount });
     } catch (error) {
         console.error(chalk.red("[PAYPAL CAPTURE ERROR]"), error);
-        res.status(500).json({ error: "Failed to capture PayPal order." });
+        res.status(500).json({ error: "[Sys-err] Payment system offline. Capture failed." });
     }
 });
 
-app.post('/create-crypto-payment', requireAuth, async (req, res) => {
+[span_43](start_span)// Implement USD Withdrawals[span_43](end_span)
+app.post('/usd/withdraw', requireAuth, (req, res) => {
     try {
-        const { uid, amountUsd } = req.body;
+        const { uid, amount } = req.body;
         if (uid !== req.user.uid) return res.status(403).json({ error: "Forbidden" });
-        
-        const paymentId = "CRYPTO_" + crypto.randomBytes(6).toString('hex');
-        const amountBtc = (parseFloat(amountUsd) / 65000).toFixed(6); 
-        pendingCryptoPayments[paymentId] = { uid, amountUsd: parseFloat(amountUsd), status: 'pending', timestamp: Date.now() };
-        res.json({ paymentId, address: "bc1q" + crypto.randomBytes(16).toString('hex'), amount: amountBtc });
-    } catch (error) {
-        res.status(500).json({ error: "Failed to initialize crypto gateway." });
-    }
-});
+        if (typeof amount !== 'number' || amount < 10) return res.status(400).json({ error: "Invalid withdrawal amount." });
 
-app.get('/crypto/status/:paymentId', requireAuth, async (req, res) => {
-    try {
-        const payment = pendingCryptoPayments[req.params.paymentId];
-        if (!payment || payment.uid !== req.user.uid) return res.status(404).json({ error: "Payment not found or forbidden." });
+        const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid);
+        if (availableUsd < amount) return res.status(400).json({ error: "Insufficient available USD." });
 
-        if (payment.status === 'pending' && (Date.now() - payment.timestamp) > 15000) {
-            payment.status = 'confirmed';
-            nexusChain.state.addUsd(payment.uid, payment.amountUsd);
-            nexusChain.saveChain();
-        }
-        res.json({ status: payment.status });
-    } catch (error) {
-        res.status(500).json({ error: "Failed to check crypto status." });
+        // Immutably record withdrawal
+        const withdrawTx = { from: uid, to: "paypal-gateway", amount: amount, type: 'USD_WITHDRAWAL', timestamp: Date.now() };
+        mempool.addTransaction(withdrawTx);
+
+        // Note: Real payout integration would go here. For now, it logs and deducts locally.
+        console.log(chalk.green(`[PAYOUT] Processing $${amount} withdrawal for ${uid}`));
+
+        res.json({ success: true, message: "Withdrawal processing." });
+    } catch (err) {
+        res.status(500).json({ error: "Internal Server Error" });
     }
 });
 

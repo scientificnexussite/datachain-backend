@@ -41,8 +41,8 @@ class DataChain {
     this.tempFile = path.join(volumePath, 'chain.json.tmp'); 
     
     this.difficulty = 2;
-    this.difficultyAdjustmentInterval = 100; // Blocks
-    this.targetBlockTime = 10000; // 10 seconds 
+    this.difficultyAdjustmentInterval = 100; 
+    this.targetBlockTime = 10000;  
     this.state = new State();
     
     this.loadChain();
@@ -56,7 +56,6 @@ class DataChain {
         
         let chainArray = Array.isArray(parsed) ? parsed : (parsed.chain || []);
         
-        // Restore difficulty
         if (!Array.isArray(parsed) && parsed.difficulty) {
             this.difficulty = parsed.difficulty;
         }
@@ -69,6 +68,17 @@ class DataChain {
         });
         
         this.state.rebuild(this.chain);
+
+        // --- LEGACY MIGRATION: CRITICAL FIX FOR MISSING BALANCES ---
+        // Restore USD and SYR balances from the old chain.json structure so historical replay failures don't wipe them.
+        if (!Array.isArray(parsed) && parsed.usd_balances) {
+            Object.assign(this.state.usd_balances, parsed.usd_balances);
+        }
+        // Only override SYR balances if we don't have a modern snapshot to ensure integrity
+        if (!Array.isArray(parsed) && parsed.balances && !fs.existsSync(this.state.snapshotFile)) {
+            Object.assign(this.state.balances, parsed.balances);
+        }
+
       } else {
         this.chain = [this.createGenesisBlock()];
         this.state.rebuild(this.chain);
@@ -94,7 +104,6 @@ class DataChain {
        fs.writeFileSync(this.tempFile, JSON.stringify(dataToSave, null, 2));
        fs.renameSync(this.tempFile, this.chainFile);
        
-       // Snapshots every 1000 blocks
        if (this.chain.length % 1000 === 0) {
            this.state.saveSnapshot(this.chain.length - 1);
        }
@@ -126,7 +135,6 @@ class DataChain {
   }
 
   adjustDifficulty() {
-      // Dynamic difficulty adjustment
       if (this.chain.length % this.difficultyAdjustmentInterval === 0 && this.chain.length >= this.difficultyAdjustmentInterval) {
           const previousAdjustmentBlock = this.chain[this.chain.length - this.difficultyAdjustmentInterval];
           const latestBlock = this.getLatestBlock();
@@ -146,7 +154,6 @@ class DataChain {
   addBlock(transactions, currentPrice = 0) {
     if (!transactions || transactions.length === 0) return false;
 
-    // Add block reward transaction
     const rewardTx = {
         from: "system",
         to: config.blockchain.miner_address,

@@ -5,21 +5,20 @@ import chalk from 'chalk';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import admin from 'firebase-admin';
-import crypto from 'crypto'; // Added for secure secret generation
+import crypto from 'crypto'; 
 import mempool from './mempool.js';
 import { DataChain } from './datachain.js';
 import validator from './validator.js';
 import menuBook from './menubook.js'; 
-import './p2p.js'; // Start P2P on launch
+import './p2p.js'; 
 import config from './config.json' with { type: "json" };
 
 // ======================== SECURITY & ENV VARIABLES ========================
 let INTERNAL_SECRET = process.env.INTERNAL_SECRET;
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
-const PAYPAL_API_BASE = "https://api-m.sandbox.paypal.com"; // Keep sandbox until full launch
+const PAYPAL_API_BASE = "https://api-m.sandbox.paypal.com"; 
 
-// Graceful fallback to prevent Railway deployment crash loops while maintaining security
 if (!INTERNAL_SECRET || INTERNAL_SECRET.length < 32) {
     console.error(chalk.yellow.bold("[SECURITY] INTERNAL_SECRET missing or too weak in env variables."));
     console.warn(chalk.yellow("[SECURITY] Auto-generating a secure 32-byte session secret to prevent crash."));
@@ -132,7 +131,6 @@ function updateMarketEconomics() {
 
         const hasUserBids = menuBook.bids.some(b => b.uid !== "system");
         if (circulating > 0 && !hasUserBids) {
-            // Tightened spread floor to 90%
             const floorPrice = currentPrice > 0 ? currentPrice * 0.90 : config.blockchain.starting_price * 0.9;
             menuBook.bids.push({
                 id: 'sys-liquidity-bid',
@@ -151,7 +149,6 @@ function updateMarketEconomics() {
 updateMarketEconomics();
 
 // ======================== ISOLATED AUTO-MINER ========================
-// Prevents race conditions by making the auto-miner the ONLY component that calls addBlock.
 let isMining = false;
 setInterval(() => {
     if (isMining) return;
@@ -180,7 +177,6 @@ app.get('/menubook', (req, res) => {
     res.json({ bids: menuBook.bids, asks: menuBook.asks, marketData: menuBook.getSpread() });
 });
 
-// Network Stats Endpoint
 app.get('/network', (req, res) => {
     res.json({
         chainLength: nexusChain.chain.length,
@@ -189,21 +185,32 @@ app.get('/network', (req, res) => {
     });
 });
 
-// Price History Chart Endpoint
+// Fixed Price History for Lightweight Charts
 app.get('/pricehistory', (req, res) => {
     const history = [];
+    
+    // Ensure we always have a baseline Genesis data point so the chart is never blank
+    history.push({ 
+        timestamp: new Date(config.blockchain.genesis_date).getTime(), 
+        price: config.blockchain.starting_price 
+    });
+
     for (const block of nexusChain.chain) {
         if (typeof block.data === 'string') continue;
         for (const tx of block.data) {
             if (tx.type === 'MARKET_TRADE' && tx.amountUsd && tx.amount) {
                 history.push({ timestamp: tx.timestamp, price: tx.amountUsd / tx.amount });
+            } else if ((tx.type === 'BUY' || tx.type === 'SELL') && tx.priceUsd) {
+                history.push({ timestamp: tx.timestamp, price: tx.priceUsd });
             }
         }
     }
+    
+    // Ensure we always have the current price as the closing data point
+    history.push({ timestamp: Date.now(), price: currentPrice });
     res.json(history);
 });
 
-// Positions Extraction Endpoint
 app.get('/positions/:uid', requireAuth, (req, res) => {
     if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
     const uid = req.params.uid;
@@ -355,9 +362,6 @@ app.post('/tx/new', txLimiter, requireAuth, (req, res) => {
       const { from, to, amount, type } = req.body;
       const tx = { from, to, amount: parseFloat(amount), type, timestamp: Date.now() };
       const requesterUid = req.user.uid;
-      
-      // Cryptographic signature logic placeholder for when mobile client is updated
-      // if (!verifySignature(tx, req.body.signature)) return res.status(401).json({ error: "Invalid TX Signature" });
 
       if (type === 'BUY' || type === 'SELL') return res.status(400).json({ error: "Trades must be routed through /menubook/limit." });
       if (type === 'TRANSFER' && from !== requesterUid) return res.status(403).json({ error: "Forbidden: You do not own the originating address." });
@@ -420,9 +424,9 @@ app.post('/capture-paypal-order', requireAuth, async (req, res) => {
         const data = await response.json();
         if (!response.ok) throw new Error(data.message);
 
-        const capturedAmount = parseFloat(data.purchase_units.payments.captures.amount.value);
+        // Fixed PayPal Array structure access bug
+        const capturedAmount = parseFloat(data.purchase_units[0].payments.captures[0].amount.value);
 
-        // Immutably record the deposit on-chain
         const depositTx = { from: "paypal-gateway", to: uid, amount: capturedAmount, type: 'USD_DEPOSIT', timestamp: Date.now() };
         mempool.addTransaction(depositTx);
 
@@ -433,7 +437,6 @@ app.post('/capture-paypal-order', requireAuth, async (req, res) => {
     }
 });
 
-// Implement USD Withdrawals
 app.post('/usd/withdraw', requireAuth, (req, res) => {
     try {
         const { uid, amount } = req.body;
@@ -443,11 +446,9 @@ app.post('/usd/withdraw', requireAuth, (req, res) => {
         const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid);
         if (availableUsd < amount) return res.status(400).json({ error: "Insufficient available USD." });
 
-        // Immutably record withdrawal
         const withdrawTx = { from: uid, to: "paypal-gateway", amount: amount, type: 'USD_WITHDRAWAL', timestamp: Date.now() };
         mempool.addTransaction(withdrawTx);
 
-        // Note: Real payout integration would go here. For now, it logs and deducts locally.
         console.log(chalk.green(`[PAYOUT] Processing $${amount} withdrawal for ${uid}`));
 
         res.json({ success: true, message: "Withdrawal processing." });

@@ -27,8 +27,8 @@ class State {
     return true;
   }
 
-  // Unified validation for both live and historical transactions
-  applyTransaction(tx, currentPrice = 0) {
+  // Unified validation for live transactions. Bypasses strict checks during historical replay to preserve chain integrity.
+  applyTransaction(tx, currentPrice = 0, isReplay = false) {
     const { from, to, amount, type } = tx;
     
     if (type === "MINT" && from === "system") {
@@ -42,17 +42,20 @@ class State {
     }
 
     if (type === "USD_WITHDRAWAL") {
-        return this.deductUsd(from, amount);
+        if (!isReplay && !this.deductUsd(from, amount)) return false;
+        if (isReplay) this.usd_balances[from] = (this.usd_balances[from] || 0) - amount;
+        return true;
     }
 
     if (type === "MARKET_TRADE") {
         const { amountUsd } = tx;
-        if (!this.deductUsd(to, amountUsd)) return false; 
+        if (!isReplay && !this.deductUsd(to, amountUsd)) return false; 
         
         const sellerBalance = this.balances[from] || 0;
-        if (sellerBalance < amount) return false; 
+        if (!isReplay && sellerBalance < amount) return false; 
         
-        this.balances[from] = sellerBalance - amount;
+        if (isReplay) this.usd_balances[to] = (this.usd_balances[to] || 0) - amountUsd;
+        this.balances[from] = (this.balances[from] || 0) - amount;
         this.balances[to] = (this.balances[to] || 0) + amount;
         this.addUsd(from, amountUsd);
         return true;
@@ -60,33 +63,34 @@ class State {
 
     if (type === "BUY") {
         const cost = amount * currentPrice;
-        if (!this.deductUsd(to, cost)) return false; 
+        if (!isReplay && !this.deductUsd(to, cost)) return false; 
         
         const sysBalance = this.balances[from] || 0;
-        if (sysBalance < amount) return false;
+        if (!isReplay && sysBalance < amount) return false;
         
-        this.balances[from] = sysBalance - amount;
+        if (isReplay) this.usd_balances[to] = (this.usd_balances[to] || 0) - cost;
+        this.balances[from] = (this.balances[from] || 0) - amount;
         this.balances[to] = (this.balances[to] || 0) + amount;
         return true;
     }
 
     if (type === "SELL") {
         const senderBalance = this.balances[from] || 0;
-        if (senderBalance < amount) return false;
+        if (!isReplay && senderBalance < amount) return false;
         
         const revenue = amount * currentPrice;
         this.addUsd(from, revenue); 
         
-        this.balances[from] = senderBalance - amount;
+        this.balances[from] = (this.balances[from] || 0) - amount;
         this.balances[to] = (this.balances[to] || 0) + amount;
         return true;
     }
 
     // Standard Transfer
     const senderBalance = this.balances[from] || 0;
-    if (senderBalance < amount) return false;
+    if (!isReplay && senderBalance < amount) return false;
     
-    this.balances[from] = senderBalance - amount;
+    this.balances[from] = (this.balances[from] || 0) - amount;
     this.balances[to] = (this.balances[to] || 0) + amount;
     return true;
   }
@@ -96,7 +100,6 @@ class State {
     this.usd_balances = {};
     let startIndex = 0;
 
-    // Snapshot restoration
     try {
         if (fs.existsSync(this.snapshotFile)) {
             const snapshot = JSON.parse(fs.readFileSync(this.snapshotFile, 'utf8'));
@@ -112,7 +115,7 @@ class State {
       const block = chain[i];
       if (typeof block.data === 'string') continue;
       for (const tx of block.data) {
-        this.applyTransaction(tx); 
+        this.applyTransaction(tx, 0, true); // Flagged as Replay
       }
     }
   }

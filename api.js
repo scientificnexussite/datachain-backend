@@ -107,7 +107,8 @@ if (nexusChain.getBalance("system") === 0 && nexusChain.chain.length <= 1) {
 function updateMarketEconomics() {
     try {
         const chainPrice = nexusChain.getLastMarketPrice(config.blockchain.starting_price);
-        currentPrice = Math.max(chainPrice, menuBook.lastTradePrice);
+        // Fix 5: Use actual last trade price instead of Math.max ratchet so price can move both up AND down
+        currentPrice = menuBook.lastTradePrice > 0 ? menuBook.lastTradePrice : chainPrice;
         menuBook.setInitialPrice(currentPrice);
 
         const remaining = nexusChain.getRemainingSupply();
@@ -118,14 +119,27 @@ function updateMarketEconomics() {
 
         const hasUserAsks = menuBook.asks.some(a => a.uid !== "system");
         if (remaining > 0 && !hasUserAsks) {
-            const premiumPrice = currentPrice > 0 ? currentPrice * 1.02 : config.blockchain.starting_price; 
-            menuBook.asks.push({
-                id: 'sys-liquidity-ask',
-                uid: 'system',
-                amountSyr: Math.min(remaining, 5000), 
-                priceUsd: premiumPrice,
-                timestamp: Date.now()
-            });
+            // Fix 7: Place tiered system asks so the price rises in steps as users buy,
+            // preventing the instant "no liquidity" wall from a single thin order.
+            const tiers = [
+                { multiplier: 1.02, amount: Math.min(remaining, 2000) },
+                { multiplier: 1.05, amount: Math.min(remaining, 2000) },
+                { multiplier: 1.10, amount: Math.min(remaining, 1000) },
+            ];
+            let tierRemaining = remaining;
+            for (const tier of tiers) {
+                if (tierRemaining <= 0) break;
+                const tierAmount = Math.min(tier.amount, tierRemaining);
+                const tierPrice = currentPrice > 0 ? currentPrice * tier.multiplier : config.blockchain.starting_price * tier.multiplier;
+                menuBook.asks.push({
+                    id: `sys-liquidity-ask-${tier.multiplier}`,
+                    uid: 'system',
+                    amountSyr: tierAmount,
+                    priceUsd: tierPrice,
+                    timestamp: Date.now()
+                });
+                tierRemaining -= tierAmount;
+            }
             menuBook.asks.sort((a, b) => a.priceUsd - b.priceUsd || a.timestamp - b.timestamp);
         }
 
@@ -169,6 +183,11 @@ setInterval(() => {
 }, 5000); 
 
 // ======================== FRONTEND ENDPOINTS ========================
+// Fix 12: Health endpoint for keep-alive monitoring (e.g. UptimeRobot ping every 5 min)
+app.get('/health', (req, res) => {
+    res.json({ status: 'alive', chainLength: nexusChain.chain.length, timestamp: Date.now() });
+});
+
 app.get('/config', (req, res) => {
     res.json({ paypalClientId: PAYPAL_CLIENT_ID });
 });
@@ -338,7 +357,25 @@ app.post('/api/orders/cancel', requireAuth, (req, res) => {
 
 // ======================== CORE BLOCKCHAIN & TRANSACTIONS ========================
 app.get('/', (req, res) => { res.json({ status: "Scientific Nexus DataChain API Node is ONLINE" }); });
-app.get('/blocks', (req, res) => { res.json(nexusChain.chain); });
+
+// Fix 15: Paginated /blocks endpoint — supports ?limit=50&offset=0 query params.
+// Falls back to returning the full chain if no params are given (backward compatible).
+app.get('/blocks', (req, res) => {
+    const chain = nexusChain.chain;
+    const total = chain.length;
+
+    if (req.query.limit !== undefined || req.query.offset !== undefined) {
+        const limit = Math.min(parseInt(req.query.limit) || 50, 200); // cap at 200 per page
+        const offset = parseInt(req.query.offset) || 0;
+        // Newest first — reverse the chain then slice the page
+        const reversed = [...chain].reverse();
+        const page = reversed.slice(offset, offset + limit);
+        return res.json({ blocks: page, total, offset, limit });
+    }
+
+    // No query params — return full chain for backward compatibility
+    res.json(chain);
+});
 
 app.get('/balance/:address', (req, res) => { 
     const address = req.params.address;

@@ -104,7 +104,9 @@ class DataChain {
        fs.writeFileSync(this.tempFile, JSON.stringify(dataToSave, null, 2));
        fs.renameSync(this.tempFile, this.chainFile);
        
-       if (this.chain.length % 1000 === 0) {
+       // Fix 11: Save snapshot every 100 blocks (was 1000) so a crash loses at most 100 blocks
+       // of replay work instead of 999, and USD balances stay accurate after restarts.
+       if (this.chain.length % 100 === 0) {
            this.state.saveSnapshot(this.chain.length - 1);
        }
     } catch(e) {

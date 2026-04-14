@@ -62,7 +62,9 @@ class State {
     }
 
     if (type === "BUY") {
-        const cost = amount * currentPrice;
+        // Fix 6: During replay currentPrice is 0, so we must read the stored amountUsd on the tx
+        // rather than recalculating cost = amount * currentPrice (which gives $0 and corrupts balances).
+        const cost = tx.amountUsd !== undefined ? tx.amountUsd : (amount * currentPrice);
         if (!isReplay && !this.deductUsd(to, cost)) return false; 
         
         const sysBalance = this.balances[from] || 0;

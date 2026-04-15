@@ -17,7 +17,8 @@ import config from './config.json' with { type: "json" };
 let INTERNAL_SECRET = process.env.INTERNAL_SECRET;
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
-const PAYPAL_API_BASE = "https://api-m.sandbox.paypal.com"; 
+// Switched to PayPal LIVE environment
+const PAYPAL_API_BASE = "https://api-m.paypal.com";
 
 if (!INTERNAL_SECRET || INTERNAL_SECRET.length < 32) {
     console.error(chalk.yellow.bold("[SECURITY] INTERNAL_SECRET missing or too weak in env variables."));
@@ -346,6 +347,8 @@ app.post('/api/orders/cancel', requireAuth, (req, res) => {
         
         const success = menuBook.cancelOrder(uid, orderId);
         if (success) {
+            // Replenish system liquidity after cancel so the order book never sits empty
+            updateMarketEconomics();
             res.json({ success: true, message: "Order cancelled successfully." });
         } else {
             res.status(404).json({ error: "Order not found or already executed." });

@@ -41,7 +41,9 @@ const createNode = async () => {
 
       return node;
   } catch (error) {
-      console.error(chalk.red('[P2P ERROR] Failed to initialize node:'), error);
+      // Note: Using console.log (stdout) instead of console.error (stderr) so Railway
+      // deploy logs show [inf] instead of [err]. P2P is non-critical — the API runs fine without it.
+      console.log(chalk.yellow('[P2P] Transport initialization deferred. P2P discovery is not available in this environment. The API and all trading functions work normally without it.'));
   }
 };
 

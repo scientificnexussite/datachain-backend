@@ -17,11 +17,9 @@ import config from './config.json' with { type: "json" };
 let INTERNAL_SECRET = process.env.INTERNAL_SECRET;
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
-// Switched to PayPal LIVE environment
 const PAYPAL_API_BASE = "https://api-m.paypal.com";
 
 if (!INTERNAL_SECRET || INTERNAL_SECRET.length < 32) {
-    console.error(chalk.yellow.bold("[SECURITY] INTERNAL_SECRET missing or too weak in env variables."));
     console.warn(chalk.yellow("[SECURITY] Auto-generating a secure 32-byte session secret to prevent crash."));
     INTERNAL_SECRET = crypto.randomBytes(32).toString('hex');
 }
@@ -31,7 +29,6 @@ try {
         const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
         admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     } else {
-        console.warn(chalk.yellow("[SECURITY] FIREBASE_SERVICE_ACCOUNT env var missing. Auth verification may fail."));
         admin.initializeApp(); 
     }
 } catch (e) {
@@ -86,10 +83,7 @@ async function getPayPalAccessToken() {
     const response = await fetch(`${PAYPAL_API_BASE}/v1/oauth2/token`, {
         method: "POST",
         body: "grant_type=client_credentials",
-        headers: {
-            Authorization: `Basic ${auth}`,
-            "Content-Type": "application/x-www-form-urlencoded"
-        },
+        headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/x-www-form-urlencoded" },
     });
     const data = await response.json();
     if (!response.ok) throw new Error("Failed to get PayPal Access Token");
@@ -105,12 +99,12 @@ if (nexusChain.getBalance("system") === 0 && nexusChain.chain.length <= 1) {
   nexusChain.addBlock([initTx]);
 }
 
-function updateMarketEconomics() {
+// UPGRADE: Make economics update async to support async I/O
+async function updateMarketEconomics() {
     try {
         const chainPrice = nexusChain.getLastMarketPrice(config.blockchain.starting_price);
-        // Fix 5: Use actual last trade price instead of Math.max ratchet so price can move both up AND down
         currentPrice = menuBook.lastTradePrice > 0 ? menuBook.lastTradePrice : chainPrice;
-        menuBook.setInitialPrice(currentPrice);
+        await menuBook.setInitialPrice(currentPrice);
 
         const remaining = nexusChain.getRemainingSupply();
         const circulating = MAX_SUPPLY - remaining;
@@ -120,8 +114,6 @@ function updateMarketEconomics() {
 
         const hasUserAsks = menuBook.asks.some(a => a.uid !== "system");
         if (remaining > 0 && !hasUserAsks) {
-            // Fix 7: Place tiered system asks so the price rises in steps as users buy,
-            // preventing the instant "no liquidity" wall from a single thin order.
             const tiers = [
                 { multiplier: 1.02, amount: Math.min(remaining, 2000) },
                 { multiplier: 1.05, amount: Math.min(remaining, 2000) },
@@ -132,13 +124,7 @@ function updateMarketEconomics() {
                 if (tierRemaining <= 0) break;
                 const tierAmount = Math.min(tier.amount, tierRemaining);
                 const tierPrice = currentPrice > 0 ? currentPrice * tier.multiplier : config.blockchain.starting_price * tier.multiplier;
-                menuBook.asks.push({
-                    id: `sys-liquidity-ask-${tier.multiplier}`,
-                    uid: 'system',
-                    amountSyr: tierAmount,
-                    priceUsd: tierPrice,
-                    timestamp: Date.now()
-                });
+                menuBook.asks.push({ id: `sys-liquidity-ask-${tier.multiplier}`, uid: 'system', amountSyr: tierAmount, priceUsd: tierPrice, timestamp: Date.now() });
                 tierRemaining -= tierAmount;
             }
             menuBook.asks.sort((a, b) => a.priceUsd - b.priceUsd || a.timestamp - b.timestamp);
@@ -147,34 +133,29 @@ function updateMarketEconomics() {
         const hasUserBids = menuBook.bids.some(b => b.uid !== "system");
         if (circulating > 0 && !hasUserBids) {
             const floorPrice = currentPrice > 0 ? currentPrice * 0.90 : config.blockchain.starting_price * 0.9;
-            menuBook.bids.push({
-                id: 'sys-liquidity-bid',
-                uid: 'system',
-                amountSyr: Math.min(circulating, 1000), 
-                priceUsd: floorPrice,
-                timestamp: Date.now()
-            });
+            menuBook.bids.push({ id: 'sys-liquidity-bid', uid: 'system', amountSyr: Math.min(circulating, 1000), priceUsd: floorPrice, timestamp: Date.now() });
             menuBook.bids.sort((a, b) => b.priceUsd - a.priceUsd || a.timestamp - b.timestamp);
         }
-        menuBook.saveOrders();
+        await menuBook.saveOrders();
     } catch (e) {
         console.error(chalk.red("[ECONOMICS ERROR]"), e);
     }
 }
-updateMarketEconomics();
+updateMarketEconomics(); // Initial async fire-and-forget
 
 // ======================== ISOLATED AUTO-MINER ========================
 let isMining = false;
-setInterval(() => {
+setInterval(async () => {
     if (isMining) return;
     const pendingCount = mempool.getPendingCount();
     if (pendingCount > 0) {
         isMining = true;
         const pendingTxs = mempool.getAndClear();
-        const success = nexusChain.addBlock(pendingTxs, currentPrice);
+        // UPGRADE: Now safely awaits the non-blocking block mining without freezing API
+        const success = await nexusChain.addBlock(pendingTxs, currentPrice);
         
         if (success) {
-            updateMarketEconomics();
+            await updateMarketEconomics();
         } else {
             console.log(chalk.red(`[AUTO-MINER] Block validation failed.`));
             pendingTxs.forEach(tx => mempool.addTransaction(tx));
@@ -184,37 +165,17 @@ setInterval(() => {
 }, 5000); 
 
 // ======================== FRONTEND ENDPOINTS ========================
-// Fix 12: Health endpoint for keep-alive monitoring (e.g. UptimeRobot ping every 5 min)
-app.get('/health', (req, res) => {
-    res.json({ status: 'alive', chainLength: nexusChain.chain.length, timestamp: Date.now() });
-});
-
-app.get('/config', (req, res) => {
-    res.json({ paypalClientId: PAYPAL_CLIENT_ID });
-});
-
-app.get('/menubook', (req, res) => {
-    res.json({ bids: menuBook.bids, asks: menuBook.asks, marketData: menuBook.getSpread() });
-});
+app.get('/health', (req, res) => { res.json({ status: 'alive', chainLength: nexusChain.chain.length, timestamp: Date.now() }); });
+app.get('/config', (req, res) => { res.json({ paypalClientId: PAYPAL_CLIENT_ID }); });
+app.get('/menubook', (req, res) => { res.json({ bids: menuBook.bids, asks: menuBook.asks, marketData: menuBook.getSpread() }); });
 
 app.get('/network', (req, res) => {
-    res.json({
-        chainLength: nexusChain.chain.length,
-        difficulty: nexusChain.difficulty,
-        mempoolCount: mempool.getPendingCount()
-    });
+    res.json({ chainLength: nexusChain.chain.length, difficulty: nexusChain.difficulty, mempoolCount: mempool.getPendingCount() });
 });
 
-// Fixed Price History for Lightweight Charts
 app.get('/pricehistory', (req, res) => {
     const history = [];
-    
-    // Ensure we always have a baseline Genesis data point so the chart is never blank
-    history.push({ 
-        timestamp: new Date(config.blockchain.genesis_date).getTime(), 
-        price: config.blockchain.starting_price 
-    });
-
+    history.push({ timestamp: new Date(config.blockchain.genesis_date).getTime(), price: config.blockchain.starting_price });
     for (const block of nexusChain.chain) {
         if (typeof block.data === 'string') continue;
         for (const tx of block.data) {
@@ -225,8 +186,6 @@ app.get('/pricehistory', (req, res) => {
             }
         }
     }
-    
-    // Ensure we always have the current price as the closing data point
     history.push({ timestamp: Date.now(), price: currentPrice });
     res.json(history);
 });
@@ -234,8 +193,7 @@ app.get('/pricehistory', (req, res) => {
 app.get('/positions/:uid', requireAuth, (req, res) => {
     if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
     const uid = req.params.uid;
-    let totalSpent = 0;
-    let totalBought = 0;
+    let totalSpent = 0; let totalBought = 0;
 
     for (const block of nexusChain.chain) {
         if (typeof block.data === 'string') continue;
@@ -249,20 +207,15 @@ app.get('/positions/:uid', requireAuth, (req, res) => {
     
     const avgPrice = totalBought > 0 ? (totalSpent / totalBought) : 0;
     const currentBal = nexusChain.getBalance(uid);
-    
-    res.json({
-        positions: currentBal > 0 ? [{ asset: "SYR", qty: currentBal, avgPrice: avgPrice }] : []
-    });
+    res.json({ positions: currentBal > 0 ? [{ asset: "SYR", qty: currentBal, avgPrice: avgPrice }] : [] });
 });
 
-app.post('/menubook/limit', txLimiter, requireAuth, (req, res) => {
+app.post('/menubook/limit', txLimiter, requireAuth, async (req, res) => {
     try {
         const { side, amountSyr, priceUsd } = req.body;
         const uid = req.user.uid;
         
-        if (!['BUY', 'SELL'].includes(side) || amountSyr <= 0 || priceUsd <= 0) {
-            return res.status(400).json({ error: "Invalid limit order parameters." });
-        }
+        if (!['BUY', 'SELL'].includes(side) || amountSyr <= 0 || priceUsd <= 0) return res.status(400).json({ error: "Invalid limit order parameters." });
 
         const parsedAmount = parseFloat(amountSyr);
         const parsedPrice = parseFloat(priceUsd);
@@ -280,29 +233,23 @@ app.post('/menubook/limit', txLimiter, requireAuth, (req, res) => {
         let executedTrades = [];
         const fundsToCheck = side === 'BUY' ? (nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid)) : (nexusChain.getBalance(uid) - menuBook.getLockedSyr(uid));
         
-        const matchResult = menuBook.matchMarketOrder(uid, side, remainingAmount, fundsToCheck, parsedPrice);
-        
+        const matchResult = await menuBook.matchMarketOrder(uid, side, remainingAmount, fundsToCheck, parsedPrice);
         executedTrades = matchResult.trades;
         remainingAmount = matchResult.remaining;
 
         for (const trade of executedTrades) {
-            const tx = { from: trade.seller, to: trade.buyer, amount: trade.amountSyr, amountUsd: trade.amountUsd, type: 'MARKET_TRADE', timestamp: Date.now() };
-            mempool.addTransaction(tx);
+            mempool.addTransaction({ from: trade.seller, to: trade.buyer, amount: trade.amountSyr, amountUsd: trade.amountUsd, type: 'MARKET_TRADE', timestamp: Date.now() });
         }
 
         let order = null;
-        if (remainingAmount > 0) {
-            order = menuBook.addLimitOrder(uid, side, remainingAmount, parsedPrice);
-        }
+        if (remainingAmount > 0) order = await menuBook.addLimitOrder(uid, side, remainingAmount, parsedPrice);
 
-        updateMarketEconomics();
+        await updateMarketEconomics();
         res.status(201).json({ message: "Limit order processed.", order, executedTrades });
-    } catch (error) {
-        res.status(500).json({ error: "Internal Server Error" });
-    }
+    } catch (error) { res.status(500).json({ error: "Internal Server Error" }); }
 });
 
-app.post('/menubook/market', txLimiter, requireAuth, (req, res) => {
+app.post('/menubook/market', txLimiter, requireAuth, async (req, res) => {
     try {
         const { side, amountSyr } = req.body;
         const uid = req.user.uid;
@@ -313,26 +260,21 @@ app.post('/menubook/market', txLimiter, requireAuth, (req, res) => {
         const availableSyr = nexusChain.getBalance(uid) - menuBook.getLockedSyr(uid);
         const fundsToCheck = side === 'BUY' ? availableUsd : availableSyr;
 
-        const matchResult = menuBook.matchMarketOrder(uid, side, parseFloat(amountSyr), fundsToCheck);
+        const matchResult = await menuBook.matchMarketOrder(uid, side, parseFloat(amountSyr), fundsToCheck);
 
-        if (matchResult.trades.length === 0) {
-            return res.status(400).json({ error: "No liquidity available in Menu Book to match order." });
-        }
+        if (matchResult.trades.length === 0) return res.status(400).json({ error: "No liquidity available in Menu Book to match order." });
 
         for (const trade of matchResult.trades) {
-            const tx = { from: trade.seller, to: trade.buyer, amount: trade.amountSyr, amountUsd: trade.amountUsd, type: 'MARKET_TRADE', timestamp: Date.now() };
-            mempool.addTransaction(tx);
+            mempool.addTransaction({ from: trade.seller, to: trade.buyer, amount: trade.amountSyr, amountUsd: trade.amountUsd, type: 'MARKET_TRADE', timestamp: Date.now() });
         }
 
-        updateMarketEconomics();
+        await updateMarketEconomics();
         res.status(201).json({
             message: "Market order executed", executedSyr: matchResult.executedSyr,
             remainingUnfilled: matchResult.remaining, totalUsdCost: matchResult.totalUsdCost,
             slippagePercentage: (matchResult.slippage * 100).toFixed(2) + "%", trades: matchResult.trades
         });
-    } catch (error) {
-        res.status(500).json({ error: "Internal Server Error" });
-    }
+    } catch (error) { res.status(500).json({ error: "Internal Server Error" }); }
 });
 
 app.get('/api/orders/:uid', requireAuth, (req, res) => {
@@ -340,43 +282,34 @@ app.get('/api/orders/:uid', requireAuth, (req, res) => {
     res.json(menuBook.getUserOrders(req.params.uid));
 });
 
-app.post('/api/orders/cancel', requireAuth, (req, res) => {
+app.post('/api/orders/cancel', requireAuth, async (req, res) => {
     try {
         const { uid, orderId } = req.body;
         if (req.user.uid !== uid) return res.status(403).json({ error: "Forbidden" });
         
-        const success = menuBook.cancelOrder(uid, orderId);
+        const success = await menuBook.cancelOrder(uid, orderId);
         if (success) {
-            // Replenish system liquidity after cancel so the order book never sits empty
-            updateMarketEconomics();
+            await updateMarketEconomics();
             res.json({ success: true, message: "Order cancelled successfully." });
         } else {
             res.status(404).json({ error: "Order not found or already executed." });
         }
-    } catch (err) {
-        res.status(500).json({ error: "Failed to cancel order." });
-    }
+    } catch (err) { res.status(500).json({ error: "Failed to cancel order." }); }
 });
 
 // ======================== CORE BLOCKCHAIN & TRANSACTIONS ========================
 app.get('/', (req, res) => { res.json({ status: "Scientific Nexus DataChain API Node is ONLINE" }); });
 
-// Fix 15: Paginated /blocks endpoint — supports ?limit=50&offset=0 query params.
-// Falls back to returning the full chain if no params are given (backward compatible).
 app.get('/blocks', (req, res) => {
     const chain = nexusChain.chain;
     const total = chain.length;
-
     if (req.query.limit !== undefined || req.query.offset !== undefined) {
-        const limit = Math.min(parseInt(req.query.limit) || 50, 200); // cap at 200 per page
+        const limit = Math.min(parseInt(req.query.limit) || 50, 200); 
         const offset = parseInt(req.query.offset) || 0;
-        // Newest first — reverse the chain then slice the page
         const reversed = [...chain].reverse();
         const page = reversed.slice(offset, offset + limit);
         return res.json({ blocks: page, total, offset, limit });
     }
-
-    // No query params — return full chain for backward compatibility
     res.json(chain);
 });
 
@@ -389,10 +322,7 @@ app.get('/balance/:address', (req, res) => {
 
 app.get('/stats', (req, res) => {
   const remaining = nexusChain.getRemainingSupply();
-  res.json({ 
-      maxSupply: MAX_SUPPLY, remainingSupply: remaining, circulatingSupply: MAX_SUPPLY - remaining, 
-      currentPrice, marketCap: (MAX_SUPPLY - remaining) * currentPrice 
-  });
+  res.json({ maxSupply: MAX_SUPPLY, remainingSupply: remaining, circulatingSupply: MAX_SUPPLY - remaining, currentPrice, marketCap: (MAX_SUPPLY - remaining) * currentPrice });
 });
 
 app.get('/supply', (req, res) => { res.json({ remainingSupply: nexusChain.getRemainingSupply() }); });
@@ -413,12 +343,8 @@ app.post('/tx/new', txLimiter, requireAuth, (req, res) => {
       const success = mempool.addTransaction(tx);
       if (success) {
         res.status(201).json({ message: "Transaction added to mempool.", tx });
-      } else {
-        res.status(400).json({ error: "MEMPOOL_FULL" });
-      }
-  } catch (error) {
-      res.status(500).json({ error: "Internal Server Error." });
-  }
+      } else { res.status(400).json({ error: "MEMPOOL_FULL" }); }
+  } catch (error) { res.status(500).json({ error: "Internal Server Error." }); }
 });
 
 // ======================== USD & PAYPAL GATEWAY ========================
@@ -434,7 +360,6 @@ app.post('/create-paypal-order', requireAuth, async (req, res) => {
     try {
         const amount = parseFloat(req.body.amount);
         if (isNaN(amount) || amount < 10 || amount > 10000) return res.status(400).json({ error: "Invalid amount" }); 
-        
         const accessToken = await getPayPalAccessToken();
         const response = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders`, {
             method: "POST",
@@ -444,10 +369,7 @@ app.post('/create-paypal-order', requireAuth, async (req, res) => {
         const data = await response.json();
         if (!response.ok) throw new Error(data.message);
         res.json({ id: data.id });
-    } catch (error) {
-        console.error(chalk.red("[PAYPAL CREATE ERROR]"), error);
-        res.status(500).json({ error: "[Sys-err] Payment system offline. Check configuration." });
-    }
+    } catch (error) { res.status(500).json({ error: "[Sys-err] Payment system offline. Check configuration." }); }
 });
 
 app.post('/capture-paypal-order', requireAuth, async (req, res) => {
@@ -464,17 +386,11 @@ app.post('/capture-paypal-order', requireAuth, async (req, res) => {
         const data = await response.json();
         if (!response.ok) throw new Error(data.message);
 
-        // Fixed PayPal Array structure access bug
         const capturedAmount = parseFloat(data.purchase_units[0].payments.captures[0].amount.value);
-
-        const depositTx = { from: "paypal-gateway", to: uid, amount: capturedAmount, type: 'USD_DEPOSIT', timestamp: Date.now() };
-        mempool.addTransaction(depositTx);
+        mempool.addTransaction({ from: "paypal-gateway", to: uid, amount: capturedAmount, type: 'USD_DEPOSIT', timestamp: Date.now() });
 
         res.json({ status: 'COMPLETED', amount: capturedAmount });
-    } catch (error) {
-        console.error(chalk.red("[PAYPAL CAPTURE ERROR]"), error);
-        res.status(500).json({ error: "[Sys-err] Payment system offline. Capture failed." });
-    }
+    } catch (error) { res.status(500).json({ error: "[Sys-err] Payment system offline. Capture failed." }); }
 });
 
 app.post('/usd/withdraw', requireAuth, (req, res) => {
@@ -486,19 +402,10 @@ app.post('/usd/withdraw', requireAuth, (req, res) => {
         const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid);
         if (availableUsd < amount) return res.status(400).json({ error: "Insufficient available USD." });
 
-        const withdrawTx = { from: uid, to: "paypal-gateway", amount: amount, type: 'USD_WITHDRAWAL', timestamp: Date.now() };
-        mempool.addTransaction(withdrawTx);
-
-        console.log(chalk.green(`[PAYOUT] Processing $${amount} withdrawal for ${uid}`));
-
+        mempool.addTransaction({ from: uid, to: "paypal-gateway", amount: amount, type: 'USD_WITHDRAWAL', timestamp: Date.now() });
         res.json({ success: true, message: "Withdrawal processing." });
-    } catch (err) {
-        res.status(500).json({ error: "Internal Server Error" });
-    }
+    } catch (err) { res.status(500).json({ error: "Internal Server Error" }); }
 });
 
 app.use((req, res) => { res.status(404).json({ error: "API Node Endpoint Not Found" }); });
-
-app.listen(port, "0.0.0.0", () => {
-  console.log(chalk.blue.bold(`--- SCIENTIFIC NEXUS API RUNNING ON PORT ${port} ---`));
-});
+app.listen(port, "0.0.0.0", () => { console.log(chalk.blue.bold(`--- SCIENTIFIC NEXUS API RUNNING ON PORT ${port} ---`)); });

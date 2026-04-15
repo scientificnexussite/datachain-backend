@@ -1,6 +1,9 @@
 import fs from 'fs';
 import path from 'path';
 
+// UPGRADE: Precision utility prevents Javascript floating point dust
+const fixDust = (num) => Number(num.toFixed(8));
+
 class State {
   constructor() {
     this.balances = {};     
@@ -16,23 +19,22 @@ class State {
   addUsd(address, amount) {
     if (typeof amount !== 'number' || isNaN(amount) || amount <= 0) return;
     const current = this.getUsd(address);
-    this.usd_balances[address] = current + amount;
+    this.usd_balances[address] = fixDust(current + amount);
   }
 
   deductUsd(address, amount) {
     if (typeof amount !== 'number' || isNaN(amount) || amount <= 0) return false;
     const current = this.getUsd(address);
     if (address !== 'system' && current < amount) return false;
-    this.usd_balances[address] = current - amount;
+    this.usd_balances[address] = fixDust(current - amount);
     return true;
   }
 
-  // Unified validation for live transactions. Bypasses strict checks during historical replay to preserve chain integrity.
   applyTransaction(tx, currentPrice = 0, isReplay = false) {
     const { from, to, amount, type } = tx;
     
     if (type === "MINT" && from === "system") {
-      this.balances[to] = (this.balances[to] || 0) + amount;
+      this.balances[to] = fixDust((this.balances[to] || 0) + amount);
       return true;
     }
 
@@ -43,7 +45,7 @@ class State {
 
     if (type === "USD_WITHDRAWAL") {
         if (!isReplay && !this.deductUsd(from, amount)) return false;
-        if (isReplay) this.usd_balances[from] = (this.usd_balances[from] || 0) - amount;
+        if (isReplay) this.usd_balances[from] = fixDust((this.usd_balances[from] || 0) - amount);
         return true;
     }
 
@@ -54,25 +56,23 @@ class State {
         const sellerBalance = this.balances[from] || 0;
         if (!isReplay && sellerBalance < amount) return false; 
         
-        if (isReplay) this.usd_balances[to] = (this.usd_balances[to] || 0) - amountUsd;
-        this.balances[from] = (this.balances[from] || 0) - amount;
-        this.balances[to] = (this.balances[to] || 0) + amount;
+        if (isReplay) this.usd_balances[to] = fixDust((this.usd_balances[to] || 0) - amountUsd);
+        this.balances[from] = fixDust((this.balances[from] || 0) - amount);
+        this.balances[to] = fixDust((this.balances[to] || 0) + amount);
         this.addUsd(from, amountUsd);
         return true;
     }
 
     if (type === "BUY") {
-        // Fix 6: During replay currentPrice is 0, so we must read the stored amountUsd on the tx
-        // rather than recalculating cost = amount * currentPrice (which gives $0 and corrupts balances).
         const cost = tx.amountUsd !== undefined ? tx.amountUsd : (amount * currentPrice);
         if (!isReplay && !this.deductUsd(to, cost)) return false; 
         
         const sysBalance = this.balances[from] || 0;
         if (!isReplay && sysBalance < amount) return false;
         
-        if (isReplay) this.usd_balances[to] = (this.usd_balances[to] || 0) - cost;
-        this.balances[from] = (this.balances[from] || 0) - amount;
-        this.balances[to] = (this.balances[to] || 0) + amount;
+        if (isReplay) this.usd_balances[to] = fixDust((this.usd_balances[to] || 0) - cost);
+        this.balances[from] = fixDust((this.balances[from] || 0) - amount);
+        this.balances[to] = fixDust((this.balances[to] || 0) + amount);
         return true;
     }
 
@@ -83,8 +83,8 @@ class State {
         const revenue = amount * currentPrice;
         this.addUsd(from, revenue); 
         
-        this.balances[from] = (this.balances[from] || 0) - amount;
-        this.balances[to] = (this.balances[to] || 0) + amount;
+        this.balances[from] = fixDust((this.balances[from] || 0) - amount);
+        this.balances[to] = fixDust((this.balances[to] || 0) + amount);
         return true;
     }
 
@@ -92,8 +92,8 @@ class State {
     const senderBalance = this.balances[from] || 0;
     if (!isReplay && senderBalance < amount) return false;
     
-    this.balances[from] = (this.balances[from] || 0) - amount;
-    this.balances[to] = (this.balances[to] || 0) + amount;
+    this.balances[from] = fixDust((this.balances[from] || 0) - amount);
+    this.balances[to] = fixDust((this.balances[to] || 0) + amount);
     return true;
   }
 
@@ -117,15 +117,16 @@ class State {
       const block = chain[i];
       if (typeof block.data === 'string') continue;
       for (const tx of block.data) {
-        this.applyTransaction(tx, 0, true); // Flagged as Replay
+        this.applyTransaction(tx, 0, true); 
       }
     }
   }
 
-  saveSnapshot(lastIndex) {
+  // UPGRADE: Async state snapshot saving
+  async saveSnapshot(lastIndex) {
       try {
           const snapshot = { balances: this.balances, usd_balances: this.usd_balances, lastIndex };
-          fs.writeFileSync(this.snapshotFile, JSON.stringify(snapshot));
+          await fs.promises.writeFile(this.snapshotFile, JSON.stringify(snapshot));
       } catch (e) {
           console.error("Snapshot save failed:", e);
       }

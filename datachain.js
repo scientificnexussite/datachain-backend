@@ -22,13 +22,23 @@ class Block {
     ).toString();
   }
 
+  // UPGRADE: Non-blocking Async Mining. Yields to event loop every 2000 hashes so API doesn't freeze.
   mineBlock(difficulty) {
-    const target = Array(difficulty + 1).join("0");
-    while (this.hash.substring(0, difficulty) !== target) {
-      this.nonce++;
-      this.hash = this.calculateHash();
-    }
-    console.log(chalk.cyan(`[DATACHAIN] Block Mined: ${this.hash}`));
+    return new Promise((resolve) => {
+      const target = Array(difficulty + 1).join("0");
+      const mineChunk = () => {
+        for (let i = 0; i < 2000; i++) {
+          if (this.hash.substring(0, difficulty) === target) {
+            console.log(chalk.cyan(`[DATACHAIN] Block Mined: ${this.hash}`));
+            return resolve(true);
+          }
+          this.nonce++;
+          this.hash = this.calculateHash();
+        }
+        setImmediate(mineChunk); // Yield to keep Express fast
+      };
+      mineChunk();
+    });
   }
 }
 
@@ -55,10 +65,7 @@ class DataChain {
         const parsed = JSON.parse(data);
         
         let chainArray = Array.isArray(parsed) ? parsed : (parsed.chain || []);
-        
-        if (!Array.isArray(parsed) && parsed.difficulty) {
-            this.difficulty = parsed.difficulty;
-        }
+        if (!Array.isArray(parsed) && parsed.difficulty) this.difficulty = parsed.difficulty;
 
         this.chain = chainArray.map(b => {
            const block = new Block(b.index, b.timestamp, b.data, b.previousHash);
@@ -69,12 +76,9 @@ class DataChain {
         
         this.state.rebuild(this.chain);
 
-        // --- LEGACY MIGRATION: CRITICAL FIX FOR MISSING BALANCES ---
-        // Restore USD and SYR balances from the old chain.json structure so historical replay failures don't wipe them.
         if (!Array.isArray(parsed) && parsed.usd_balances) {
             Object.assign(this.state.usd_balances, parsed.usd_balances);
         }
-        // Only override SYR balances if we don't have a modern snapshot to ensure integrity
         if (!Array.isArray(parsed) && parsed.balances && !fs.existsSync(this.state.snapshotFile)) {
             Object.assign(this.state.balances, parsed.balances);
         }
@@ -82,7 +86,7 @@ class DataChain {
       } else {
         this.chain = [this.createGenesisBlock()];
         this.state.rebuild(this.chain);
-        this.saveChain();
+        this.saveChain(); // initial sync save is fine
       }
     } catch (err) {
       console.log(chalk.red('[DATACHAIN] Main chain load failed. Attempting backup recovery...'));
@@ -92,22 +96,18 @@ class DataChain {
     }
   }
 
-  saveChain() {
+  // UPGRADE: Async File Saving protects the event loop during heavy I/O
+  async saveChain() {
     try {
        if (fs.existsSync(this.chainFile)) {
-           fs.copyFileSync(this.chainFile, this.backupFile);
+           await fs.promises.copyFile(this.chainFile, this.backupFile);
        }
-       const dataToSave = { 
-           chain: this.chain, 
-           difficulty: this.difficulty 
-       };
-       fs.writeFileSync(this.tempFile, JSON.stringify(dataToSave, null, 2));
-       fs.renameSync(this.tempFile, this.chainFile);
+       const dataToSave = { chain: this.chain, difficulty: this.difficulty };
+       await fs.promises.writeFile(this.tempFile, JSON.stringify(dataToSave, null, 2));
+       await fs.promises.rename(this.tempFile, this.chainFile);
        
-       // Fix 11: Save snapshot every 100 blocks (was 1000) so a crash loses at most 100 blocks
-       // of replay work instead of 999, and USD balances stay accurate after restarts.
        if (this.chain.length % 100 === 0) {
-           this.state.saveSnapshot(this.chain.length - 1);
+           await this.state.saveSnapshot(this.chain.length - 1);
        }
     } catch(e) {
        console.log(chalk.red(`[DATACHAIN] Failed to save chain: ${e.message}`));
@@ -138,10 +138,10 @@ class DataChain {
 
   adjustDifficulty() {
       if (this.chain.length % this.difficultyAdjustmentInterval === 0 && this.chain.length >= this.difficultyAdjustmentInterval) {
-          const previousAdjustmentBlock = this.chain[this.chain.length - this.difficultyAdjustmentInterval];
-          const latestBlock = this.getLatestBlock();
+          const prev = this.chain[this.chain.length - this.difficultyAdjustmentInterval];
+          const latest = this.getLatestBlock();
           const timeExpected = this.difficultyAdjustmentInterval * this.targetBlockTime;
-          const timeTaken = latestBlock.timestamp - previousAdjustmentBlock.timestamp;
+          const timeTaken = latest.timestamp - prev.timestamp;
 
           if (timeTaken < timeExpected / 2) {
               this.difficulty++;
@@ -153,7 +153,8 @@ class DataChain {
       }
   }
 
-  addBlock(transactions, currentPrice = 0) {
+  // UPGRADE: Made addBlock async to support non-blocking mining
+  async addBlock(transactions, currentPrice = 0) {
     if (!transactions || transactions.length === 0) return false;
 
     const rewardTx = {
@@ -177,7 +178,8 @@ class DataChain {
     }
 
     const newBlock = new Block(this.chain.length, Date.now(), transactions, this.getLatestBlock().hash);
-    newBlock.mineBlock(this.difficulty);
+    
+    await newBlock.mineBlock(this.difficulty); // Await the non-blocking loop
 
     if (!validator.validateBlock(newBlock, this.getLatestBlock())) return false;
 
@@ -185,7 +187,7 @@ class DataChain {
     this.state = tempState;
     
     this.adjustDifficulty();
-    this.saveChain(); 
+    await this.saveChain(); 
     return true;
   }
 

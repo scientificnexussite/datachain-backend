@@ -2,6 +2,9 @@ import chalk from 'chalk';
 import fs from 'fs';
 import path from 'path';
 
+// UPGRADE: Precision utility prevents Javascript floating point dust
+const fixDust = (num) => Number(num.toFixed(8));
+
 class MenuBook {
   constructor() {
     this.bids = []; 
@@ -29,37 +32,38 @@ class MenuBook {
       }
   }
 
-  saveOrders() {
+  // UPGRADE: Async I/O File writes
+  async saveOrders() {
       try {
           const data = { bids: this.bids, asks: this.asks, lastTradePrice: this.lastTradePrice, orderCounter: this.orderCounter };
-          fs.writeFileSync(this.ordersFile, JSON.stringify(data, null, 2));
+          await fs.promises.writeFile(this.ordersFile, JSON.stringify(data, null, 2));
       } catch (e) {
           console.error(chalk.red("[MENU BOOK] Failed to save orders to disk."));
       }
   }
 
-  setInitialPrice(price) {
+  async setInitialPrice(price) {
       this.lastTradePrice = price;
-      this.saveOrders();
+      await this.saveOrders();
   }
 
   getLockedUsd(uid) {
-    return this.bids.filter(b => b.uid === uid).reduce((sum, b) => sum + (b.amountSyr * b.priceUsd), 0);
+    return fixDust(this.bids.filter(b => b.uid === uid).reduce((sum, b) => sum + (b.amountSyr * b.priceUsd), 0));
   }
 
   getLockedSyr(uid) {
-    return this.asks.filter(a => a.uid === uid).reduce((sum, a) => sum + a.amountSyr, 0);
+    return fixDust(this.asks.filter(a => a.uid === uid).reduce((sum, a) => sum + a.amountSyr, 0));
   }
 
   getSpread() {
     const highestBid = this.bids.length > 0 ? this.bids[0].priceUsd : 0;
     const lowestAsk = this.asks.length > 0 ? this.asks[0].priceUsd : 0;
-    const spread = (highestBid > 0 && lowestAsk > 0) ? (lowestAsk - highestBid) : 0;
+    const spread = (highestBid > 0 && lowestAsk > 0) ? fixDust(lowestAsk - highestBid) : 0;
     return { highestBid, lowestAsk, spread, lastTradePrice: this.lastTradePrice };
   }
 
-  addLimitOrder(uid, side, amountSyr, priceUsd) {
-    const order = { id: ++this.orderCounter, uid, amountSyr, priceUsd, timestamp: Date.now() };
+  async addLimitOrder(uid, side, amountSyr, priceUsd) {
+    const order = { id: ++this.orderCounter, uid, amountSyr: fixDust(amountSyr), priceUsd: fixDust(priceUsd), timestamp: Date.now() };
     if (side === 'BUY') {
       this.bids.push(order);
       this.bids.sort((a, b) => b.priceUsd - a.priceUsd || a.timestamp - b.timestamp); 
@@ -68,34 +72,39 @@ class MenuBook {
       this.asks.sort((a, b) => a.priceUsd - b.priceUsd || a.timestamp - b.timestamp); 
     }
     console.log(chalk.cyan(`[MENU BOOK] Limit ${side} added: ${amountSyr} SYR @ $${priceUsd}`));
-    this.saveOrders();
+    await this.saveOrders();
     return order;
   }
 
-  matchMarketOrder(uid, side, amountSyr, availableFunds, limitPrice = null) {
-    let remaining = amountSyr;
+  async matchMarketOrder(uid, side, amountSyr, availableFunds, limitPrice = null) {
+    let remaining = fixDust(amountSyr);
     let totalUsdCost = 0;
     let trades = [];
     
     const book = side === 'BUY' ? this.asks : this.bids;
     let initialPrice = book.length > 0 ? book[0].priceUsd : this.lastTradePrice;
 
-    while (remaining > 1e-8 && book.length > 0) {
-      const topOrder = book[0]; 
+    let bookIndex = 0;
+    while (remaining > 1e-8 && bookIndex < book.length) {
+      const topOrder = book[bookIndex]; 
       
-      if (topOrder.uid === uid && topOrder.uid !== 'system') break; 
+      // UPGRADE: Engine no longer breaks on user's own orders; it safely skips them.
+      if (topOrder.uid === uid && topOrder.uid !== 'system') {
+          bookIndex++;
+          continue; 
+      }
 
       if (limitPrice !== null) {
           if (side === 'BUY' && topOrder.priceUsd > limitPrice) break;
           if (side === 'SELL' && topOrder.priceUsd < limitPrice) break;
       }
 
-      let tradeAmount = Math.min(remaining, topOrder.amountSyr);
-      let tradeUsd = tradeAmount * topOrder.priceUsd;
+      let tradeAmount = fixDust(Math.min(remaining, topOrder.amountSyr));
+      let tradeUsd = fixDust(tradeAmount * topOrder.priceUsd);
 
       if (side === 'BUY' && (totalUsdCost + tradeUsd) > availableFunds) {
-          tradeAmount = (availableFunds - totalUsdCost) / topOrder.priceUsd;
-          tradeUsd = tradeAmount * topOrder.priceUsd;
+          tradeAmount = fixDust((availableFunds - totalUsdCost) / topOrder.priceUsd);
+          tradeUsd = fixDust(tradeAmount * topOrder.priceUsd);
           if (tradeAmount <= 1e-8) break; 
       }
 
@@ -109,12 +118,16 @@ class MenuBook {
 
       this.lastTradePrice = topOrder.priceUsd; 
       
-      totalUsdCost += tradeUsd;
-      remaining -= tradeAmount;
-      topOrder.amountSyr -= tradeAmount;
+      totalUsdCost = fixDust(totalUsdCost + tradeUsd);
+      remaining = fixDust(remaining - tradeAmount);
+      topOrder.amountSyr = fixDust(topOrder.amountSyr - tradeAmount);
 
       if (topOrder.amountSyr <= 1e-8) {
-        book.shift(); 
+        book.splice(bookIndex, 1); 
+        // Do not increment bookIndex; next element slides down.
+      } else {
+        // Order partially filled, we exhausted our market order remaining budget.
+        break;
       }
 
       if (side === 'BUY' && totalUsdCost >= availableFunds) break;
@@ -122,18 +135,17 @@ class MenuBook {
 
     const finalPrice = trades.length > 0 ? trades[trades.length - 1].price : initialPrice;
     let slippage = 0;
-    
     if (initialPrice > 0 && trades.length > 0) {
-        slippage = Math.abs(finalPrice - initialPrice) / initialPrice;
+        slippage = fixDust(Math.abs(finalPrice - initialPrice) / initialPrice);
     }
 
-    this.saveOrders();
+    await this.saveOrders();
     return { 
       trades, 
       remaining, 
       totalUsdCost, 
       slippage, 
-      executedSyr: amountSyr - remaining 
+      executedSyr: fixDust(amountSyr - remaining) 
     };
   }
 
@@ -143,17 +155,17 @@ class MenuBook {
     return [...userBids, ...userAsks].sort((a, b) => b.timestamp - a.timestamp);
   }
 
-  cancelOrder(uid, orderId) {
+  async cancelOrder(uid, orderId) {
     const bidIndex = this.bids.findIndex(b => b.id === orderId && b.uid === uid);
     if (bidIndex !== -1) { 
         this.bids.splice(bidIndex, 1); 
-        this.saveOrders();
+        await this.saveOrders();
         return true; 
     }
     const askIndex = this.asks.findIndex(a => a.id === orderId && a.uid === uid);
     if (askIndex !== -1) { 
         this.asks.splice(askIndex, 1); 
-        this.saveOrders();
+        await this.saveOrders();
         return true; 
     }
     return false;

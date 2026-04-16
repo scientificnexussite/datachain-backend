@@ -41,12 +41,11 @@ class Validator {
     if (typeof tx.from !== 'string' || tx.from.length > 256) return false; 
     if (typeof tx.to !== 'string' || tx.to.length > 256) return false;
     
-    // Strict input sanitization
-    if (typeof tx.amount !== 'number' || !Number.isFinite(tx.amount) || tx.amount <= 0 || tx.amount > 3000000000) {
+    // Strict input sanitization. Upper bound safely raised to 10 Billion to accommodate true network supply + block rewards.
+    if (typeof tx.amount !== 'number' || !Number.isFinite(tx.amount) || tx.amount <= 0 || tx.amount > 10000000000) {
         return false;
     }
     
-    // Support for on-chain USD tracking
     if (!['BUY', 'SELL', 'TRANSFER', 'MINT', 'MARKET_TRADE', 'USD_DEPOSIT', 'USD_WITHDRAWAL'].includes(tx.type)) {
         return false;
     }
@@ -60,7 +59,7 @@ class Validator {
     // ==========================================
     if (tx.signature && tx.publicKey) {
         try {
-            // Strip out the auth wrappers to get the exact original payload
+            // FIX: Safely extract the exact, unadulterated payload that the browser originally signed.
             const { signature, publicKey, uid, ...txDataToVerify } = tx;
             
             const verify = crypto.createVerify('SHA256');

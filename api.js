@@ -45,9 +45,6 @@ const txLimiter = rateLimit({
     message: { error: "Too many transactions submitted. Please try again later." }
 });
 
-// ==========================================
-// DER TRANSLATOR FUNCTION
-// ==========================================
 const rawToDer = (rawSigHex) => {
     const toStrictHexInt = (hex) => {
         while (hex.length > 2 && hex.startsWith('00')) hex = hex.substring(2);
@@ -63,9 +60,6 @@ const rawToDer = (rawSigHex) => {
     return '30' + seqLen + seq;
 };
 
-// ==========================================
-// MIDDLEWARE: DECENTRALIZED WEB3 AUTHENTICATION
-// ==========================================
 const requireWeb3Auth = (req, res, next) => {
     const { signature, publicKey, uid, ...payloadData } = req.body;
     
@@ -112,7 +106,8 @@ async function getPayPalAccessToken() {
     return data.access_token;
 }
 
-const MAX_SUPPLY = 3000000000;
+// Updated to accurately track the 6 Billion True Supply
+const MAX_SUPPLY = 6000000000;
 let currentPrice = professionalStartingPrice; 
 
 if (nexusChain.getBalance("system", "SYR") === 0 && nexusChain.chain.length <= 1) {
@@ -336,23 +331,23 @@ app.get('/supply', (req, res) => { res.json({ remainingSupply: nexusChain.getRem
 
 app.post('/tx/new', txLimiter, requireWeb3Auth, (req, res) => {
   try {
-      // 1. We extract the exact JSON payload the user signed, skipping auth headers
+      // FIX: Secure JSON ordering. Extracts the exact payload matching the frontend signature string.
       const { signature, publicKey, uid, ...payloadData } = req.body;
       
-      // 2. We build the core transaction EXACTLY matching the JSON order
       const tx = { ...payloadData };
-      tx.amount = parseFloat(tx.amount); // Ensure numeric
+      tx.amount = parseFloat(tx.amount);
       
-      // 3. We re-attach the cryptographic wrappers so Validator.js can double check it later
+      // Re-attach security identifiers for validator.js
       if (signature && publicKey) {
           tx.signature = signature;
           tx.publicKey = publicKey;
+          tx.uid = uid;
       }
 
       const requesterUid = req.user.uid;
       const from = tx.from;
       const type = tx.type;
-      const tokenSymbol = tx.tokenSymbol || "SYR"; // Safe fallback internally
+      const tokenSymbol = tx.tokenSymbol || "SYR"; 
 
       if (type === 'BUY' || type === 'SELL') return res.status(400).json({ error: "Trades must be routed through /menubook/limit." });
       

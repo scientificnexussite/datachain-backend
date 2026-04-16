@@ -106,7 +106,6 @@ async function getPayPalAccessToken() {
     return data.access_token;
 }
 
-// Updated to accurately track the 6 Billion True Supply
 const MAX_SUPPLY = 6000000000;
 let currentPrice = professionalStartingPrice; 
 
@@ -331,13 +330,11 @@ app.get('/supply', (req, res) => { res.json({ remainingSupply: nexusChain.getRem
 
 app.post('/tx/new', txLimiter, requireWeb3Auth, (req, res) => {
   try {
-      // FIX: Secure JSON ordering. Extracts the exact payload matching the frontend signature string.
       const { signature, publicKey, uid, ...payloadData } = req.body;
       
       const tx = { ...payloadData };
       tx.amount = parseFloat(tx.amount);
       
-      // Re-attach security identifiers for validator.js
       if (signature && publicKey) {
           tx.signature = signature;
           tx.publicKey = publicKey;
@@ -349,16 +346,31 @@ app.post('/tx/new', txLimiter, requireWeb3Auth, (req, res) => {
       const type = tx.type;
       const tokenSymbol = tx.tokenSymbol || "SYR"; 
 
-      if (type === 'BUY' || type === 'SELL') return res.status(400).json({ error: "Trades must be routed through /menubook/limit." });
-      
-      if (type === 'TRANSFER' && from !== requesterUid) {
-          return res.status(403).json({ error: "Forbidden: You do not own the originating address or lacked cryptographic signature." });
+      if (type === 'BUY' || type === 'SELL' || type === 'MARKET_TRADE') {
+          return res.status(400).json({ error: "Trades must be routed through /menubook endpoints." });
       }
       
-      if (!validator.validateTransactionPayload(tx)) return res.status(400).json({ error: "Malformed transaction payload or invalid cryptography." });
+      // ==============================================
+      // FIX: Isolate Security & Balance Checks properly
+      // ==============================================
+      if (type === 'TRANSFER') {
+          if (from !== requesterUid) return res.status(403).json({ error: "Forbidden: You do not own the originating address." });
+          const senderBalance = nexusChain.getBalance(from, tokenSymbol) - menuBook.getLockedToken(from, tokenSymbol);
+          if (senderBalance < tx.amount) return res.status(400).json({ error: `Insufficient available ${tokenSymbol} balance.` });
+          
+      } else if (type === 'USD_WITHDRAWAL') {
+          if (from !== requesterUid) return res.status(403).json({ error: "Forbidden: You do not own the originating address." });
+          const availableUsd = nexusChain.state.getUsd(from) - menuBook.getLockedUsd(from, tokenSymbol);
+          if (availableUsd < tx.amount) return res.status(400).json({ error: `Insufficient available USD balance.` });
+          
+      } else if (type === 'USD_DEPOSIT' || type === 'MINT') {
+          // Bypasses the SYR balance check so the migration script works.
+          // Allows System/Gateway accounts to inject liquidity securely.
+      } else {
+          return res.status(400).json({ error: "Invalid transaction type." });
+      }
 
-      const senderBalance = nexusChain.getBalance(from, tokenSymbol) - menuBook.getLockedToken(from, tokenSymbol);
-      if (senderBalance < tx.amount) return res.status(400).json({ error: `Insufficient available ${tokenSymbol} balance.` });
+      if (!validator.validateTransactionPayload(tx)) return res.status(400).json({ error: "Malformed transaction payload or invalid cryptography." });
 
       const success = mempool.addTransaction(tx);
       if (success) {

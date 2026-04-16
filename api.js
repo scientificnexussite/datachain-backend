@@ -4,7 +4,6 @@ import cors from 'cors';
 import chalk from 'chalk';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import admin from 'firebase-admin';
 import crypto from 'crypto'; 
 import mempool from './mempool.js';
 import { DataChain } from './datachain.js';
@@ -22,17 +21,6 @@ const PAYPAL_API_BASE = "https://api-m.paypal.com";
 if (!INTERNAL_SECRET || INTERNAL_SECRET.length < 32) {
     console.warn(chalk.yellow("[SECURITY] Auto-generating a secure 32-byte session secret to prevent crash."));
     INTERNAL_SECRET = crypto.randomBytes(32).toString('hex');
-}
-
-try {
-    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-        admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-    } else {
-        admin.initializeApp(); 
-    }
-} catch (e) {
-    console.error(chalk.red("[SECURITY] Firebase Admin Init Error:"), e);
 }
 
 const app = express();
@@ -59,18 +47,31 @@ const txLimiter = rateLimit({
     message: { error: "Too many transactions submitted. Please try again later." }
 });
 
-const requireAuth = async (req, res, next) => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: "Unauthorized: Missing Bearer Token" });
+// ======================== WEB3 DECENTRALIZED AUTH ========================
+// Replaces Firebase. Mathematically proves the user owns the wallet address.
+const requireWeb3Auth = (req, res, next) => {
+    const { signature, publicKey, uid, ...payloadData } = req.body;
+    
+    if (!signature || !publicKey || !uid) {
+        return res.status(401).json({ error: "Unauthorized: Missing Web3 ECDSA Signature. Firebase is no longer supported." });
     }
-    const token = authHeader.split('Bearer ')[1];
+    
     try {
-        const decodedToken = await admin.auth().verifyIdToken(token);
-        req.user = decodedToken; 
+        const verify = crypto.createVerify('SHA256');
+        verify.update(JSON.stringify(payloadData));
+        
+        const isValid = verify.verify(publicKey, signature, 'hex');
+        
+        if (!isValid) {
+            console.log(chalk.red(`[AUTH] Cryptographic signature validation failed for address: ${uid.substring(0,8)}...`));
+            return res.status(401).json({ error: "Unauthorized: Invalid Cryptographic Signature" });
+        }
+        
+        req.user = { uid: uid }; 
         next();
     } catch (error) {
-        return res.status(401).json({ error: "Unauthorized: Invalid or Expired Token" });
+        console.error(chalk.red("[AUTH ERROR]"), error);
+        return res.status(401).json({ error: "Unauthorized: Malformed Key or Signature Structure" });
     }
 };
 
@@ -112,9 +113,6 @@ async function updateMarketEconomics() {
 
         const hasUserAsks = menuBook.books["SYR"].asks.some(a => a.uid !== "system");
         if (remaining > 0 && !hasUserAsks) {
-            // ==========================================
-            // UPGRADE 2: "Whale" Tier Liquidity (85,000 SYR depth)
-            // ==========================================
             const tiers = [
                 { multiplier: 1.02, amount: Math.min(remaining, 10000) },
                 { multiplier: 1.05, amount: Math.min(remaining, 25000) },
@@ -164,7 +162,8 @@ setInterval(async () => {
     }
 }, 5000); 
 
-// ======================== FRONTEND ENDPOINTS ========================
+// ======================== PUBLIC FRONTEND ENDPOINTS ========================
+// Notice: These are now 100% public. A true blockchain allows anyone to query balances.
 app.get('/health', (req, res) => { res.json({ status: 'alive', chainLength: nexusChain.chain.length, timestamp: Date.now() }); });
 app.get('/config', (req, res) => { res.json({ paypalClientId: PAYPAL_CLIENT_ID }); });
 app.get('/menubook', (req, res) => { res.json({ bids: menuBook.books["SYR"].bids, asks: menuBook.books["SYR"].asks, marketData: menuBook.getSpread("SYR") }); });
@@ -176,7 +175,6 @@ app.get('/pricehistory', (req, res) => {
     for (const block of nexusChain.chain) {
         if (typeof block.data === 'string') continue;
         for (const tx of block.data) {
-            // Only track SYR price history for the main chart
             if ((tx.tokenSymbol === 'SYR' || !tx.tokenSymbol)) {
                 if (tx.type === 'MARKET_TRADE' && tx.amountUsd && tx.amount) {
                     history.push({ timestamp: tx.timestamp, price: tx.amountUsd / tx.amount });
@@ -190,12 +188,10 @@ app.get('/pricehistory', (req, res) => {
     res.json(history);
 });
 
-app.get('/positions/:uid', requireAuth, (req, res) => {
-    if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
+app.get('/positions/:uid', (req, res) => {
     const uid = req.params.uid;
     let positionsArr = [];
     
-    // Loop dynamically through all tokens a user might own (SYR, GAMECASH, etc)
     for (const token in nexusChain.state.balances) {
         const currentBal = nexusChain.state.getBalance(uid, token);
         if (currentBal > 0) {
@@ -205,7 +201,12 @@ app.get('/positions/:uid', requireAuth, (req, res) => {
     res.json({ positions: positionsArr });
 });
 
-app.post('/menubook/limit', txLimiter, requireAuth, async (req, res) => {
+app.get('/api/orders/:uid', (req, res) => {
+    res.json(menuBook.getUserOrders(req.params.uid, "SYR"));
+});
+
+// ======================== SIGNATURE-PROTECTED TRADING ENDPOINTS ========================
+app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const { side, amountSyr, priceUsd, tokenSymbol = "SYR" } = req.body;
         const uid = req.user.uid;
@@ -244,7 +245,7 @@ app.post('/menubook/limit', txLimiter, requireAuth, async (req, res) => {
     } catch (error) { res.status(500).json({ error: "Internal Server Error" }); }
 });
 
-app.post('/menubook/market', txLimiter, requireAuth, async (req, res) => {
+app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const { side, amountSyr, tokenSymbol = "SYR" } = req.body;
         const uid = req.user.uid;
@@ -272,12 +273,7 @@ app.post('/menubook/market', txLimiter, requireAuth, async (req, res) => {
     } catch (error) { res.status(500).json({ error: "Internal Server Error" }); }
 });
 
-app.get('/api/orders/:uid', requireAuth, (req, res) => {
-    if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
-    res.json(menuBook.getUserOrders(req.params.uid, "SYR"));
-});
-
-app.post('/api/orders/cancel', requireAuth, async (req, res) => {
+app.post('/api/orders/cancel', requireWeb3Auth, async (req, res) => {
     try {
         const { uid, orderId, tokenSymbol = "SYR" } = req.body;
         if (req.user.uid !== uid) return res.status(403).json({ error: "Forbidden" });
@@ -292,7 +288,7 @@ app.post('/api/orders/cancel', requireAuth, async (req, res) => {
     } catch (err) { res.status(500).json({ error: "Failed to cancel order." }); }
 });
 
-// ======================== CORE BLOCKCHAIN & TRANSACTIONS ========================
+// ======================== CORE BLOCKCHAIN ENDPOINTS ========================
 app.get('/', (req, res) => { res.json({ status: "Scientific Nexus DataChain API Node is ONLINE" }); });
 
 app.get('/blocks', (req, res) => {
@@ -323,12 +319,11 @@ app.get('/stats', (req, res) => {
 
 app.get('/supply', (req, res) => { res.json({ remainingSupply: nexusChain.getRemainingSupply() }); });
 
-app.post('/tx/new', txLimiter, requireAuth, (req, res) => {
+app.post('/tx/new', txLimiter, requireWeb3Auth, (req, res) => {
   try {
       const { from, to, amount, type, tokenSymbol = "SYR", signature, publicKey } = req.body;
       const tx = { from, to, amount: parseFloat(amount), type, tokenSymbol, timestamp: Date.now() };
       
-      // If client provides ECDSA signatures, attach them for cryptographic validation
       if (signature && publicKey) {
           tx.signature = signature;
           tx.publicKey = publicKey;
@@ -337,8 +332,8 @@ app.post('/tx/new', txLimiter, requireAuth, (req, res) => {
       const requesterUid = req.user.uid;
 
       if (type === 'BUY' || type === 'SELL') return res.status(400).json({ error: "Trades must be routed through /menubook/limit." });
-      // We allow either Firebase UID match OR they use ECDSA cryptographic signing
-      if (type === 'TRANSFER' && from !== requesterUid && !tx.signature) {
+      
+      if (type === 'TRANSFER' && from !== requesterUid) {
           return res.status(403).json({ error: "Forbidden: You do not own the originating address or lacked cryptographic signature." });
       }
       
@@ -354,10 +349,7 @@ app.post('/tx/new', txLimiter, requireAuth, (req, res) => {
   } catch (error) { res.status(500).json({ error: "Internal Server Error." }); }
 });
 
-// ==========================================
-// UPGRADE 3: CREATE NEW WEBSITE CASH ENDPOINT
-// ==========================================
-app.post('/mint-new-cash', txLimiter, requireAuth, (req, res) => {
+app.post('/mint-new-cash', txLimiter, requireWeb3Auth, (req, res) => {
     try {
         const { ticker, supply } = req.body;
         const uid = req.user.uid;
@@ -368,7 +360,6 @@ app.post('/mint-new-cash', txLimiter, requireAuth, (req, res) => {
 
         const customTicker = ticker.toUpperCase();
 
-        // Check if user has enough USD to pay the deployment fee (Example: $100 USD to deploy a new token)
         const deployFee = 100;
         const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, "SYR");
         
@@ -387,15 +378,14 @@ app.post('/mint-new-cash', txLimiter, requireAuth, (req, res) => {
 });
 
 // ======================== USD & PAYPAL GATEWAY ========================
-app.get('/usd/balance/:uid', requireAuth, (req, res) => {
-    if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
+app.get('/usd/balance/:uid', (req, res) => {
     const address = req.params.uid;
     const totalUsd = nexusChain.state.getUsd(address);
-    const lockedUsd = menuBook.getLockedUsd(address, "SYR"); // Assuming USD is only locked by SYR trades right now
+    const lockedUsd = menuBook.getLockedUsd(address, "SYR"); 
     res.json({ address: address, balance: totalUsd - lockedUsd, total: totalUsd, locked: lockedUsd });
 });
 
-app.post('/create-paypal-order', requireAuth, async (req, res) => {
+app.post('/create-paypal-order', requireWeb3Auth, async (req, res) => {
     try {
         const amount = parseFloat(req.body.amount);
         if (isNaN(amount) || amount < 10 || amount > 10000) return res.status(400).json({ error: "Invalid amount" }); 
@@ -411,7 +401,7 @@ app.post('/create-paypal-order', requireAuth, async (req, res) => {
     } catch (error) { res.status(500).json({ error: "[Sys-err] Payment system offline. Check configuration." }); }
 });
 
-app.post('/capture-paypal-order', requireAuth, async (req, res) => {
+app.post('/capture-paypal-order', requireWeb3Auth, async (req, res) => {
     try {
         const { orderID, uid } = req.body;
         if (uid !== req.user.uid) return res.status(403).json({ error: "Forbidden" });
@@ -432,7 +422,7 @@ app.post('/capture-paypal-order', requireAuth, async (req, res) => {
     } catch (error) { res.status(500).json({ error: "[Sys-err] Payment system offline. Capture failed." }); }
 });
 
-app.post('/usd/withdraw', requireAuth, (req, res) => {
+app.post('/usd/withdraw', requireWeb3Auth, (req, res) => {
     try {
         const { uid, amount } = req.body;
         if (uid !== req.user.uid) return res.status(403).json({ error: "Forbidden" });

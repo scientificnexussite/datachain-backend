@@ -12,7 +12,6 @@ import menuBook from './menubook.js';
 import './p2p.js'; 
 import config from './config.json' with { type: "json" };
 
-// ======================== SECURITY & ENV VARIABLES ========================
 let INTERNAL_SECRET = process.env.INTERNAL_SECRET;
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
@@ -32,7 +31,6 @@ const nexusChain = new DataChain();
 const professionalStartingPrice = nexusChain.getLastMarketPrice(config.blockchain.starting_price);
 menuBook.setInitialPrice(professionalStartingPrice, "SYR");
 
-// ======================== MIDDLEWARE ========================
 app.use(helmet()); 
 app.use(cors({
     origin: '*', 
@@ -47,20 +45,24 @@ const txLimiter = rateLimit({
     message: { error: "Too many transactions submitted. Please try again later." }
 });
 
-// ======================== WEB3 DECENTRALIZED AUTH ========================
-// Replaces Firebase. Mathematically proves the user owns the wallet address.
 const requireWeb3Auth = (req, res, next) => {
     const { signature, publicKey, uid, ...payloadData } = req.body;
     
     if (!signature || !publicKey || !uid) {
-        return res.status(401).json({ error: "Unauthorized: Missing Web3 ECDSA Signature. Firebase is no longer supported." });
+        return res.status(401).json({ error: "Unauthorized: Missing Web3 ECDSA Signature." });
     }
     
     try {
         const verify = crypto.createVerify('SHA256');
         verify.update(JSON.stringify(payloadData));
         
-        const isValid = verify.verify(publicKey, signature, 'hex');
+        // FIX: Natively accept the browser's IEEE P1363 format
+        const isValid = verify.verify({
+            key: publicKey,
+            format: 'pem',
+            type: 'spki',
+            dsaEncoding: 'ieee-p1363'
+        }, signature, 'hex');
         
         if (!isValid) {
             console.log(chalk.red(`[AUTH] Cryptographic signature validation failed for address: ${uid.substring(0,8)}...`));
@@ -90,7 +92,6 @@ async function getPayPalAccessToken() {
     return data.access_token;
 }
 
-// ======================== MARKET ECONOMICS (WHALE UPGRADE) ========================
 const MAX_SUPPLY = 3000000000;
 let currentPrice = professionalStartingPrice; 
 
@@ -142,7 +143,6 @@ async function updateMarketEconomics() {
 }
 updateMarketEconomics(); 
 
-// ======================== ISOLATED AUTO-MINER ========================
 let isMining = false;
 setInterval(async () => {
     if (isMining) return;
@@ -162,8 +162,6 @@ setInterval(async () => {
     }
 }, 5000); 
 
-// ======================== PUBLIC FRONTEND ENDPOINTS ========================
-// Notice: These are now 100% public. A true blockchain allows anyone to query balances.
 app.get('/health', (req, res) => { res.json({ status: 'alive', chainLength: nexusChain.chain.length, timestamp: Date.now() }); });
 app.get('/config', (req, res) => { res.json({ paypalClientId: PAYPAL_CLIENT_ID }); });
 app.get('/menubook', (req, res) => { res.json({ bids: menuBook.books["SYR"].bids, asks: menuBook.books["SYR"].asks, marketData: menuBook.getSpread("SYR") }); });
@@ -191,7 +189,6 @@ app.get('/pricehistory', (req, res) => {
 app.get('/positions/:uid', (req, res) => {
     const uid = req.params.uid;
     let positionsArr = [];
-    
     for (const token in nexusChain.state.balances) {
         const currentBal = nexusChain.state.getBalance(uid, token);
         if (currentBal > 0) {
@@ -205,7 +202,6 @@ app.get('/api/orders/:uid', (req, res) => {
     res.json(menuBook.getUserOrders(req.params.uid, "SYR"));
 });
 
-// ======================== SIGNATURE-PROTECTED TRADING ENDPOINTS ========================
 app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const { side, amountSyr, priceUsd, tokenSymbol = "SYR" } = req.body;
@@ -288,7 +284,6 @@ app.post('/api/orders/cancel', requireWeb3Auth, async (req, res) => {
     } catch (err) { res.status(500).json({ error: "Failed to cancel order." }); }
 });
 
-// ======================== CORE BLOCKCHAIN ENDPOINTS ========================
 app.get('/', (req, res) => { res.json({ status: "Scientific Nexus DataChain API Node is ONLINE" }); });
 
 app.get('/blocks', (req, res) => {
@@ -321,8 +316,9 @@ app.get('/supply', (req, res) => { res.json({ remainingSupply: nexusChain.getRem
 
 app.post('/tx/new', txLimiter, requireWeb3Auth, (req, res) => {
   try {
-      const { from, to, amount, type, tokenSymbol = "SYR", signature, publicKey } = req.body;
-      const tx = { from, to, amount: parseFloat(amount), type, tokenSymbol, timestamp: Date.now() };
+      // FIX: Ensure we explicitly preserve the timestamp from the frontend payload!
+      const { from, to, amount, type, tokenSymbol = "SYR", signature, publicKey, timestamp } = req.body;
+      const tx = { from, to, amount: parseFloat(amount), type, tokenSymbol, timestamp: timestamp || Date.now() };
       
       if (signature && publicKey) {
           tx.signature = signature;
@@ -377,7 +373,6 @@ app.post('/mint-new-cash', txLimiter, requireWeb3Auth, (req, res) => {
     } catch (err) { res.status(500).json({ error: "Internal Server Error" }); }
 });
 
-// ======================== USD & PAYPAL GATEWAY ========================
 app.get('/usd/balance/:uid', (req, res) => {
     const address = req.params.uid;
     const totalUsd = nexusChain.state.getUsd(address);

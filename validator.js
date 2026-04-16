@@ -16,15 +16,13 @@ class Validator {
 
   validateTransactionPayload(tx) {
     if (!tx || typeof tx !== 'object') return false;
-    if (typeof tx.from !== 'string' || tx.from.length > 256) return false; // Increased length for ECDSA Public Keys
+    if (typeof tx.from !== 'string' || tx.from.length > 256) return false; 
     if (typeof tx.to !== 'string' || tx.to.length > 256) return false;
     
-    // Strict input sanitization
     if (typeof tx.amount !== 'number' || !Number.isFinite(tx.amount) || tx.amount <= 0 || tx.amount > 3000000000) {
         return false;
     }
     
-    // Support for on-chain USD tracking
     if (!['BUY', 'SELL', 'TRANSFER', 'MINT', 'MARKET_TRADE', 'USD_DEPOSIT', 'USD_WITHDRAWAL'].includes(tx.type)) {
         return false;
     }
@@ -33,18 +31,20 @@ class Validator {
         return false;
     }
 
-    // ==========================================
-    // UPGRADE 1: ECDSA Cryptographic Verification
-    // ==========================================
     if (tx.signature && tx.publicKey) {
         try {
-            // Reconstruct the exact data payload that was signed (everything except the signature itself)
             const { signature, ...txDataToVerify } = tx;
-            
             const verify = crypto.createVerify('SHA256');
             verify.update(JSON.stringify(txDataToVerify));
             
-            const isValid = verify.verify(tx.publicKey, signature, 'hex');
+            // FIX: Natively accept the browser's IEEE P1363 format
+            const isValid = verify.verify({
+                key: tx.publicKey,
+                format: 'pem',
+                type: 'spki',
+                dsaEncoding: 'ieee-p1363'
+            }, signature, 'hex');
+
             if (!isValid) {
                 console.log(chalk.red('[VALIDATOR] Cryptographic signature rejected! Trustless validation failed.'));
                 return false;

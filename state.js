@@ -1,12 +1,16 @@
 import fs from 'fs';
 import path from 'path';
 
-// UPGRADE: Precision utility prevents Javascript floating point dust
+// Precision utility prevents Javascript floating point dust
 const fixDust = (num) => Number(num.toFixed(8));
 
 class State {
   constructor() {
-    this.balances = {};     
+    // ==========================================
+    // UPGRADE 3: Multi-Cash Two-Dimensional Ledger
+    // balances = { "SYR": { "uid1": 100 }, "GAMECASH": { "uid1": 50 } }
+    // ==========================================
+    this.balances = { "SYR": {} };     
     this.usd_balances = {}; 
     const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd();
     this.snapshotFile = path.join(volumePath, 'state_snapshot.json');
@@ -32,9 +36,15 @@ class State {
 
   applyTransaction(tx, currentPrice = 0, isReplay = false) {
     const { from, to, amount, type } = tx;
+    const tokenSymbol = tx.tokenSymbol || "SYR"; // Defaults to SYR if none provided
     
+    // Ensure the token sub-ledger exists
+    if (!this.balances[tokenSymbol]) {
+        this.balances[tokenSymbol] = {};
+    }
+
     if (type === "MINT" && from === "system") {
-      this.balances[to] = fixDust((this.balances[to] || 0) + amount);
+      this.balances[tokenSymbol][to] = fixDust((this.balances[tokenSymbol][to] || 0) + amount);
       return true;
     }
 
@@ -53,12 +63,12 @@ class State {
         const { amountUsd } = tx;
         if (!isReplay && !this.deductUsd(to, amountUsd)) return false; 
         
-        const sellerBalance = this.balances[from] || 0;
+        const sellerBalance = this.balances[tokenSymbol][from] || 0;
         if (!isReplay && sellerBalance < amount) return false; 
         
         if (isReplay) this.usd_balances[to] = fixDust((this.usd_balances[to] || 0) - amountUsd);
-        this.balances[from] = fixDust((this.balances[from] || 0) - amount);
-        this.balances[to] = fixDust((this.balances[to] || 0) + amount);
+        this.balances[tokenSymbol][from] = fixDust((this.balances[tokenSymbol][from] || 0) - amount);
+        this.balances[tokenSymbol][to] = fixDust((this.balances[tokenSymbol][to] || 0) + amount);
         this.addUsd(from, amountUsd);
         return true;
     }
@@ -67,45 +77,45 @@ class State {
         const cost = tx.amountUsd !== undefined ? tx.amountUsd : (amount * currentPrice);
         if (!isReplay && !this.deductUsd(to, cost)) return false; 
         
-        const sysBalance = this.balances[from] || 0;
+        const sysBalance = this.balances[tokenSymbol][from] || 0;
         if (!isReplay && sysBalance < amount) return false;
         
         if (isReplay) this.usd_balances[to] = fixDust((this.usd_balances[to] || 0) - cost);
-        this.balances[from] = fixDust((this.balances[from] || 0) - amount);
-        this.balances[to] = fixDust((this.balances[to] || 0) + amount);
+        this.balances[tokenSymbol][from] = fixDust((this.balances[tokenSymbol][from] || 0) - amount);
+        this.balances[tokenSymbol][to] = fixDust((this.balances[tokenSymbol][to] || 0) + amount);
         return true;
     }
 
     if (type === "SELL") {
-        const senderBalance = this.balances[from] || 0;
+        const senderBalance = this.balances[tokenSymbol][from] || 0;
         if (!isReplay && senderBalance < amount) return false;
         
         const revenue = amount * currentPrice;
         this.addUsd(from, revenue); 
         
-        this.balances[from] = fixDust((this.balances[from] || 0) - amount);
-        this.balances[to] = fixDust((this.balances[to] || 0) + amount);
+        this.balances[tokenSymbol][from] = fixDust((this.balances[tokenSymbol][from] || 0) - amount);
+        this.balances[tokenSymbol][to] = fixDust((this.balances[tokenSymbol][to] || 0) + amount);
         return true;
     }
 
     // Standard Transfer
-    const senderBalance = this.balances[from] || 0;
+    const senderBalance = this.balances[tokenSymbol][from] || 0;
     if (!isReplay && senderBalance < amount) return false;
     
-    this.balances[from] = fixDust((this.balances[from] || 0) - amount);
-    this.balances[to] = fixDust((this.balances[to] || 0) + amount);
+    this.balances[tokenSymbol][from] = fixDust((this.balances[tokenSymbol][from] || 0) - amount);
+    this.balances[tokenSymbol][to] = fixDust((this.balances[tokenSymbol][to] || 0) + amount);
     return true;
   }
 
   rebuild(chain) {
-    this.balances = {};
+    this.balances = { "SYR": {} };
     this.usd_balances = {};
     let startIndex = 0;
 
     try {
         if (fs.existsSync(this.snapshotFile)) {
             const snapshot = JSON.parse(fs.readFileSync(this.snapshotFile, 'utf8'));
-            this.balances = snapshot.balances || {};
+            this.balances = snapshot.balances || { "SYR": {} };
             this.usd_balances = snapshot.usd_balances || {};
             startIndex = snapshot.lastIndex + 1;
         }
@@ -122,7 +132,6 @@ class State {
     }
   }
 
-  // UPGRADE: Async state snapshot saving
   async saveSnapshot(lastIndex) {
       try {
           const snapshot = { balances: this.balances, usd_balances: this.usd_balances, lastIndex };
@@ -132,8 +141,9 @@ class State {
       }
   }
 
-  getBalance(address) { 
-    return this.balances[address] || 0; 
+  getBalance(address, tokenSymbol = "SYR") { 
+    if (!this.balances[tokenSymbol]) return 0;
+    return this.balances[tokenSymbol][address] || 0; 
   }
 }
 

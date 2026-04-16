@@ -42,7 +42,7 @@ const port = process.env.PORT || config.network.api_port;
 const nexusChain = new DataChain();
 
 const professionalStartingPrice = nexusChain.getLastMarketPrice(config.blockchain.starting_price);
-menuBook.setInitialPrice(professionalStartingPrice);
+menuBook.setInitialPrice(professionalStartingPrice, "SYR");
 
 // ======================== MIDDLEWARE ========================
 app.use(helmet()); 
@@ -74,7 +74,6 @@ const requireAuth = async (req, res, next) => {
     }
 };
 
-// ======================== PAYPAL AUTH ========================
 async function getPayPalAccessToken() {
     if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET) {
         throw new Error("PayPal credentials not configured on server.");
@@ -90,58 +89,60 @@ async function getPayPalAccessToken() {
     return data.access_token;
 }
 
-// ======================== MARKET ECONOMICS ========================
+// ======================== MARKET ECONOMICS (WHALE UPGRADE) ========================
 const MAX_SUPPLY = 3000000000;
 let currentPrice = professionalStartingPrice; 
 
-if (nexusChain.getBalance("system") === 0 && nexusChain.chain.length <= 1) {
-  const initTx = { from: "system", to: "system", amount: MAX_SUPPLY, type: "MINT", timestamp: Date.now() };
+if (nexusChain.getBalance("system", "SYR") === 0 && nexusChain.chain.length <= 1) {
+  const initTx = { from: "system", to: "system", amount: MAX_SUPPLY, type: "MINT", tokenSymbol: "SYR", timestamp: Date.now() };
   nexusChain.addBlock([initTx]);
 }
 
-// UPGRADE: Make economics update async to support async I/O
 async function updateMarketEconomics() {
     try {
         const chainPrice = nexusChain.getLastMarketPrice(config.blockchain.starting_price);
-        currentPrice = menuBook.lastTradePrice > 0 ? menuBook.lastTradePrice : chainPrice;
-        await menuBook.setInitialPrice(currentPrice);
+        currentPrice = menuBook.books["SYR"].lastTradePrice > 0 ? menuBook.books["SYR"].lastTradePrice : chainPrice;
+        await menuBook.setInitialPrice(currentPrice, "SYR");
 
         const remaining = nexusChain.getRemainingSupply();
         const circulating = MAX_SUPPLY - remaining;
 
-        menuBook.asks = menuBook.asks.filter(a => a.uid !== "system");
-        menuBook.bids = menuBook.bids.filter(a => a.uid !== "system");
+        menuBook.books["SYR"].asks = menuBook.books["SYR"].asks.filter(a => a.uid !== "system");
+        menuBook.books["SYR"].bids = menuBook.books["SYR"].bids.filter(a => a.uid !== "system");
 
-        const hasUserAsks = menuBook.asks.some(a => a.uid !== "system");
+        const hasUserAsks = menuBook.books["SYR"].asks.some(a => a.uid !== "system");
         if (remaining > 0 && !hasUserAsks) {
+            // ==========================================
+            // UPGRADE 2: "Whale" Tier Liquidity (85,000 SYR depth)
+            // ==========================================
             const tiers = [
-                { multiplier: 1.02, amount: Math.min(remaining, 2000) },
-                { multiplier: 1.05, amount: Math.min(remaining, 2000) },
-                { multiplier: 1.10, amount: Math.min(remaining, 1000) },
+                { multiplier: 1.02, amount: Math.min(remaining, 10000) },
+                { multiplier: 1.05, amount: Math.min(remaining, 25000) },
+                { multiplier: 1.10, amount: Math.min(remaining, 50000) },
             ];
             let tierRemaining = remaining;
             for (const tier of tiers) {
                 if (tierRemaining <= 0) break;
                 const tierAmount = Math.min(tier.amount, tierRemaining);
                 const tierPrice = currentPrice > 0 ? currentPrice * tier.multiplier : config.blockchain.starting_price * tier.multiplier;
-                menuBook.asks.push({ id: `sys-liquidity-ask-${tier.multiplier}`, uid: 'system', amountSyr: tierAmount, priceUsd: tierPrice, timestamp: Date.now() });
+                menuBook.books["SYR"].asks.push({ id: `sys-liquidity-ask-${tier.multiplier}`, uid: 'system', amountSyr: tierAmount, priceUsd: tierPrice, timestamp: Date.now() });
                 tierRemaining -= tierAmount;
             }
-            menuBook.asks.sort((a, b) => a.priceUsd - b.priceUsd || a.timestamp - b.timestamp);
+            menuBook.books["SYR"].asks.sort((a, b) => a.priceUsd - b.priceUsd || a.timestamp - b.timestamp);
         }
 
-        const hasUserBids = menuBook.bids.some(b => b.uid !== "system");
+        const hasUserBids = menuBook.books["SYR"].bids.some(b => b.uid !== "system");
         if (circulating > 0 && !hasUserBids) {
             const floorPrice = currentPrice > 0 ? currentPrice * 0.90 : config.blockchain.starting_price * 0.9;
-            menuBook.bids.push({ id: 'sys-liquidity-bid', uid: 'system', amountSyr: Math.min(circulating, 1000), priceUsd: floorPrice, timestamp: Date.now() });
-            menuBook.bids.sort((a, b) => b.priceUsd - a.priceUsd || a.timestamp - b.timestamp);
+            menuBook.books["SYR"].bids.push({ id: 'sys-liquidity-bid', uid: 'system', amountSyr: Math.min(circulating, 5000), priceUsd: floorPrice, timestamp: Date.now() });
+            menuBook.books["SYR"].bids.sort((a, b) => b.priceUsd - a.priceUsd || a.timestamp - b.timestamp);
         }
         await menuBook.saveOrders();
     } catch (e) {
         console.error(chalk.red("[ECONOMICS ERROR]"), e);
     }
 }
-updateMarketEconomics(); // Initial async fire-and-forget
+updateMarketEconomics(); 
 
 // ======================== ISOLATED AUTO-MINER ========================
 let isMining = false;
@@ -151,7 +152,6 @@ setInterval(async () => {
     if (pendingCount > 0) {
         isMining = true;
         const pendingTxs = mempool.getAndClear();
-        // UPGRADE: Now safely awaits the non-blocking block mining without freezing API
         const success = await nexusChain.addBlock(pendingTxs, currentPrice);
         
         if (success) {
@@ -167,11 +167,8 @@ setInterval(async () => {
 // ======================== FRONTEND ENDPOINTS ========================
 app.get('/health', (req, res) => { res.json({ status: 'alive', chainLength: nexusChain.chain.length, timestamp: Date.now() }); });
 app.get('/config', (req, res) => { res.json({ paypalClientId: PAYPAL_CLIENT_ID }); });
-app.get('/menubook', (req, res) => { res.json({ bids: menuBook.bids, asks: menuBook.asks, marketData: menuBook.getSpread() }); });
-
-app.get('/network', (req, res) => {
-    res.json({ chainLength: nexusChain.chain.length, difficulty: nexusChain.difficulty, mempoolCount: mempool.getPendingCount() });
-});
+app.get('/menubook', (req, res) => { res.json({ bids: menuBook.books["SYR"].bids, asks: menuBook.books["SYR"].asks, marketData: menuBook.getSpread("SYR") }); });
+app.get('/network', (req, res) => { res.json({ chainLength: nexusChain.chain.length, difficulty: nexusChain.difficulty, mempoolCount: mempool.getPendingCount() }); });
 
 app.get('/pricehistory', (req, res) => {
     const history = [];
@@ -179,10 +176,13 @@ app.get('/pricehistory', (req, res) => {
     for (const block of nexusChain.chain) {
         if (typeof block.data === 'string') continue;
         for (const tx of block.data) {
-            if (tx.type === 'MARKET_TRADE' && tx.amountUsd && tx.amount) {
-                history.push({ timestamp: tx.timestamp, price: tx.amountUsd / tx.amount });
-            } else if ((tx.type === 'BUY' || tx.type === 'SELL') && tx.priceUsd) {
-                history.push({ timestamp: tx.timestamp, price: tx.priceUsd });
+            // Only track SYR price history for the main chart
+            if ((tx.tokenSymbol === 'SYR' || !tx.tokenSymbol)) {
+                if (tx.type === 'MARKET_TRADE' && tx.amountUsd && tx.amount) {
+                    history.push({ timestamp: tx.timestamp, price: tx.amountUsd / tx.amount });
+                } else if ((tx.type === 'BUY' || tx.type === 'SELL') && tx.priceUsd) {
+                    history.push({ timestamp: tx.timestamp, price: tx.priceUsd });
+                }
             }
         }
     }
@@ -193,26 +193,21 @@ app.get('/pricehistory', (req, res) => {
 app.get('/positions/:uid', requireAuth, (req, res) => {
     if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
     const uid = req.params.uid;
-    let totalSpent = 0; let totalBought = 0;
-
-    for (const block of nexusChain.chain) {
-        if (typeof block.data === 'string') continue;
-        for (const tx of block.data) {
-            if (tx.to === uid && (tx.type === 'MARKET_TRADE' || tx.type === 'BUY')) {
-                totalSpent += tx.amountUsd || (tx.amount * currentPrice);
-                totalBought += tx.amount;
-            }
+    let positionsArr = [];
+    
+    // Loop dynamically through all tokens a user might own (SYR, GAMECASH, etc)
+    for (const token in nexusChain.state.balances) {
+        const currentBal = nexusChain.state.getBalance(uid, token);
+        if (currentBal > 0) {
+            positionsArr.push({ asset: token, qty: currentBal, avgPrice: token === "SYR" ? currentPrice : 0 });
         }
     }
-    
-    const avgPrice = totalBought > 0 ? (totalSpent / totalBought) : 0;
-    const currentBal = nexusChain.getBalance(uid);
-    res.json({ positions: currentBal > 0 ? [{ asset: "SYR", qty: currentBal, avgPrice: avgPrice }] : [] });
+    res.json({ positions: positionsArr });
 });
 
 app.post('/menubook/limit', txLimiter, requireAuth, async (req, res) => {
     try {
-        const { side, amountSyr, priceUsd } = req.body;
+        const { side, amountSyr, priceUsd, tokenSymbol = "SYR" } = req.body;
         const uid = req.user.uid;
         
         if (!['BUY', 'SELL'].includes(side) || amountSyr <= 0 || priceUsd <= 0) return res.status(400).json({ error: "Invalid limit order parameters." });
@@ -222,27 +217,27 @@ app.post('/menubook/limit', txLimiter, requireAuth, async (req, res) => {
 
         if (side === 'BUY') {
             const totalCost = parsedAmount * parsedPrice;
-            const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid);
+            const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, tokenSymbol);
             if (availableUsd < totalCost) return res.status(400).json({ error: "Insufficient available USD." });
         } else {
-            const availableSyr = nexusChain.getBalance(uid) - menuBook.getLockedSyr(uid);
-            if (availableSyr < parsedAmount) return res.status(400).json({ error: "Insufficient available SilverCash." });
+            const availableToken = nexusChain.getBalance(uid, tokenSymbol) - menuBook.getLockedToken(uid, tokenSymbol);
+            if (availableToken < parsedAmount) return res.status(400).json({ error: `Insufficient available ${tokenSymbol}.` });
         }
 
         let remainingAmount = parsedAmount;
         let executedTrades = [];
-        const fundsToCheck = side === 'BUY' ? (nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid)) : (nexusChain.getBalance(uid) - menuBook.getLockedSyr(uid));
+        const fundsToCheck = side === 'BUY' ? (nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, tokenSymbol)) : (nexusChain.getBalance(uid, tokenSymbol) - menuBook.getLockedToken(uid, tokenSymbol));
         
-        const matchResult = await menuBook.matchMarketOrder(uid, side, remainingAmount, fundsToCheck, parsedPrice);
+        const matchResult = await menuBook.matchMarketOrder(uid, side, remainingAmount, fundsToCheck, parsedPrice, tokenSymbol);
         executedTrades = matchResult.trades;
         remainingAmount = matchResult.remaining;
 
         for (const trade of executedTrades) {
-            mempool.addTransaction({ from: trade.seller, to: trade.buyer, amount: trade.amountSyr, amountUsd: trade.amountUsd, type: 'MARKET_TRADE', timestamp: Date.now() });
+            mempool.addTransaction({ from: trade.seller, to: trade.buyer, amount: trade.amountSyr, amountUsd: trade.amountUsd, type: 'MARKET_TRADE', tokenSymbol: tokenSymbol, timestamp: Date.now() });
         }
 
         let order = null;
-        if (remainingAmount > 0) order = await menuBook.addLimitOrder(uid, side, remainingAmount, parsedPrice);
+        if (remainingAmount > 0) order = await menuBook.addLimitOrder(uid, side, remainingAmount, parsedPrice, tokenSymbol);
 
         await updateMarketEconomics();
         res.status(201).json({ message: "Limit order processed.", order, executedTrades });
@@ -251,21 +246,21 @@ app.post('/menubook/limit', txLimiter, requireAuth, async (req, res) => {
 
 app.post('/menubook/market', txLimiter, requireAuth, async (req, res) => {
     try {
-        const { side, amountSyr } = req.body;
+        const { side, amountSyr, tokenSymbol = "SYR" } = req.body;
         const uid = req.user.uid;
 
         if (!['BUY', 'SELL'].includes(side) || amountSyr <= 0) return res.status(400).json({ error: "Invalid market order parameters." });
 
-        const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid);
-        const availableSyr = nexusChain.getBalance(uid) - menuBook.getLockedSyr(uid);
-        const fundsToCheck = side === 'BUY' ? availableUsd : availableSyr;
+        const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, tokenSymbol);
+        const availableToken = nexusChain.getBalance(uid, tokenSymbol) - menuBook.getLockedToken(uid, tokenSymbol);
+        const fundsToCheck = side === 'BUY' ? availableUsd : availableToken;
 
-        const matchResult = await menuBook.matchMarketOrder(uid, side, parseFloat(amountSyr), fundsToCheck);
+        const matchResult = await menuBook.matchMarketOrder(uid, side, parseFloat(amountSyr), fundsToCheck, null, tokenSymbol);
 
         if (matchResult.trades.length === 0) return res.status(400).json({ error: "No liquidity available in Menu Book to match order." });
 
         for (const trade of matchResult.trades) {
-            mempool.addTransaction({ from: trade.seller, to: trade.buyer, amount: trade.amountSyr, amountUsd: trade.amountUsd, type: 'MARKET_TRADE', timestamp: Date.now() });
+            mempool.addTransaction({ from: trade.seller, to: trade.buyer, amount: trade.amountSyr, amountUsd: trade.amountUsd, type: 'MARKET_TRADE', tokenSymbol: tokenSymbol, timestamp: Date.now() });
         }
 
         await updateMarketEconomics();
@@ -279,15 +274,15 @@ app.post('/menubook/market', txLimiter, requireAuth, async (req, res) => {
 
 app.get('/api/orders/:uid', requireAuth, (req, res) => {
     if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
-    res.json(menuBook.getUserOrders(req.params.uid));
+    res.json(menuBook.getUserOrders(req.params.uid, "SYR"));
 });
 
 app.post('/api/orders/cancel', requireAuth, async (req, res) => {
     try {
-        const { uid, orderId } = req.body;
+        const { uid, orderId, tokenSymbol = "SYR" } = req.body;
         if (req.user.uid !== uid) return res.status(403).json({ error: "Forbidden" });
         
-        const success = await menuBook.cancelOrder(uid, orderId);
+        const success = await menuBook.cancelOrder(uid, orderId, tokenSymbol);
         if (success) {
             await updateMarketEconomics();
             res.json({ success: true, message: "Order cancelled successfully." });
@@ -315,9 +310,10 @@ app.get('/blocks', (req, res) => {
 
 app.get('/balance/:address', (req, res) => { 
     const address = req.params.address;
-    const totalSyr = nexusChain.getBalance(address);
-    const lockedSyr = menuBook.getLockedSyr(address);
-    res.json({ address: address, balance: totalSyr - lockedSyr, total: totalSyr, locked: lockedSyr }); 
+    const token = req.query.token || "SYR";
+    const totalSyr = nexusChain.getBalance(address, token);
+    const lockedSyr = menuBook.getLockedToken(address, token);
+    res.json({ address: address, token: token, balance: totalSyr - lockedSyr, total: totalSyr, locked: lockedSyr }); 
 });
 
 app.get('/stats', (req, res) => {
@@ -329,16 +325,27 @@ app.get('/supply', (req, res) => { res.json({ remainingSupply: nexusChain.getRem
 
 app.post('/tx/new', txLimiter, requireAuth, (req, res) => {
   try {
-      const { from, to, amount, type } = req.body;
-      const tx = { from, to, amount: parseFloat(amount), type, timestamp: Date.now() };
+      const { from, to, amount, type, tokenSymbol = "SYR", signature, publicKey } = req.body;
+      const tx = { from, to, amount: parseFloat(amount), type, tokenSymbol, timestamp: Date.now() };
+      
+      // If client provides ECDSA signatures, attach them for cryptographic validation
+      if (signature && publicKey) {
+          tx.signature = signature;
+          tx.publicKey = publicKey;
+      }
+
       const requesterUid = req.user.uid;
 
       if (type === 'BUY' || type === 'SELL') return res.status(400).json({ error: "Trades must be routed through /menubook/limit." });
-      if (type === 'TRANSFER' && from !== requesterUid) return res.status(403).json({ error: "Forbidden: You do not own the originating address." });
-      if (!validator.validateTransactionPayload(tx)) return res.status(400).json({ error: "Malformed transaction payload." });
+      // We allow either Firebase UID match OR they use ECDSA cryptographic signing
+      if (type === 'TRANSFER' && from !== requesterUid && !tx.signature) {
+          return res.status(403).json({ error: "Forbidden: You do not own the originating address or lacked cryptographic signature." });
+      }
+      
+      if (!validator.validateTransactionPayload(tx)) return res.status(400).json({ error: "Malformed transaction payload or invalid cryptography." });
 
-      const senderBalance = nexusChain.getBalance(from) - menuBook.getLockedSyr(from);
-      if (senderBalance < tx.amount) return res.status(400).json({ error: "Insufficient available SilverCash balance." });
+      const senderBalance = nexusChain.getBalance(from, tokenSymbol) - menuBook.getLockedToken(from, tokenSymbol);
+      if (senderBalance < tx.amount) return res.status(400).json({ error: `Insufficient available ${tokenSymbol} balance.` });
 
       const success = mempool.addTransaction(tx);
       if (success) {
@@ -347,12 +354,44 @@ app.post('/tx/new', txLimiter, requireAuth, (req, res) => {
   } catch (error) { res.status(500).json({ error: "Internal Server Error." }); }
 });
 
+// ==========================================
+// UPGRADE 3: CREATE NEW WEBSITE CASH ENDPOINT
+// ==========================================
+app.post('/mint-new-cash', txLimiter, requireAuth, (req, res) => {
+    try {
+        const { ticker, supply } = req.body;
+        const uid = req.user.uid;
+
+        if (!ticker || typeof ticker !== 'string' || ticker.length > 10 || ticker === 'SYR' || supply <= 0) {
+            return res.status(400).json({ error: "Invalid ticker symbol or supply." });
+        }
+
+        const customTicker = ticker.toUpperCase();
+
+        // Check if user has enough USD to pay the deployment fee (Example: $100 USD to deploy a new token)
+        const deployFee = 100;
+        const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, "SYR");
+        
+        if (availableUsd < deployFee) {
+            return res.status(400).json({ error: `Deploying a new Cash on the network costs $${deployFee} USD. Insufficient funds.` });
+        }
+
+        const feeTx = { from: uid, to: "system", amount: deployFee, type: 'USD_WITHDRAWAL', timestamp: Date.now() };
+        const mintTx = { from: "system", to: uid, amount: parseFloat(supply), type: 'MINT', tokenSymbol: customTicker, timestamp: Date.now() };
+
+        mempool.addTransaction(feeTx);
+        mempool.addTransaction(mintTx);
+
+        res.status(201).json({ message: `Successfully minted ${supply} ${customTicker} on the Syrpts Network!`, ticker: customTicker });
+    } catch (err) { res.status(500).json({ error: "Internal Server Error" }); }
+});
+
 // ======================== USD & PAYPAL GATEWAY ========================
 app.get('/usd/balance/:uid', requireAuth, (req, res) => {
     if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
     const address = req.params.uid;
     const totalUsd = nexusChain.state.getUsd(address);
-    const lockedUsd = menuBook.getLockedUsd(address);
+    const lockedUsd = menuBook.getLockedUsd(address, "SYR"); // Assuming USD is only locked by SYR trades right now
     res.json({ address: address, balance: totalUsd - lockedUsd, total: totalUsd, locked: lockedUsd });
 });
 
@@ -399,7 +438,7 @@ app.post('/usd/withdraw', requireAuth, (req, res) => {
         if (uid !== req.user.uid) return res.status(403).json({ error: "Forbidden" });
         if (typeof amount !== 'number' || amount < 10) return res.status(400).json({ error: "Invalid withdrawal amount." });
 
-        const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid);
+        const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, "SYR");
         if (availableUsd < amount) return res.status(400).json({ error: "Insufficient available USD." });
 
         mempool.addTransaction({ from: uid, to: "paypal-gateway", amount: amount, type: 'USD_WITHDRAWAL', timestamp: Date.now() });

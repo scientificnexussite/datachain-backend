@@ -45,6 +45,27 @@ const txLimiter = rateLimit({
     message: { error: "Too many transactions submitted. Please try again later." }
 });
 
+// ==========================================
+// DER TRANSLATOR FUNCTION
+// ==========================================
+const rawToDer = (rawSigHex) => {
+    const toStrictHexInt = (hex) => {
+        while (hex.length > 2 && hex.startsWith('00')) hex = hex.substring(2);
+        if (parseInt(hex.substring(0, 2), 16) >= 128) hex = '00' + hex;
+        return hex;
+    };
+    let r = toStrictHexInt(rawSigHex.substring(0, 64));
+    let s = toStrictHexInt(rawSigHex.substring(64, 128));
+    let rLen = (r.length / 2).toString(16).padStart(2, '0');
+    let sLen = (s.length / 2).toString(16).padStart(2, '0');
+    let seq = '02' + rLen + r + '02' + sLen + s;
+    let seqLen = (seq.length / 2).toString(16).padStart(2, '0');
+    return '30' + seqLen + seq;
+};
+
+// ==========================================
+// MIDDLEWARE: DECENTRALIZED WEB3 AUTHENTICATION
+// ==========================================
 const requireWeb3Auth = (req, res, next) => {
     const { signature, publicKey, uid, ...payloadData } = req.body;
     
@@ -56,13 +77,12 @@ const requireWeb3Auth = (req, res, next) => {
         const verify = crypto.createVerify('SHA256');
         verify.update(JSON.stringify(payloadData));
         
-        // FIX: Natively accept the browser's IEEE P1363 format
-        const isValid = verify.verify({
-            key: publicKey,
-            format: 'pem',
-            type: 'spki',
-            dsaEncoding: 'ieee-p1363'
-        }, signature, 'hex');
+        let derSignature = signature;
+        if (signature.length === 128) {
+            derSignature = rawToDer(signature);
+        }
+        
+        const isValid = verify.verify(publicKey, derSignature, 'hex');
         
         if (!isValid) {
             console.log(chalk.red(`[AUTH] Cryptographic signature validation failed for address: ${uid.substring(0,8)}...`));
@@ -316,16 +336,23 @@ app.get('/supply', (req, res) => { res.json({ remainingSupply: nexusChain.getRem
 
 app.post('/tx/new', txLimiter, requireWeb3Auth, (req, res) => {
   try {
-      // FIX: Ensure we explicitly preserve the timestamp from the frontend payload!
-      const { from, to, amount, type, tokenSymbol = "SYR", signature, publicKey, timestamp } = req.body;
-      const tx = { from, to, amount: parseFloat(amount), type, tokenSymbol, timestamp: timestamp || Date.now() };
+      // 1. We extract the exact JSON payload the user signed, skipping auth headers
+      const { signature, publicKey, uid, ...payloadData } = req.body;
       
+      // 2. We build the core transaction EXACTLY matching the JSON order
+      const tx = { ...payloadData };
+      tx.amount = parseFloat(tx.amount); // Ensure numeric
+      
+      // 3. We re-attach the cryptographic wrappers so Validator.js can double check it later
       if (signature && publicKey) {
           tx.signature = signature;
           tx.publicKey = publicKey;
       }
 
       const requesterUid = req.user.uid;
+      const from = tx.from;
+      const type = tx.type;
+      const tokenSymbol = tx.tokenSymbol || "SYR"; // Safe fallback internally
 
       if (type === 'BUY' || type === 'SELL') return res.status(400).json({ error: "Trades must be routed through /menubook/limit." });
       

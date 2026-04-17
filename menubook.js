@@ -6,16 +6,15 @@ const fixDust = (num) => Number(num.toFixed(8));
 
 class MenuBook {
   constructor() {
-    // ==========================================
-    // UPGRADE 3: Multi-Cash Order Books
-    // ==========================================
-    this.books = {
-        "SYR": { bids: [], asks: [], lastTradePrice: 0.01 }
-    };
+    this.books = { "SYR": { bids: [], asks: [], lastTradePrice: 0.01 } };
     this.orderCounter = 0;
     
     const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd();
     this.ordersFile = path.join(volumePath, 'orders.json');
+    
+    this.isSaving = false;
+    this.saveQueue = false;
+
     this.loadOrders();
   }
 
@@ -39,11 +38,23 @@ class MenuBook {
   }
 
   async saveOrders() {
+      if (this.isSaving) {
+          this.saveQueue = true;
+          return;
+      }
+      this.isSaving = true;
+      this.saveQueue = false;
+
       try {
           const data = { books: this.books, orderCounter: this.orderCounter };
-          await fs.promises.writeFile(this.ordersFile, JSON.stringify(data, null, 2));
+          const tempFile = this.ordersFile + '.tmp';
+          await fs.promises.writeFile(tempFile, JSON.stringify(data, null, 2));
+          await fs.promises.rename(tempFile, this.ordersFile);
       } catch (e) {
           console.error(chalk.red("[MENU BOOK] Failed to save orders to disk."));
+      } finally {
+          this.isSaving = false;
+          if (this.saveQueue) this.saveOrders();
       }
   }
 
@@ -81,6 +92,8 @@ class MenuBook {
       this.books[token].asks.push(order);
       this.books[token].asks.sort((a, b) => a.priceUsd - b.priceUsd || a.timestamp - b.timestamp); 
     }
+    
+    console.log(chalk.cyan(`[MENU BOOK] Limit ${side} added: ${amountSyr} ${token} @ $${priceUsd}`));
     await this.saveOrders();
     return order;
   }

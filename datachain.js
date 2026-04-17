@@ -26,7 +26,8 @@ class Block {
     return new Promise((resolve) => {
       const target = Array(difficulty + 1).join("0");
       const mineChunk = () => {
-        for (let i = 0; i < 2000; i++) {
+        // Reduced to 500 to prevent CPU event-loop starvation during high difficulty
+        for (let i = 0; i < 500; i++) {
           if (this.hash.substring(0, difficulty) === target) {
             console.log(chalk.cyan(`[DATACHAIN] Block Mined: ${this.hash}`));
             return resolve(true);
@@ -54,6 +55,9 @@ class DataChain {
     this.targetBlockTime = 10000;  
     this.state = new State();
     
+    this.isSaving = false;
+    this.saveQueue = false;
+
     this.loadChain();
   }
 
@@ -96,8 +100,14 @@ class DataChain {
   }
 
   async saveChain() {
+    if (this.isSaving) {
+        this.saveQueue = true;
+        return;
+    }
+    this.isSaving = true;
+    this.saveQueue = false;
+
     try {
-       // Fix: Prevent event loop blocking
        try {
            await fs.promises.access(this.chainFile);
            await fs.promises.copyFile(this.chainFile, this.backupFile);
@@ -112,6 +122,9 @@ class DataChain {
        }
     } catch(e) {
        console.log(chalk.red(`[DATACHAIN] Failed to save chain: ${e.message}`));
+    } finally {
+       this.isSaving = false;
+       if (this.saveQueue) this.saveChain();
     }
   }
 
@@ -157,7 +170,6 @@ class DataChain {
   async addBlock(transactions, currentPrice = 0) {
     if (!transactions || transactions.length === 0) return false;
 
-    // Fix: Explicitly add tokenSymbol to mining reward
     const rewardTx = {
         from: "system",
         to: config.blockchain.miner_address,
@@ -166,21 +178,23 @@ class DataChain {
         tokenSymbol: "SYR", 
         timestamp: Date.now()
     };
-    transactions.push(rewardTx);
 
     const tempState = new State();
-    // Fix: Deep copy balances to prevent state corruption on block failure
     tempState.balances = JSON.parse(JSON.stringify(this.state.balances));
     tempState.usd_balances = { ...this.state.usd_balances }; 
     
+    const validTransactions = [rewardTx];
+    tempState.applyTransaction(rewardTx, currentPrice);
+
     for (const tx of transactions) {
-      if (!tempState.applyTransaction(tx, currentPrice)) {
-        console.log(chalk.red(`[VALIDATION] Transaction rejected in state simulation: ${JSON.stringify(tx)}`));
-        return false;
+      if (tempState.applyTransaction(tx, currentPrice)) {
+        validTransactions.push(tx);
+      } else {
+        console.log(chalk.red(`[VALIDATION] Tx dropped due to insufficient funds/conflict: ${tx.from} -> ${tx.to}`));
       }
     }
 
-    const newBlock = new Block(this.chain.length, Date.now(), transactions, this.getLatestBlock().hash);
+    const newBlock = new Block(this.chain.length, Date.now(), validTransactions, this.getLatestBlock().hash);
     
     await newBlock.mineBlock(this.difficulty); 
 
@@ -194,7 +208,6 @@ class DataChain {
     return true;
   }
 
-  // Fix: Explicit tokenSymbol pass-through
   getBalance(address, tokenSymbol = "SYR") { 
       return this.state.getBalance(address, tokenSymbol); 
   }

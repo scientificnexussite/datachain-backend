@@ -9,6 +9,9 @@ class State {
     this.usd_balances = {}; 
     const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd();
     this.snapshotFile = path.join(volumePath, 'state_snapshot.json');
+    
+    this.isSaving = false;
+    this.saveQueue = false;
   }
 
   getUsd(address) { 
@@ -84,7 +87,6 @@ class State {
         const senderBalance = this.balances[tokenSymbol][from] || 0;
         if (!isReplay && senderBalance < amount) return false;
         
-        // Fix: Use stored amountUsd to prevent zeroing revenues on server restart replay
         const revenue = tx.amountUsd !== undefined ? tx.amountUsd : (amount * currentPrice);
         this.addUsd(from, revenue); 
         
@@ -127,11 +129,23 @@ class State {
   }
 
   async saveSnapshot(lastIndex) {
+      if (this.isSaving) {
+          this.saveQueue = true;
+          return;
+      }
+      this.isSaving = true;
+      this.saveQueue = false;
+
       try {
           const snapshot = { balances: this.balances, usd_balances: this.usd_balances, lastIndex };
-          await fs.promises.writeFile(this.snapshotFile, JSON.stringify(snapshot));
+          const tempFile = this.snapshotFile + '.tmp';
+          await fs.promises.writeFile(tempFile, JSON.stringify(snapshot));
+          await fs.promises.rename(tempFile, this.snapshotFile);
       } catch (e) {
           console.error("Snapshot save failed:", e);
+      } finally {
+          this.isSaving = false;
+          if (this.saveQueue) this.saveSnapshot(lastIndex);
       }
   }
 

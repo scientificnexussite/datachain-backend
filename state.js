@@ -1,15 +1,10 @@
 import fs from 'fs';
 import path from 'path';
 
-// Precision utility prevents Javascript floating point dust
 const fixDust = (num) => Number(num.toFixed(8));
 
 class State {
   constructor() {
-    // ==========================================
-    // UPGRADE 3: Multi-Cash Two-Dimensional Ledger
-    // balances = { "SYR": { "uid1": 100 }, "GAMECASH": { "uid1": 50 } }
-    // ==========================================
     this.balances = { "SYR": {} };     
     this.usd_balances = {}; 
     const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd();
@@ -36,9 +31,8 @@ class State {
 
   applyTransaction(tx, currentPrice = 0, isReplay = false) {
     const { from, to, amount, type } = tx;
-    const tokenSymbol = tx.tokenSymbol || "SYR"; // Defaults to SYR if none provided
+    const tokenSymbol = tx.tokenSymbol || "SYR"; 
     
-    // Ensure the token sub-ledger exists
     if (!this.balances[tokenSymbol]) {
         this.balances[tokenSymbol] = {};
     }
@@ -90,7 +84,8 @@ class State {
         const senderBalance = this.balances[tokenSymbol][from] || 0;
         if (!isReplay && senderBalance < amount) return false;
         
-        const revenue = amount * currentPrice;
+        // Fix: Use stored amountUsd to prevent zeroing revenues on server restart replay
+        const revenue = tx.amountUsd !== undefined ? tx.amountUsd : (amount * currentPrice);
         this.addUsd(from, revenue); 
         
         this.balances[tokenSymbol][from] = fixDust((this.balances[tokenSymbol][from] || 0) - amount);
@@ -98,7 +93,6 @@ class State {
         return true;
     }
 
-    // Standard Transfer
     const senderBalance = this.balances[tokenSymbol][from] || 0;
     if (!isReplay && senderBalance < amount) return false;
     

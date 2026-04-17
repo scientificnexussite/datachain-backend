@@ -1,4 +1,5 @@
 import chalk from 'chalk';
+import crypto from 'crypto';
 
 class Mempool {
   constructor() {
@@ -17,12 +18,13 @@ class Mempool {
       return false;
     }
 
-    const isDuplicate = this.pendingTransactions.some(p => 
-        p.from === tx.from && 
-        p.to === tx.to && 
-        p.amount === tx.amount && 
-        p.timestamp === tx.timestamp
-    );
+    // Fix: Generate a payload hash to compare instead of relying on the timestamp
+    const txHash = crypto.createHash('sha256').update(JSON.stringify({from: tx.from, to: tx.to, amount: tx.amount, type: tx.type, sig: tx.signature || 'sys'})).digest('hex');
+
+    const isDuplicate = this.pendingTransactions.some(p => {
+        const pHash = crypto.createHash('sha256').update(JSON.stringify({from: p.from, to: p.to, amount: p.amount, type: p.type, sig: p.signature || 'sys'})).digest('hex');
+        return pHash === txHash;
+    });
     
     if (isDuplicate) return false;
 

@@ -2,7 +2,7 @@
   "network": {
     "name": "Scientific Nexus DataChain",
     "p2p_port": 4001,
-    "api_port": 3001,
+    "api_port": 8080,
     "max_peers": 50
   },
   "blockchain": {
@@ -11,7 +11,7 @@
     "sub_unit": "Sats",
     "genesis_date": "03/27/2026",
     "miner_address": "nexus-system-miner",
-    "starting_price": 0.01
+    "starting_price": 0.50
   },
   "peers": [
     "/ip4/127.0.0.1/tcp/4001"

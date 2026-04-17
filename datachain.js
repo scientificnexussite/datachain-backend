@@ -22,7 +22,6 @@ class Block {
     ).toString();
   }
 
-  // UPGRADE: Non-blocking Async Mining. Yields to event loop every 2000 hashes so API doesn't freeze.
   mineBlock(difficulty) {
     return new Promise((resolve) => {
       const target = Array(difficulty + 1).join("0");
@@ -35,7 +34,7 @@ class Block {
           this.nonce++;
           this.hash = this.calculateHash();
         }
-        setImmediate(mineChunk); // Yield to keep Express fast
+        setImmediate(mineChunk); 
       };
       mineChunk();
     });
@@ -86,7 +85,7 @@ class DataChain {
       } else {
         this.chain = [this.createGenesisBlock()];
         this.state.rebuild(this.chain);
-        this.saveChain(); // initial sync save is fine
+        this.saveChain(); 
       }
     } catch (err) {
       console.log(chalk.red('[DATACHAIN] Main chain load failed. Attempting backup recovery...'));
@@ -96,12 +95,14 @@ class DataChain {
     }
   }
 
-  // UPGRADE: Async File Saving protects the event loop during heavy I/O
   async saveChain() {
     try {
-       if (fs.existsSync(this.chainFile)) {
+       // Fix: Prevent event loop blocking
+       try {
+           await fs.promises.access(this.chainFile);
            await fs.promises.copyFile(this.chainFile, this.backupFile);
-       }
+       } catch (err) {}
+       
        const dataToSave = { chain: this.chain, difficulty: this.difficulty };
        await fs.promises.writeFile(this.tempFile, JSON.stringify(dataToSave, null, 2));
        await fs.promises.rename(this.tempFile, this.chainFile);
@@ -153,21 +154,23 @@ class DataChain {
       }
   }
 
-  // UPGRADE: Made addBlock async to support non-blocking mining
   async addBlock(transactions, currentPrice = 0) {
     if (!transactions || transactions.length === 0) return false;
 
+    // Fix: Explicitly add tokenSymbol to mining reward
     const rewardTx = {
         from: "system",
         to: config.blockchain.miner_address,
         amount: config.blockchain.reward,
         type: "MINT",
+        tokenSymbol: "SYR", 
         timestamp: Date.now()
     };
     transactions.push(rewardTx);
 
     const tempState = new State();
-    tempState.balances = { ...this.state.balances };
+    // Fix: Deep copy balances to prevent state corruption on block failure
+    tempState.balances = JSON.parse(JSON.stringify(this.state.balances));
     tempState.usd_balances = { ...this.state.usd_balances }; 
     
     for (const tx of transactions) {
@@ -179,7 +182,7 @@ class DataChain {
 
     const newBlock = new Block(this.chain.length, Date.now(), transactions, this.getLatestBlock().hash);
     
-    await newBlock.mineBlock(this.difficulty); // Await the non-blocking loop
+    await newBlock.mineBlock(this.difficulty); 
 
     if (!validator.validateBlock(newBlock, this.getLatestBlock())) return false;
 
@@ -191,8 +194,14 @@ class DataChain {
     return true;
   }
 
-  getBalance(address) { return this.state.getBalance(address); }
-  getRemainingSupply() { return this.state.getBalance("system"); }
+  // Fix: Explicit tokenSymbol pass-through
+  getBalance(address, tokenSymbol = "SYR") { 
+      return this.state.getBalance(address, tokenSymbol); 
+  }
+  
+  getRemainingSupply(tokenSymbol = "SYR") { 
+      return this.state.getBalance("system", tokenSymbol); 
+  }
 }
 
 export { Block, DataChain };

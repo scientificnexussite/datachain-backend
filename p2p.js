@@ -11,9 +11,6 @@ const mplex = mplexPkg.mplex || mplexPkg.default || mplexPkg;
 import * as noisePkg from '@libp2p/noise';
 const noise = noisePkg.noise || noisePkg.default || noisePkg;
 
-import * as mdnsPkg from '@libp2p/mdns';
-const mdns = mdnsPkg.mdns || mdnsPkg.multicastDNS || mdnsPkg.default || mdnsPkg;
-
 const createNode = async () => {
   try {
       const node = await createLibp2p({
@@ -22,8 +19,8 @@ const createNode = async () => {
         },
         transports: [tcp()],
         streamMuxers: [mplex()],
-        connectionEncryption: [noise()],
-        peerDiscovery: [ mdns({ interval: 1000 }) ]
+        connectionEncryption: [noise()]
+        // MDNS Peer Discovery removed to save CPU execution hours on Railway Hobby Plan
       });
 
       await node.start();
@@ -41,8 +38,6 @@ const createNode = async () => {
 
       return node;
   } catch (error) {
-      // Note: Using console.log (stdout) instead of console.error (stderr) so Railway
-      // deploy logs show [inf] instead of [err]. P2P is non-critical — the API runs fine without it.
       console.log(chalk.yellow('[P2P] Transport initialization deferred. P2P discovery is not available in this environment. The API and all trading functions work normally without it.'));
   }
 };

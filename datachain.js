@@ -26,8 +26,8 @@ class Block {
     return new Promise((resolve) => {
       const target = Array(difficulty + 1).join("0");
       const mineChunk = () => {
-        // Reduced to 500 to prevent CPU event-loop starvation during high difficulty
-        for (let i = 0; i < 500; i++) {
+        // Restored to 2000 hashes to fully utilize the 8 vCPUs on the Railway Hobby plan
+        for (let i = 0; i < 2000; i++) {
           if (this.hash.substring(0, difficulty) === target) {
             console.log(chalk.cyan(`[DATACHAIN] Block Mined: ${this.hash}`));
             return resolve(true);

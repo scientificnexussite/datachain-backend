@@ -9,7 +9,6 @@
     "p2p": "node p2p.js"
   },
   "dependencies": {
-    "@libp2p/mdns": "^1.0.0",
     "@libp2p/mplex": "^1.0.0",
     "@libp2p/noise": "^1.0.0",
     "@libp2p/tcp": "^1.0.0",

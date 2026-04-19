@@ -8,6 +8,7 @@ class MenuBook {
   constructor() {
     this.books = { "SYR": { bids: [], asks: [], lastTradePrice: 0.01 } };
     this.orderCounter = 0;
+    this.activeMintLocks = new Set();
     
     const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd();
     this.ordersFile = path.join(volumePath, 'orders.json');
@@ -30,10 +31,12 @@ class MenuBook {
               const data = JSON.parse(fs.readFileSync(this.ordersFile, 'utf8'));
               this.books = data.books || { "SYR": { bids: [], asks: [], lastTradePrice: 0.01 } };
               this.orderCounter = data.orderCounter || 0;
+              this.activeMintLocks = new Set(data.activeMintLocks || []);
               console.log(chalk.green("[MENU BOOK] Orders successfully loaded from disk."));
           }
       } catch (e) {
           console.warn(chalk.yellow("[MENU BOOK] No persistent orders found, starting fresh."));
+          this.activeMintLocks = new Set();
       }
   }
 
@@ -46,7 +49,11 @@ class MenuBook {
       this.saveQueue = false;
 
       try {
-          const data = { books: this.books, orderCounter: this.orderCounter };
+          const data = { 
+              books: this.books, 
+              orderCounter: this.orderCounter,
+              activeMintLocks: Array.from(this.activeMintLocks || [])
+          };
           const tempFile = this.ordersFile + '.tmp';
           await fs.promises.writeFile(tempFile, JSON.stringify(data, null, 2));
           await fs.promises.rename(tempFile, this.ordersFile);
@@ -57,6 +64,10 @@ class MenuBook {
           if (this.saveQueue) this.saveOrders();
       }
   }
+
+  hasMintLock(uid) { return this.activeMintLocks ? this.activeMintLocks.has(uid) : false; }
+  addMintLock(uid) { if(!this.activeMintLocks) this.activeMintLocks = new Set(); this.activeMintLocks.add(uid); this.saveOrders(); }
+  removeMintLock(uid) { if(this.activeMintLocks) { this.activeMintLocks.delete(uid); this.saveOrders(); } }
 
   async setInitialPrice(price, token = "SYR") {
       this._initTokenBook(token);
@@ -146,10 +157,8 @@ class MenuBook {
 
       if (topOrder.amountSyr <= 1e-8) {
         targetBook.splice(bookIndex, 1); 
-      } else {
-        break;
       }
-
+      
       if (side === 'BUY' && totalUsdCost >= availableFunds) break;
     }
 

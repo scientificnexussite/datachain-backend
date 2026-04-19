@@ -13,7 +13,5 @@
     "miner_address": "nexus-system-miner",
     "starting_price": 0.50
   },
-  "peers": [
-    "/ip4/127.0.0.1/tcp/4001"
-  ]
+  "peers": []
 }

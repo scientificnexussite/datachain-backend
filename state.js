@@ -4,7 +4,8 @@ import fs from 'fs';
 import path from 'path';
 
 const { Pool } = pkg;
-const fixDust = (num) => Number(num.toFixed(8));
+// Strict Number casting to prevent legacy JSON string prototype crashes
+const fixDust = (num) => Number(Number(num).toFixed(8));
 
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL || "postgresql://postgres:MuTxOCYQHBfxbSgexbWOdGdbkgjBCsIv@postgres.railway.internal:5432/railway",
@@ -52,22 +53,30 @@ class State {
   }
 
   addUsd(address, amount) {
-    if (typeof amount !== 'number' || isNaN(amount) || amount <= 0) return;
+    const parsedAmount = parseFloat(amount);
+    if (isNaN(parsedAmount) || parsedAmount <= 0) return;
     const current = this.getUsd(address);
-    this.usd_balances[address] = fixDust(current + amount);
+    this.usd_balances[address] = fixDust(current + parsedAmount);
   }
 
   deductUsd(address, amount) {
-    if (typeof amount !== 'number' || isNaN(amount) || amount <= 0) return false;
+    const parsedAmount = parseFloat(amount);
+    if (isNaN(parsedAmount) || parsedAmount <= 0) return false;
     const current = this.getUsd(address);
-    if (address !== 'system' && current < amount) return false;
-    this.usd_balances[address] = fixDust(current - amount);
+    if (address !== 'system' && current < parsedAmount) return false;
+    this.usd_balances[address] = fixDust(current - parsedAmount);
     return true;
   }
 
   applyTransaction(tx, currentPrice = 0, isReplay = false) {
-    const { from, to, amount, type } = tx;
-    const tokenSymbol = tx.tokenSymbol || "SYR"; 
+    let { from, to, type } = tx;
+    
+    // FORCE STRICT NUMBER PARSING TO PREVENT JSON STRING CONCATENATION CRASHES
+    let amount = parseFloat(tx.amount);
+    if (isNaN(amount) || amount <= 0) return false;
+    
+    type = String(type).toUpperCase();
+    const tokenSymbol = tx.tokenSymbol ? String(tx.tokenSymbol).toUpperCase() : "SYR"; 
     
     if (!this.balances[tokenSymbol]) this.balances[tokenSymbol] = {};
 
@@ -90,7 +99,6 @@ class State {
     let sender = from;
     let receiver = to;
 
-    // FIX: Legacy systems recorded the buyer as 'from'. We must route the tokens TO them.
     if (type === 'BUY') {
         receiver = (to && to !== 'system') ? to : from; 
         sender = 'system';
@@ -102,18 +110,17 @@ class State {
 
     let senderBalance = this.balances[tokenSymbol][sender] || 0;
 
-    // Infinitely fund the system wallet during replay so your legacy buys process successfully
+    // Infinitely fund the system wallet during replay so legacy history doesn't bottleneck
     if (sender === 'system' && senderBalance < amount) {
         this.balances[tokenSymbol][sender] = fixDust(senderBalance + amount);
         senderBalance = this.balances[tokenSymbol][sender];
     }
 
     if (type === 'TRANSFER' || type === 'MARKET_TRADE' || type === 'BUY' || type === 'SELL') {
-        // Reject invalid transfers unless it's a forced historical replay
         if (!isReplay && sender !== 'system' && senderBalance < amount) return false; 
         
-        let tradeUsdValue = tx.amountUsd || 0;
-        if (!tradeUsdValue && tx.priceUsd) tradeUsdValue = amount * tx.priceUsd;
+        let tradeUsdValue = parseFloat(tx.amountUsd) || 0;
+        if (!tradeUsdValue && tx.priceUsd) tradeUsdValue = fixDust(amount * parseFloat(tx.priceUsd));
 
         if (type === 'MARKET_TRADE' || type === 'BUY' || type === 'SELL') {
             if (receiver !== 'system' && !isReplay) {
@@ -124,7 +131,7 @@ class State {
             }
         }
 
-        // Execute the mathematical transfer
+        // Execute Mathematical Transfer safely as Floats
         this.balances[tokenSymbol][sender] = fixDust(senderBalance - amount);
         this.balances[tokenSymbol][receiver] = fixDust((this.balances[tokenSymbol][receiver] || 0) + amount);
         return true;
@@ -140,7 +147,6 @@ class State {
 
   async loadSnapshot(chain) {
     // MATHEMATICAL OVERRIDE: We ignore the database state and force calculate every transaction from Block 0.
-    // This forces the system to recognize your 5.98 Billion buys and credit your wallets.
     console.log(chalk.yellow("[STATE] Rebuilding ledger state mathematically from Genesis Block..."));
 
     this.balances = { "SYR": {} };

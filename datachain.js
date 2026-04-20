@@ -296,7 +296,10 @@ class DataChain {
     
     for (const address in syrBalances) {
         if (address !== "system") {
-            totalCirculating += syrBalances[address];
+            // FIX: Clamp circulating addition to prevent any negative balance ghosts from inflating the 6 Billion cap
+            if (syrBalances[address] > 0) {
+                totalCirculating += syrBalances[address];
+            }
         }
     }
     

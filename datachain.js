@@ -80,22 +80,9 @@ class DataChain {
     this.state = new State();
     this.priceHistoryCache = [];
     
-    const volumeDir = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
-    this.chainFile = path.join(volumeDir, 'chain.json');
-    this.backupFile = path.join(volumeDir, 'chain_backup.json');
-
-    // PATH LOCATOR: Finds legacy history from before the volume was mounted
-    const legacyChain = path.join(process.cwd(), 'chain.json');
-    const legacyBackup = path.join(process.cwd(), 'chain_backup.json');
-
-    if (!fs.existsSync(this.chainFile) && fs.existsSync(legacyChain)) {
-        try {
-            if (!fs.existsSync(volumeDir)) fs.mkdirSync(volumeDir, { recursive: true });
-            fs.copyFileSync(legacyChain, this.chainFile);
-            if (fs.existsSync(legacyBackup)) fs.copyFileSync(legacyBackup, this.backupFile);
-            console.log(chalk.yellow("[MIGRATION] Found legacy chain.json. Moved to secure volume."));
-        } catch(e) {}
-    }
+    this.volumeDir = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
+    this.chainFile = path.join(this.volumeDir, 'chain.json');
+    this.backupFile = path.join(this.volumeDir, 'chain_backup.json');
     
     this.isSaving = false;
     this.saveQueue = false;
@@ -104,31 +91,59 @@ class DataChain {
   }
 
   async loadChain() {
-    try {
-        let shouldForceMigrate = false;
-        let dbBlockCount = 0;
+    const legacyChain = path.join(process.cwd(), 'chain.json');
+    const legacyBackup = path.join(process.cwd(), 'chain_backup.json');
 
-        try {
-            const countRes = await pool.query('SELECT COUNT(*) FROM blocks');
-            dbBlockCount = parseInt(countRes.rows[0].count);
-        } catch(e) {}
-
-        if (fs.existsSync(this.chainFile)) {
+    // 1. ULTIMATE AUTO-HEAL: Scan every possible location and find the longest chain
+    let bestChainData = null;
+    let bestLen = 0;
+    
+    const filesToCheck = [legacyChain, legacyBackup, this.chainFile, this.backupFile];
+    for (const file of filesToCheck) {
+        if (fs.existsSync(file)) {
             try {
-                const fileData = JSON.parse(fs.readFileSync(this.chainFile, 'utf8'));
-                if (fileData.length > dbBlockCount && dbBlockCount < 50) {
-                    shouldForceMigrate = true;
-                    console.log(chalk.red("[AUTO-HEAL] Local JSON chain is larger than DB. Wiping blank database to restore history..."));
+                const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+                if (Array.isArray(data) && data.length > bestLen) {
+                    bestLen = data.length;
+                    bestChainData = data;
                 }
             } catch(e) {}
         }
+    }
 
-        if (shouldForceMigrate) {
-            await pool.query('TRUNCATE blocks, transactions, state_meta, state_usd_balances, state_balances, menubook_store, api_state CASCADE').catch(() => null);
-            dbBlockCount = 0;
-        }
+    // 2. Force the absolute best chain found into the secure volume
+    if (bestChainData && bestLen > 0) {
+        try {
+            if (!fs.existsSync(this.volumeDir)) fs.mkdirSync(this.volumeDir, { recursive: true });
+            fs.writeFileSync(this.chainFile, JSON.stringify(bestChainData));
+        } catch(e) {}
+    }
 
-        if (dbBlockCount > 0) {
+    let dbBlockCount = 0;
+    try {
+        const countRes = await pool.query('SELECT COUNT(*) FROM blocks');
+        dbBlockCount = parseInt(countRes.rows[0].count);
+    } catch(e) {}
+
+    // 3. GENESIS MISMATCH PROTOCOL: Drop the database if it's a fake blank slate
+    if (dbBlockCount > 0 && bestLen > 0) {
+        try {
+            const dbGen = await pool.query('SELECT hash FROM blocks WHERE index = 0');
+            if (dbGen.rows.length > 0 && dbGen.rows[0].hash !== bestChainData[0].hash) {
+                console.log(chalk.red("[AUTO-HEAL] Database Genesis Block does not match legacy JSON! DB is a false blank-slate. Wiping DB..."));
+                await pool.query('TRUNCATE blocks, transactions, state_meta, state_usd_balances, state_balances, menubook_store, api_state CASCADE');
+                dbBlockCount = 0;
+            } else if (dbBlockCount < bestLen) {
+                console.log(chalk.red("[AUTO-HEAL] Database is lagging behind JSON. Wiping to force full resync..."));
+                await pool.query('TRUNCATE blocks, transactions, state_meta, state_usd_balances, state_balances, menubook_store, api_state CASCADE');
+                dbBlockCount = 0;
+            }
+        } catch(e) {}
+    }
+
+    // 4. DB Load (If DB survived the validation above)
+    if (dbBlockCount > 0) {
+        try {
             const blockRes = await pool.query('SELECT * FROM blocks ORDER BY index ASC');
             const txRes = await pool.query('SELECT * FROM transactions ORDER BY timestamp_ms ASC, id ASC');
             
@@ -159,43 +174,26 @@ class DataChain {
             this.recalculateDifficulty();
             console.log(chalk.green(`[DATACHAIN] Successfully loaded ${this.chain.length} blocks from PostgreSQL.`));
             return;
-        }
-    } catch(e) {
-        console.warn(chalk.yellow("[DATACHAIN] PostgreSQL load error. Checking local JSON..."));
-    }
-
-    let loadedPrimary = false;
-    if (fs.existsSync(this.chainFile)) {
-        try {
-            const data = fs.readFileSync(this.chainFile, 'utf8');
-            JSON.parse(data); 
-            loadedPrimary = true;
-        } catch (e) {
-            console.error(chalk.red("[DATACHAIN] chain.json is corrupted."));
+        } catch(e) {
+            console.warn(chalk.yellow("[DATACHAIN] PostgreSQL load error. Falling back to JSON..."));
         }
     }
 
-    let targetFile = loadedPrimary ? this.chainFile : this.backupFile;
-    try {
-        if (fs.existsSync(targetFile)) {
-            const data = fs.readFileSync(targetFile, 'utf8');
-            const parsed = JSON.parse(data);
-            this.chain = parsed.map(b => {
-                const block = new Block(b.index, b.timestamp, b.data, b.previousHash);
-                block.nonce = b.nonce; block.hash = b.hash;
-                return block;
-            });
-            
-            await this.state.loadSnapshot(this.chain);
-            this.rebuildPriceHistory();
-            this.recalculateDifficulty();
-            
-            console.log(chalk.green(`[DATACHAIN] Successfully loaded ${this.chain.length} blocks from JSON.`));
-            this.syncAllToDB(); 
-            return;
-        }
-    } catch (e) {
-        console.error(chalk.red("[DATACHAIN] Critical Error: Backup missing or corrupted."));
+    // 5. JSON Load (Executes if DB was empty or just wiped)
+    if (bestChainData && bestLen > 0) {
+        this.chain = bestChainData.map(b => {
+            const block = new Block(b.index, b.timestamp, b.data, b.previousHash);
+            block.nonce = b.nonce; block.hash = b.hash;
+            return block;
+        });
+        
+        await this.state.loadSnapshot(this.chain);
+        this.rebuildPriceHistory();
+        this.recalculateDifficulty();
+        
+        console.log(chalk.green(`[DATACHAIN] Successfully loaded ${this.chain.length} blocks from best JSON.`));
+        this.syncAllToDB(); 
+        return;
     }
 
     console.warn(chalk.yellow("[DATACHAIN] Starting fresh chain from genesis."));
@@ -307,7 +305,6 @@ class DataChain {
         }
     }
     
-    // RESTORED 6 BILLION MAX SUPPLY
     return Math.max(0, 6000000000 - totalCirculating);
   }
 
@@ -378,7 +375,6 @@ class DataChain {
 
     if (!transactions || transactions.length === 0) return false;
 
-    // RESTORED 6 BILLION MAX SUPPLY MINT CHECK
     if (transactions.length === 1 && transactions[0].type === "MINT" && transactions[0].amount === 6000000000) {
         if (this.chain.length > 0 && this.chain[0].index === 0) return true;
     }

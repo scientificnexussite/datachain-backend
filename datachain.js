@@ -94,6 +94,7 @@ class DataChain {
     const legacyChain = path.join(process.cwd(), 'chain.json');
     const legacyBackup = path.join(process.cwd(), 'chain_backup.json');
 
+    // 1. SCAN FOR TRUE HISTORY
     let bestChainData = null;
     let bestLen = 0;
     
@@ -123,21 +124,44 @@ class DataChain {
         dbBlockCount = parseInt(countRes.rows[0].count);
     } catch(e) {}
 
+    // 2. LASER-TARGETED AUTO-HEALER
     if (dbBlockCount > 0 && bestLen > 0) {
         try {
+            let needsWipe = false;
             const dbGen = await pool.query('SELECT hash FROM blocks WHERE index = 0');
+            
             if (dbGen.rows.length > 0 && dbGen.rows[0].hash !== bestChainData[0].hash) {
-                console.log(chalk.red("[AUTO-HEAL] Database Genesis Block does not match legacy JSON! DB is a false blank-slate. Wiping DB..."));
-                await pool.query('TRUNCATE blocks, transactions, state_meta, state_usd_balances, state_balances, menubook_store, api_state CASCADE');
-                dbBlockCount = 0;
+                needsWipe = true;
             } else if (dbBlockCount < bestLen) {
-                console.log(chalk.red("[AUTO-HEAL] Database is lagging behind JSON. Wiping to force full resync..."));
+                needsWipe = true;
+            } else {
+                // THE FIX: Scan the JSON for your massive legacy buys. If the DB doesn't have them, nuke the DB!
+                let jsonHasMassiveBuy = false;
+                for (let b of bestChainData) {
+                    if (Array.isArray(b.data)) {
+                        for (let t of b.data) {
+                            if (parseFloat(t.amount) >= 2000000000) jsonHasMassiveBuy = true;
+                        }
+                    }
+                }
+                
+                if (jsonHasMassiveBuy) {
+                    const checkDbMassive = await pool.query("SELECT COUNT(*) FROM transactions WHERE amount >= 2000000000");
+                    if (parseInt(checkDbMassive.rows[0].count) === 0) {
+                        needsWipe = true;
+                        console.log(chalk.red.bold("[CRITICAL RESCUE] DB is holding history hostage! Wiping corrupted DB to restore 5.98 Billion balance!"));
+                    }
+                }
+            }
+
+            if (needsWipe) {
                 await pool.query('TRUNCATE blocks, transactions, state_meta, state_usd_balances, state_balances, menubook_store, api_state CASCADE');
                 dbBlockCount = 0;
             }
         } catch(e) {}
     }
 
+    // 3. DB LOAD
     if (dbBlockCount > 0) {
         try {
             const blockRes = await pool.query('SELECT * FROM blocks ORDER BY index ASC');
@@ -175,6 +199,7 @@ class DataChain {
         }
     }
 
+    // 4. JSON LOAD (Will trigger immediately after the DB wipe)
     if (bestChainData && bestLen > 0) {
         this.chain = bestChainData.map(b => {
             const block = new Block(b.index, b.timestamp, b.data, b.previousHash);
@@ -296,7 +321,7 @@ class DataChain {
     
     for (const address in syrBalances) {
         if (address !== "system") {
-            // FIX: Clamp circulating addition to prevent any negative balance ghosts from inflating the 6 Billion cap
+            // FIX: Clamp circulating addition to prevent negative ghosts from inflating the 6 Billion cap
             if (syrBalances[address] > 0) {
                 totalCirculating += syrBalances[address];
             }

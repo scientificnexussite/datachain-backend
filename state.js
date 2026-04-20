@@ -175,14 +175,16 @@ class State {
           
           for (const address in this.usd_balances) {
               await client.query(
-                  'INSERT INTO state_usd_balances (address, balance) VALUES ($1, $2) ON CONFLICT (address) DO UPDATE SET balance = $2',\n                  [address, this.usd_balances[address]]
+                  'INSERT INTO state_usd_balances (address, balance) VALUES ($1, $2) ON CONFLICT (address) DO UPDATE SET balance = $2',
+                  [address, this.usd_balances[address]]
               );
           }
 
           for (const tokenSymbol in this.balances) {
               for (const address in this.balances[tokenSymbol]) {
                   await client.query(
-                      'INSERT INTO state_balances (address, token_symbol, balance) VALUES ($1, $2, $3) ON CONFLICT (address, token_symbol) DO UPDATE SET balance = $3',\n                      [address, tokenSymbol, this.balances[tokenSymbol][address]]
+                      'INSERT INTO state_balances (address, token_symbol, balance) VALUES ($1, $2, $3) ON CONFLICT (address, token_symbol) DO UPDATE SET balance = $3',
+                      [address, tokenSymbol, this.balances[tokenSymbol][address]]
                   );
               }
           }

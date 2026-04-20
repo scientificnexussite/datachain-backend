@@ -1,14 +1,38 @@
-import fs from 'fs';
-import path from 'path';
+import pkg from 'pg';
+import chalk from 'chalk';
 
+const { Pool } = pkg;
 const fixDust = (num) => Number(num.toFixed(8));
+
+// Connect to PostgreSQL using the Railway Database URL
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL || "postgresql://postgres:MuTxOCYQHBfxbSgexbWOdGdbkgjBCsIv@postgres.railway.internal:5432/railway",
+});
+
+// Initialize optimized tables for the state snapshot automatically on boot
+pool.query(`
+    CREATE TABLE IF NOT EXISTS state_meta (
+        id INT PRIMARY KEY,
+        last_index INT
+    );
+    CREATE TABLE IF NOT EXISTS state_usd_balances (
+        address VARCHAR(100) PRIMARY KEY,
+        balance DOUBLE PRECISION
+    );
+    CREATE TABLE IF NOT EXISTS state_balances (
+        address VARCHAR(100),
+        token_symbol VARCHAR(20),
+        balance DOUBLE PRECISION,
+        PRIMARY KEY (address, token_symbol)
+    );
+`).catch(err => console.error(chalk.red("[DB] Failed to initialize state tables"), err));
+
 
 class State {
   constructor() {
+    // Write-Through RAM Cache: Keeps API ultra-fast and synchronous
     this.balances = { "SYR": {} };     
     this.usd_balances = {}; 
-    const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd();
-    this.snapshotFile = path.join(volumePath, 'state_snapshot.json');
     
     this.isSaving = false;
     this.saveQueue = false;
@@ -88,17 +112,27 @@ class State {
     return this.balances[tokenSymbol][address] || 0;
   }
 
-  loadSnapshot(chain) {
+  async loadSnapshot(chain) {
     let startIndex = 0;
     try {
-        if (fs.existsSync(this.snapshotFile)) {
-            const snapshot = JSON.parse(fs.readFileSync(this.snapshotFile, 'utf8'));
-            this.balances = snapshot.balances || { "SYR": {} };
-            this.usd_balances = snapshot.usd_balances || {};
-            startIndex = snapshot.lastIndex + 1;
+        const metaRes = await pool.query('SELECT last_index FROM state_meta WHERE id = 1');
+        if (metaRes.rows.length) {
+            startIndex = metaRes.rows[0].last_index + 1;
         }
+
+        const usdRes = await pool.query('SELECT address, balance FROM state_usd_balances');
+        for (const row of usdRes.rows) {
+            this.usd_balances[row.address] = parseFloat(row.balance);
+        }
+
+        const balRes = await pool.query('SELECT address, token_symbol, balance FROM state_balances');
+        for (const row of balRes.rows) {
+            if (!this.balances[row.token_symbol]) this.balances[row.token_symbol] = {};
+            this.balances[row.token_symbol][row.address] = parseFloat(row.balance);
+        }
+        console.log(chalk.green(`[STATE] PostgreSQL Snapshot loaded successfully. Replaying from Block ${startIndex}...`));
     } catch (e) {
-        console.warn("Failed to load state snapshot, running full replay.");
+        console.warn(chalk.yellow("[STATE] No valid PostgreSQL snapshot found or DB unavailable. Running full chain replay."));
     }
 
     for (let i = startIndex; i < chain.length; i++) {
@@ -118,14 +152,35 @@ class State {
       this.isSaving = true;
       this.saveQueue = false;
 
+      const client = await pool.connect();
       try {
-          const snapshot = { balances: this.balances, usd_balances: this.usd_balances, lastIndex };
-          const tempFile = this.snapshotFile + '.tmp';
-          await fs.promises.writeFile(tempFile, JSON.stringify(snapshot));
-          await fs.promises.rename(tempFile, this.snapshotFile);
+          // Wrap the snapshot in a SQL Transaction to guarantee atomicity
+          await client.query('BEGIN');
+          
+          await client.query('INSERT INTO state_meta (id, last_index) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET last_index = $1', [lastIndex]);
+          
+          for (const address in this.usd_balances) {
+              await client.query(
+                  'INSERT INTO state_usd_balances (address, balance) VALUES ($1, $2) ON CONFLICT (address) DO UPDATE SET balance = $2',
+                  [address, this.usd_balances[address]]
+              );
+          }
+
+          for (const tokenSymbol in this.balances) {
+              for (const address in this.balances[tokenSymbol]) {
+                  await client.query(
+                      'INSERT INTO state_balances (address, token_symbol, balance) VALUES ($1, $2, $3) ON CONFLICT (address, token_symbol) DO UPDATE SET balance = $3',
+                      [address, tokenSymbol, this.balances[tokenSymbol][address]]
+                  );
+              }
+          }
+          
+          await client.query('COMMIT');
       } catch (e) {
-          console.error("Snapshot save failed:", e);
+          await client.query('ROLLBACK');
+          console.error(chalk.red("[STATE] PostgreSQL Snapshot save failed:"), e);
       } finally {
+          client.release();
           this.isSaving = false;
           if (this.saveQueue) this.saveSnapshot(lastIndex);
       }

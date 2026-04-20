@@ -7,6 +7,7 @@ import rateLimit from 'express-rate-limit';
 import crypto from 'crypto'; 
 import fs from 'fs';
 import path from 'path';
+import pkg from 'pg';
 import mempool from './mempool.js';
 import { DataChain } from './datachain.js';
 import validator from './validator.js';
@@ -17,6 +18,17 @@ import config from './config.json' with { type: "json" };
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
 const PAYPAL_API_BASE = "https://api-m.paypal.com";
+
+const { Pool } = pkg;
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL || "postgresql://postgres:MuTxOCYQHBfxbSgexbWOdGdbkgjBCsIv@postgres.railway.internal:5432/railway",
+});
+pool.query(`
+    CREATE TABLE IF NOT EXISTS api_state (
+        id VARCHAR(50) PRIMARY KEY,
+        data JSONB
+    );
+`).catch(err => console.error(chalk.red("[DB] API State init failed"), err));
 
 const app = express();
 app.set('trust proxy', 1);
@@ -112,8 +124,38 @@ const apiCache = {
 };
 const CACHE_TTL = 2000;
 
+let pendingPayPalOrders = new Map();
+let pendingVerifications = new Map();
+
+async function loadApiState() {
+    try {
+        const pRes = await pool.query("SELECT data FROM api_state WHERE id = 'paypal_orders'");
+        if (pRes.rows.length > 0) pendingPayPalOrders = new Map(pRes.rows[0].data);
+        
+        const vRes = await pool.query("SELECT data FROM api_state WHERE id = 'verifications'");
+        if (vRes.rows.length > 0) pendingVerifications = new Map(vRes.rows[0].data);
+        console.log(chalk.green("[API] Restored API state from PostgreSQL."));
+    } catch(e) {
+        console.warn("[API] DB state load failed. New state initialization.");
+    }
+}
+
+async function saveApiState() {
+    try {
+        await pool.query(
+            "INSERT INTO api_state (id, data) VALUES ('paypal_orders', $1) ON CONFLICT (id) DO UPDATE SET data = $1",
+            [JSON.stringify(Array.from(pendingPayPalOrders.entries()))]
+        );
+        await pool.query(
+            "INSERT INTO api_state (id, data) VALUES ('verifications', $1) ON CONFLICT (id) DO UPDATE SET data = $1",
+            [JSON.stringify(Array.from(pendingVerifications.entries()))]
+        );
+    } catch(e) { console.error("[API] DB state save failed.", e); }
+}
+
 async function updateMarketEconomics() {
     try {
+        await menuBook.ensureLoaded();
         menuBook._initTokenBook("SYR"); 
         const chainPrice = nexusChain.getLastMarketPrice(config.blockchain.starting_price);
         currentPrice = menuBook.books["SYR"].lastTradePrice > 0 ? menuBook.books["SYR"].lastTradePrice : chainPrice;
@@ -160,7 +202,8 @@ setInterval(async () => {
 app.get('/health', (req, res) => { res.json({ status: 'alive', chainLength: nexusChain.chain.length, timestamp: Date.now() }); });
 app.get('/config', (req, res) => { res.json({ paypalClientId: PAYPAL_CLIENT_ID }); });
 
-app.get('/menubook', (req, res) => { 
+app.get('/menubook', async (req, res) => { 
+    await menuBook.ensureLoaded();
     if (Date.now() - apiCache.menubook.time < CACHE_TTL && apiCache.menubook.data) return res.json(apiCache.menubook.data);
     apiCache.menubook.data = { bids: menuBook.books["SYR"]?.bids || [], asks: menuBook.books["SYR"]?.asks || [], marketData: menuBook.getSpread("SYR") };
     apiCache.menubook.time = Date.now();
@@ -182,7 +225,9 @@ app.get('/tokens', (req, res) => {
     const tokens = Object.keys(nexusChain.state.balances).map(ticker => {
         let totalCirculating = 0;
         for (const address in nexusChain.state.balances[ticker]) {
-            totalCirculating += nexusChain.state.balances[ticker][address];
+            if (address !== 'system') {
+                totalCirculating += nexusChain.state.balances[ticker][address];
+            }
         }
         const supply = ticker === 'SYR' ? (MAX_SUPPLY - nexusChain.getRemainingSupply('SYR')) : totalCirculating;
         return { ticker, supply };
@@ -430,15 +475,26 @@ app.post('/tx/new', txLimiter, requireWeb3Auth, (req, res) => {
   } catch (error) { res.status(500).json({ error: "Internal Server Error." }); }
 });
 
-const pendingVerifications = new Map();
 
 setInterval(() => {
     const now = Date.now();
+    let updated = false;
+    
     for (const [key, record] of pendingVerifications.entries()) {
         if (now - record.timestamp > 30 * 60 * 1000) {
             pendingVerifications.delete(key);
+            updated = true;
         }
     }
+    
+    for (const [orderId, orderData] of pendingPayPalOrders.entries()) {
+        if (now - orderData.timestamp > 24 * 60 * 60 * 1000) {
+            pendingPayPalOrders.delete(orderId);
+            updated = true;
+        }
+    }
+    
+    if (updated) saveApiState();
 }, 15 * 60 * 1000);
 
 app.post('/register-website', txLimiter, requireWeb3Auth, (req, res) => {
@@ -449,6 +505,7 @@ app.post('/register-website', txLimiter, requireWeb3Auth, (req, res) => {
         
         const key = 'nx_' + crypto.randomBytes(16).toString('hex');
         pendingVerifications.set(uid + websiteUrl, { key, timestamp: Date.now() });
+        saveApiState();
         res.json({ key });
     } catch (err) { res.status(500).json({ error: "Internal Server Error" }); }
 });
@@ -467,6 +524,7 @@ app.post('/verify-website', txLimiter, requireWeb3Auth, async (req, res) => {
             const html = await htmlRes.text();
             if (record && html.includes(record.key)) {
                 pendingVerifications.delete(uid + websiteUrl);
+                saveApiState();
                 return res.json({ verified: true });
             }
         }
@@ -480,6 +538,7 @@ app.post('/verify-website', txLimiter, requireWeb3Auth, async (req, res) => {
                     const text = await txtRes.text();
                     if (text.includes(record.key)) {
                         pendingVerifications.delete(uid + websiteUrl);
+                        saveApiState();
                         return res.json({ verified: true });
                     }
                 }
@@ -538,35 +597,6 @@ app.post('/usd/balance/:uid', requireWeb3Auth, (req, res) => {
     res.json({ address: req.params.uid, balance: totalUsd - lockedUsd, total: totalUsd, locked: lockedUsd });
 });
 
-let pendingPayPalOrders = new Map();
-const PAYPAL_ORDERS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd(), 'paypal_orders.json');
-
-function loadPayPalOrders() {
-    try {
-        if (fs.existsSync(PAYPAL_ORDERS_FILE)) {
-            const data = JSON.parse(fs.readFileSync(PAYPAL_ORDERS_FILE, 'utf8'));
-            pendingPayPalOrders = new Map(data);
-            console.log(chalk.green("[PAYPAL] Restored pending payment mapping from disk."));
-        }
-    } catch(e) { console.warn("[PAYPAL] New payment mapping initialization."); }
-}
-function savePayPalOrders() {
-    try { fs.writeFileSync(PAYPAL_ORDERS_FILE, JSON.stringify(Array.from(pendingPayPalOrders.entries()))); } catch(e) {}
-}
-loadPayPalOrders();
-
-setInterval(() => {
-    const now = Date.now();
-    let updated = false;
-    for (const [orderId, orderData] of pendingPayPalOrders.entries()) {
-        if (now - orderData.timestamp > 24 * 60 * 60 * 1000) {
-            pendingPayPalOrders.delete(orderId);
-            updated = true;
-        }
-    }
-    if (updated) savePayPalOrders();
-}, 60 * 60 * 1000);
-
 app.post('/create-paypal-order', requireWeb3Auth, async (req, res) => {
     try {
         const amount = parseFloat(req.body.amount);
@@ -581,7 +611,7 @@ app.post('/create-paypal-order', requireWeb3Auth, async (req, res) => {
         if (!response.ok) throw new Error(data.message);
         
         pendingPayPalOrders.set(data.id, { uid: req.user.uid, timestamp: Date.now() });
-        savePayPalOrders();
+        saveApiState();
         
         res.json({ id: data.id });
     } catch (error) { res.status(500).json({ error: "[Sys-err] Payment system offline. Check configuration." }); }
@@ -602,7 +632,7 @@ app.post('/capture-paypal-order', requireWeb3Auth, async (req, res) => {
         if (!response.ok) throw new Error(data.message);
         
         pendingPayPalOrders.delete(req.body.orderID);
-        savePayPalOrders();
+        saveApiState();
         
         const capturedAmount = parseFloat(data.purchase_units[0].payments.captures[0].amount.value);
         mempool.addTransaction({ from: "paypal-gateway", to: req.user.uid, amount: capturedAmount, type: 'USD_DEPOSIT', timestamp: Date.now(), isSystemGenerated: true });
@@ -644,7 +674,14 @@ app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
 app.use((req, res) => { res.status(404).json({ error: "API Node Endpoint Not Found" }); });
 
 (async () => {
+    console.log(chalk.blue("Initializing PostgreSQL API States..."));
+    await loadApiState();
+    
     console.log(chalk.blue("Initializing Market Economics..."));
+    
+    // Safety lock to guarantee DB initializes before executing economics math
+    if (nexusChain.isInitializing) { await nexusChain.isInitializing; }
+    
     currentPrice = nexusChain.getLastMarketPrice(config.blockchain.starting_price);
     await menuBook.setInitialPrice(currentPrice, "SYR");
     

@@ -23,7 +23,8 @@ class MenuBook {
     this.orderCounter = 0;
     this.activeMintLocks = {};
     
-    const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd();
+    // Strict /app/data implementation for Railway double-backup integrity
+    const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
     this.ordersFile = path.join(volumePath, 'orders.json');
     
     this.isSaving = false;

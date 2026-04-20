@@ -12,7 +12,6 @@ const pool = new Pool({
     connectionString: process.env.DATABASE_URL || "postgresql://postgres:MuTxOCYQHBfxbSgexbWOdGdbkgjBCsIv@postgres.railway.internal:5432/railway",
 });
 
-// Initialize the Database Tables to house the blocks and transactions securely
 pool.query(`
     CREATE TABLE IF NOT EXISTS blocks (
         index INT PRIMARY KEY,
@@ -38,7 +37,6 @@ pool.query(`
         description TEXT
     );
 `).catch(err => console.error(chalk.red("[DB] Blocks init failed"), err));
-
 
 class Block {
   constructor(index, timestamp, data, previousHash = '') {
@@ -82,34 +80,53 @@ class DataChain {
     this.state = new State();
     this.priceHistoryCache = [];
     
-    const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd();
+    // HARDCODED FALLBACK: Guarantees Railway finds your historical volume even if env vars fail
+    const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
     this.chainFile = path.join(volumePath, 'chain.json');
     this.backupFile = path.join(volumePath, 'chain_backup.json');
     
     this.isSaving = false;
     this.saveQueue = false;
 
-    // Engages the async DB initialization lock
     this.isInitializing = this.loadChain();
   }
 
   async loadChain() {
     try {
-        const blockRes = await pool.query('SELECT * FROM blocks ORDER BY index ASC');
-        if (blockRes.rows.length > 0) {
+        let shouldForceMigrate = false;
+        let dbBlockCount = 0;
+
+        try {
+            const countRes = await pool.query('SELECT COUNT(*) FROM blocks');
+            dbBlockCount = parseInt(countRes.rows[0].count);
+        } catch(e) {}
+
+        // AUTO-HEAL PROTOCOL: If a blank slate DB was created but the massive JSON history exists, overwrite the DB
+        if (fs.existsSync(this.chainFile)) {
+            try {
+                const fileData = JSON.parse(fs.readFileSync(this.chainFile, 'utf8'));
+                if (fileData.length > dbBlockCount && dbBlockCount < 50) {
+                    shouldForceMigrate = true;
+                    console.log(chalk.red("[AUTO-HEAL] Local JSON chain is larger than DB. Wiping blank database to restore history..."));
+                }
+            } catch(e) {}
+        }
+
+        if (shouldForceMigrate) {
+            await pool.query('TRUNCATE blocks, transactions, state_meta, state_usd_balances, state_balances, menubook_store, api_state CASCADE').catch(() => null);
+            dbBlockCount = 0;
+        }
+
+        if (dbBlockCount > 0) {
+            const blockRes = await pool.query('SELECT * FROM blocks ORDER BY index ASC');
             const txRes = await pool.query('SELECT * FROM transactions ORDER BY timestamp_ms ASC, id ASC');
             
             const txsByBlock = {};
             txRes.rows.forEach(tx => {
                 if (!txsByBlock[tx.block_index]) txsByBlock[tx.block_index] = [];
-                
                 const parsedTx = {
-                    from: tx.from_address,
-                    to: tx.to_address,
-                    amount: parseFloat(tx.amount),
-                    type: tx.type,
-                    tokenSymbol: tx.token_symbol,
-                    timestamp: parseInt(tx.timestamp_ms)
+                    from: tx.from_address, to: tx.to_address, amount: parseFloat(tx.amount),
+                    type: tx.type, tokenSymbol: tx.token_symbol, timestamp: parseInt(tx.timestamp_ms)
                 };
                 if (tx.amount_usd) parsedTx.amountUsd = parseFloat(tx.amount_usd);
                 if (tx.is_system_generated) parsedTx.isSystemGenerated = true;
@@ -117,14 +134,12 @@ class DataChain {
                 if (tx.public_key) parsedTx.publicKey = tx.public_key;
                 if (tx.platform_type) parsedTx.platformType = tx.platform_type;
                 if (tx.description) parsedTx.description = tx.description;
-                
                 txsByBlock[tx.block_index].push(parsedTx);
             });
 
             this.chain = blockRes.rows.map(b => {
                 const block = new Block(b.index, parseInt(b.timestamp_ms), txsByBlock[b.index] || [], b.previous_hash);
-                block.nonce = b.nonce;
-                block.hash = b.hash;
+                block.nonce = b.nonce; block.hash = b.hash;
                 return block;
             });
             
@@ -135,10 +150,9 @@ class DataChain {
             return;
         }
     } catch(e) {
-        console.warn(chalk.yellow("[DATACHAIN] PostgreSQL load empty or booting. Checking local JSON..."));
+        console.warn(chalk.yellow("[DATACHAIN] PostgreSQL load error. Checking local JSON..."));
     }
 
-    // JSON Fallback & DB Migration
     let loadedPrimary = false;
     if (fs.existsSync(this.chainFile)) {
         try {
@@ -157,8 +171,7 @@ class DataChain {
             const parsed = JSON.parse(data);
             this.chain = parsed.map(b => {
                 const block = new Block(b.index, b.timestamp, b.data, b.previousHash);
-                block.nonce = b.nonce;
-                block.hash = b.hash;
+                block.nonce = b.nonce; block.hash = b.hash;
                 return block;
             });
             
@@ -167,7 +180,7 @@ class DataChain {
             this.recalculateDifficulty();
             
             console.log(chalk.green(`[DATACHAIN] Successfully loaded ${this.chain.length} blocks from JSON.`));
-            this.syncAllToDB(); // Automatically ports old history into new PostgreSQL
+            this.syncAllToDB(); 
             return;
         }
     } catch (e) {
@@ -182,8 +195,8 @@ class DataChain {
   }
 
   async syncAllToDB() {
-      const check = await pool.query('SELECT COUNT(*) FROM blocks');
-      if (parseInt(check.rows[0].count) > 0) return; // Protection against duplicates
+      const check = await pool.query('SELECT COUNT(*) FROM blocks').catch(() => ({rows:[{count:0}]}));
+      if (parseInt(check.rows[0].count) > 0) return; 
 
       const client = await pool.connect();
       try {
@@ -196,9 +209,7 @@ class DataChain {
               if (typeof block.data !== 'string') {
                   for (const tx of block.data) {
                       await client.query(
-                          `INSERT INTO transactions 
-                          (block_index, from_address, to_address, amount, amount_usd, type, token_symbol, timestamp_ms, is_system_generated, signature, public_key, platform_type, description) 
-                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+                          `INSERT INTO transactions (block_index, from_address, to_address, amount, amount_usd, type, token_symbol, timestamp_ms, is_system_generated, signature, public_key, platform_type, description) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
                           [block.index, tx.from, tx.to, tx.amount, tx.amountUsd || 0, tx.type, tx.tokenSymbol || 'SYR', tx.timestamp, !!tx.isSystemGenerated, tx.signature || '', tx.publicKey || '', tx.platformType || '', tx.description || '']
                       );
                   }
@@ -206,6 +217,8 @@ class DataChain {
           }
           await client.query('COMMIT');
           console.log(chalk.green("[DATACHAIN] Successfully migrated local JSON chain to PostgreSQL!"));
+          
+          await this.state.saveSnapshot(this.chain.length - 1);
       } catch(e) {
           await client.query('ROLLBACK');
           console.error(chalk.red("[DATACHAIN] DB Migration failed"), e);
@@ -222,7 +235,6 @@ class DataChain {
       this.isSaving = true;
       this.saveQueue = false;
 
-      // Keep JSON writes to retain file backup integrity
       try {
           const tempFile = this.chainFile + '.tmp';
           await fs.promises.writeFile(tempFile, JSON.stringify(this.chain));
@@ -232,7 +244,6 @@ class DataChain {
           console.error(chalk.red("[DATACHAIN] Error saving JSON fallback"));
       }
 
-      // Centralized PostgreSQL insertion
       const client = await pool.connect();
       try {
           await client.query('BEGIN');
@@ -248,9 +259,7 @@ class DataChain {
               if (parseInt(txCheck.rows[0].count) === 0) {
                   for (const tx of latestBlock.data) {
                       await client.query(
-                          `INSERT INTO transactions 
-                          (block_index, from_address, to_address, amount, amount_usd, type, token_symbol, timestamp_ms, is_system_generated, signature, public_key, platform_type, description) 
-                          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+                          `INSERT INTO transactions (block_index, from_address, to_address, amount, amount_usd, type, token_symbol, timestamp_ms, is_system_generated, signature, public_key, platform_type, description) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
                           [latestBlock.index, tx.from, tx.to, tx.amount, tx.amountUsd || 0, tx.type, tx.tokenSymbol || 'SYR', tx.timestamp, !!tx.isSystemGenerated, tx.signature || '', tx.publicKey || '', tx.platformType || '', tx.description || '']
                       );
                   }
@@ -357,7 +366,6 @@ class DataChain {
 
     if (!transactions || transactions.length === 0) return false;
 
-    // Safety lock: Prevents genesis overwrite if DB was loading
     if (transactions.length === 1 && transactions[0].type === "MINT" && transactions[0].amount === 6000000000) {
         if (this.chain.length > 0 && this.chain[0].index === 0) return true;
     }

@@ -114,6 +114,7 @@ async function getPayPalAccessToken() {
     return data.access_token;
 }
 
+// RESTORED 6 BILLION MAX SUPPLY
 const MAX_SUPPLY = 6000000000;
 let currentPrice = config.blockchain.starting_price; 
 

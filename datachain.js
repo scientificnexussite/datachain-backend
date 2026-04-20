@@ -80,10 +80,22 @@ class DataChain {
     this.state = new State();
     this.priceHistoryCache = [];
     
-    // HARDCODED FALLBACK: Guarantees Railway finds your historical volume even if env vars fail
-    const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
-    this.chainFile = path.join(volumePath, 'chain.json');
-    this.backupFile = path.join(volumePath, 'chain_backup.json');
+    const volumeDir = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
+    this.chainFile = path.join(volumeDir, 'chain.json');
+    this.backupFile = path.join(volumeDir, 'chain_backup.json');
+
+    // PATH LOCATOR: Finds legacy history from before the volume was mounted
+    const legacyChain = path.join(process.cwd(), 'chain.json');
+    const legacyBackup = path.join(process.cwd(), 'chain_backup.json');
+
+    if (!fs.existsSync(this.chainFile) && fs.existsSync(legacyChain)) {
+        try {
+            if (!fs.existsSync(volumeDir)) fs.mkdirSync(volumeDir, { recursive: true });
+            fs.copyFileSync(legacyChain, this.chainFile);
+            if (fs.existsSync(legacyBackup)) fs.copyFileSync(legacyBackup, this.backupFile);
+            console.log(chalk.yellow("[MIGRATION] Found legacy chain.json. Moved to secure volume."));
+        } catch(e) {}
+    }
     
     this.isSaving = false;
     this.saveQueue = false;
@@ -101,7 +113,6 @@ class DataChain {
             dbBlockCount = parseInt(countRes.rows[0].count);
         } catch(e) {}
 
-        // AUTO-HEAL PROTOCOL: If a blank slate DB was created but the massive JSON history exists, overwrite the DB
         if (fs.existsSync(this.chainFile)) {
             try {
                 const fileData = JSON.parse(fs.readFileSync(this.chainFile, 'utf8'));
@@ -296,6 +307,7 @@ class DataChain {
         }
     }
     
+    // RESTORED 6 BILLION MAX SUPPLY
     return Math.max(0, 6000000000 - totalCirculating);
   }
 
@@ -366,6 +378,7 @@ class DataChain {
 
     if (!transactions || transactions.length === 0) return false;
 
+    // RESTORED 6 BILLION MAX SUPPLY MINT CHECK
     if (transactions.length === 1 && transactions[0].type === "MINT" && transactions[0].amount === 6000000000) {
         if (this.chain.length > 0 && this.chain[0].index === 0) return true;
     }

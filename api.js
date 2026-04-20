@@ -119,29 +119,11 @@ async function updateMarketEconomics() {
         currentPrice = menuBook.books["SYR"].lastTradePrice > 0 ? menuBook.books["SYR"].lastTradePrice : chainPrice;
         await menuBook.setInitialPrice(currentPrice, "SYR");
 
+        // PURE P2P ENFORCEMENT: System never places artificial liquidity on the menubook.
+        // We purge any legacy system orders to ensure humans dictate the limit price dynamics.
         menuBook.books["SYR"].asks = menuBook.books["SYR"].asks.filter(a => a.uid !== "system");
         menuBook.books["SYR"].bids = menuBook.books["SYR"].bids.filter(a => a.uid !== "system");
 
-        const hasUserAsks = menuBook.books["SYR"].asks.some(a => a.uid !== "system");
-        if (!hasUserAsks) {
-            const tiers = [
-                { multiplier: 1.02, amount: 50000 },
-                { multiplier: 1.05, amount: 100000 },
-                { multiplier: 1.10, amount: 250000 }
-            ];
-            for (const tier of tiers) {
-                const tierPrice = currentPrice > 0 ? currentPrice * tier.multiplier : config.blockchain.starting_price * tier.multiplier;
-                menuBook.books["SYR"].asks.push({ id: `sys-liquidity-ask-${tier.multiplier}`, uid: 'system', amountSyr: tier.amount, priceUsd: tierPrice, timestamp: Date.now() });
-            }
-            menuBook.books["SYR"].asks.sort((a, b) => a.priceUsd - b.priceUsd || a.timestamp - b.timestamp);
-        }
-
-        const hasUserBids = menuBook.books["SYR"].bids.some(b => b.uid !== "system");
-        if (!hasUserBids) {
-            const floorPrice = currentPrice > 0 ? currentPrice * 0.90 : config.blockchain.starting_price * 0.9;
-            menuBook.books["SYR"].bids.push({ id: 'sys-liquidity-bid', uid: 'system', amountSyr: 100000, priceUsd: floorPrice, timestamp: Date.now() });
-            menuBook.books["SYR"].bids.sort((a, b) => b.priceUsd - a.priceUsd || a.timestamp - b.timestamp);
-        }
         await menuBook.saveOrders();
 
         apiCache.stats.time = 0;
@@ -306,6 +288,46 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
         const matchResult = await menuBook.matchMarketOrder(uid, side, parsedAmount, fundsToCheck, null, tokenSymbol);
 
         if (matchResult.trades.length === 0) {
+            // ICO Phase Fallback Logic: Shift buying towards the Remaining Supply
+            const systemBalance = nexusChain.getBalance('system', tokenSymbol) - mempool.getPendingTokenSpend('system', tokenSymbol);
+            if (side === 'BUY' && systemBalance > 0 && tokenSymbol === 'SYR') {
+                let tradeAmount = Math.min(parsedAmount, systemBalance);
+                let tradeUsd = parseFloat((tradeAmount * currentPrice).toFixed(8));
+                
+                if (fundsToCheck < tradeUsd) {
+                    tradeAmount = parseFloat((fundsToCheck / currentPrice).toFixed(8));
+                    tradeUsd = parseFloat((tradeAmount * currentPrice).toFixed(8));
+                    if (tradeAmount <= 1e-8) {
+                        return res.status(400).json({ error: "Insufficient USD balance to buy from Remaining Supply." });
+                    }
+                }
+
+                mempool.addTransaction({ 
+                    from: 'system', 
+                    to: uid, 
+                    amount: tradeAmount, 
+                    amountUsd: tradeUsd, 
+                    type: 'MARKET_TRADE', 
+                    tokenSymbol: tokenSymbol, 
+                    timestamp: Date.now(),
+                    isSystemGenerated: true
+                });
+
+                // FOMO Engine: Simulates exponential price climbs to push organic human action
+                currentPrice = parseFloat((currentPrice * 1.001).toFixed(6));
+                menuBook.books[tokenSymbol].lastTradePrice = currentPrice;
+                await menuBook.saveOrders();
+
+                return res.status(201).json({
+                    message: "Purchased directly from Initial System Supply",
+                    executedSyr: tradeAmount,
+                    remainingUnfilled: parseFloat((parsedAmount - tradeAmount).toFixed(8)),
+                    totalUsdCost: tradeUsd,
+                    slippagePercentage: "0.00%",
+                    trades: [{ buyer: uid, seller: 'system', amountSyr: tradeAmount, amountUsd: tradeUsd, price: currentPrice, tokenSymbol }]
+                });
+            }
+
             if (fundsToCheck <= 1e-8) {
                 return res.status(400).json({ error: side === 'BUY' ? "Insufficient USD balance." : `Insufficient ${tokenSymbol} balance.` });
             }

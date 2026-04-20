@@ -134,7 +134,6 @@ class DataChain {
   getRemainingSupply(tokenSymbol = "SYR") {
     if (tokenSymbol !== "SYR") return 0;
     
-    // Dynamically calculate circulating supply to account for legacy MINT blocks
     let totalCirculating = 0;
     const syrBalances = this.state.balances["SYR"] || {};
     
@@ -273,7 +272,7 @@ class DataChain {
         const timeTaken = curr.timestamp - prev.timestamp;
         const timeExpected = TARGET_TIME * ADJUSTMENT_INTERVAL;
         if (timeTaken < timeExpected / 2) this.difficulty++;
-        else if (timeTaken > timeExpected * 2 && this.difficulty > 1) this.difficulty--;
+        else if (timeTaken > timeExpected * 2 && this.difficulty > 2) this.difficulty--;
     }
   }
 
@@ -288,7 +287,7 @@ class DataChain {
 
       if (timeTaken < timeExpected / 2) {
         this.difficulty++;
-      } else if (timeTaken > timeExpected * 2 && this.difficulty > 1) {
+      } else if (timeTaken > timeExpected * 2 && this.difficulty > 2) {
         this.difficulty--;
       }
       console.log(chalk.yellow(`[NETWORK] Difficulty adjusted to: ${this.difficulty}`));

@@ -120,7 +120,6 @@ async function updateMarketEconomics() {
         await menuBook.setInitialPrice(currentPrice, "SYR");
 
         // PURE P2P ENFORCEMENT: System never places artificial liquidity on the menubook.
-        // We purge any legacy system orders to ensure humans dictate the limit price dynamics.
         menuBook.books["SYR"].asks = menuBook.books["SYR"].asks.filter(a => a.uid !== "system");
         menuBook.books["SYR"].bids = menuBook.books["SYR"].bids.filter(a => a.uid !== "system");
 
@@ -296,7 +295,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                 
                 if (fundsToCheck < tradeUsd) {
                     tradeAmount = parseFloat((fundsToCheck / currentPrice).toFixed(8));
-                    tradeUsd = parseFloat((tradeAmount * currentPrice).toFixed(8));
+                    tradeUsd = fundsToCheck; // Strict hard-cap to prevent float overdraft
                     if (tradeAmount <= 1e-8) {
                         return res.status(400).json({ error: "Insufficient USD balance to buy from Remaining Supply." });
                     }
@@ -313,8 +312,10 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                     isSystemGenerated: true
                 });
 
-                // FOMO Engine: Simulates exponential price climbs to push organic human action
-                currentPrice = parseFloat((currentPrice * 1.001).toFixed(6));
+                // FOMO Engine: Proportional price climb to prevent Dusting attacks
+                // Price increases by 0.1% per 10 SYR volume bought
+                const pumpFactor = 1 + (0.001 * (tradeAmount / 10)); 
+                currentPrice = parseFloat((currentPrice * pumpFactor).toFixed(6));
                 menuBook.books[tokenSymbol].lastTradePrice = currentPrice;
                 await menuBook.saveOrders();
 

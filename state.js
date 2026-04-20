@@ -32,7 +32,7 @@ class State {
     return true;
   }
 
-  applyTransaction(tx, currentPrice = 0) {
+  applyTransaction(tx, currentPrice = 0, isReplay = false) {
     const { from, to, amount, type } = tx;
     const tokenSymbol = tx.tokenSymbol || "SYR"; 
     
@@ -55,25 +55,27 @@ class State {
     const fromBalance = this.balances[tokenSymbol][from] || 0;
 
     if (type === 'TRANSFER') {
-      if (fromBalance < amount && from !== 'system') return false;
-      if (from !== 'system') this.balances[tokenSymbol][from] = fixDust(fromBalance - amount);
+      if (fromBalance < amount) return false; 
+      this.balances[tokenSymbol][from] = fixDust(fromBalance - amount);
       this.balances[tokenSymbol][to] = fixDust((this.balances[tokenSymbol][to] || 0) + amount);
       return true;
     }
 
     if (type === 'MARKET_TRADE') {
-      if (fromBalance < amount && from !== 'system') return false;
+      if (fromBalance < amount) return false; 
       const tradeUsdValue = tx.amountUsd; 
 
       if (to !== 'system') {
-          if (!this.deductUsd(to, tradeUsdValue)) return false; 
+          if (!isReplay) {
+              if (!this.deductUsd(to, tradeUsdValue)) return false; 
+          }
       }
 
       if (from !== 'system') {
-          this.balances[tokenSymbol][from] = fixDust(fromBalance - amount);
           this.addUsd(from, tradeUsdValue);
       }
 
+      this.balances[tokenSymbol][from] = fixDust(fromBalance - amount);
       this.balances[tokenSymbol][to] = fixDust((this.balances[tokenSymbol][to] || 0) + amount);
       return true;
     }
@@ -103,7 +105,7 @@ class State {
       const block = chain[i];
       if (typeof block.data === 'string') continue;
       for (const tx of block.data) {
-        this.applyTransaction(tx, 0); 
+        this.applyTransaction(tx, 0, true); 
       }
     }
   }

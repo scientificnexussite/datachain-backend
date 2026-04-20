@@ -119,7 +119,6 @@ async function updateMarketEconomics() {
         currentPrice = menuBook.books["SYR"].lastTradePrice > 0 ? menuBook.books["SYR"].lastTradePrice : chainPrice;
         await menuBook.setInitialPrice(currentPrice, "SYR");
 
-        // PURE P2P ENFORCEMENT: System never places artificial liquidity on the menubook.
         menuBook.books["SYR"].asks = menuBook.books["SYR"].asks.filter(a => a.uid !== "system");
         menuBook.books["SYR"].bids = menuBook.books["SYR"].bids.filter(a => a.uid !== "system");
 
@@ -146,7 +145,9 @@ setInterval(async () => {
             positionsCache.clear();
             await updateMarketEconomics();
             pendingTxs.forEach(tx => {
-                if (tx.type === 'MINT' && tx.to !== 'system') menuBook.removeMintLock(tx.to); 
+                if (tx.type === 'USD_WITHDRAWAL' && tx.to === 'system' && tx.isSystemGenerated) {
+                    menuBook.removeMintLock(tx.from); 
+                }
             });
         } else {
             console.log(chalk.red(`[AUTO-MINER] Block validation failed.`));
@@ -287,7 +288,6 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
         const matchResult = await menuBook.matchMarketOrder(uid, side, parsedAmount, fundsToCheck, null, tokenSymbol);
 
         if (matchResult.trades.length === 0) {
-            // ICO Phase Fallback Logic: Shift buying towards the Remaining Supply
             const systemBalance = nexusChain.getBalance('system', tokenSymbol) - mempool.getPendingTokenSpend('system', tokenSymbol);
             if (side === 'BUY' && systemBalance > 0 && tokenSymbol === 'SYR') {
                 let tradeAmount = Math.min(parsedAmount, systemBalance);
@@ -295,7 +295,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                 
                 if (fundsToCheck < tradeUsd) {
                     tradeAmount = parseFloat((fundsToCheck / currentPrice).toFixed(8));
-                    tradeUsd = fundsToCheck; // Strict hard-cap to prevent float overdraft
+                    tradeUsd = fundsToCheck; 
                     if (tradeAmount <= 1e-8) {
                         return res.status(400).json({ error: "Insufficient USD balance to buy from Remaining Supply." });
                     }
@@ -312,8 +312,6 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                     isSystemGenerated: true
                 });
 
-                // FOMO Engine: Proportional price climb to prevent Dusting attacks
-                // Price increases by 0.1% per 10 SYR volume bought
                 const pumpFactor = 1 + (0.001 * (tradeAmount / 10)); 
                 currentPrice = parseFloat((currentPrice * pumpFactor).toFixed(6));
                 menuBook.books[tokenSymbol].lastTradePrice = currentPrice;
@@ -433,6 +431,15 @@ app.post('/tx/new', txLimiter, requireWeb3Auth, (req, res) => {
 });
 
 const pendingVerifications = new Map();
+
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, record] of pendingVerifications.entries()) {
+        if (now - record.timestamp > 30 * 60 * 1000) {
+            pendingVerifications.delete(key);
+        }
+    }
+}, 15 * 60 * 1000);
 
 app.post('/register-website', txLimiter, requireWeb3Auth, (req, res) => {
     try {

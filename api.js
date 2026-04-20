@@ -5,6 +5,8 @@ import chalk from 'chalk';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import crypto from 'crypto'; 
+import fs from 'fs';
+import path from 'path';
 import mempool from './mempool.js';
 import { DataChain } from './datachain.js';
 import validator from './validator.js';
@@ -202,10 +204,14 @@ app.get('/pricehistory', (req, res) => {
 });
 
 app.get('/tokens', (req, res) => {
-    const tokens = Object.keys(nexusChain.state.balances).map(ticker => ({
-        ticker,
-        supply: MAX_SUPPLY - nexusChain.getRemainingSupply(ticker) 
-    }));
+    const tokens = Object.keys(nexusChain.state.balances).map(ticker => {
+        let totalCirculating = 0;
+        for (const address in nexusChain.state.balances[ticker]) {
+            totalCirculating += nexusChain.state.balances[ticker][address];
+        }
+        const supply = ticker === 'SYR' ? (MAX_SUPPLY - nexusChain.getRemainingSupply('SYR')) : totalCirculating;
+        return { ticker, supply };
+    });
     res.json(tokens);
 });
 
@@ -417,8 +423,8 @@ app.post('/verify-website', txLimiter, requireWeb3Auth, async (req, res) => {
         
         if (htmlRes && htmlRes.ok) {
             const html = await htmlRes.text();
-            if ((record && html.includes(record.key)) || html.includes(uid)) {
-                if (record) pendingVerifications.delete(uid + websiteUrl);
+            if (record && html.includes(record.key)) {
+                pendingVerifications.delete(uid + websiteUrl);
                 return res.json({ verified: true });
             }
         }
@@ -438,7 +444,7 @@ app.post('/verify-website', txLimiter, requireWeb3Auth, async (req, res) => {
             } catch (e) {}
         }
 
-        res.json({ verified: false, error: "Verification token or wallet identity could not be retrieved from the target URL." });
+        res.json({ verified: false, error: "Token missing. Please ensure your key is embedded directly or utilize the fallback syrpts-verify.txt protocol for Android/Steam non-web platforms." });
     } catch (error) {
         res.status(500).json({ error: "Server node encountered an error scanning the specified platform." });
     }
@@ -490,15 +496,33 @@ app.post('/usd/balance/:uid', requireWeb3Auth, (req, res) => {
     res.json({ address: req.params.uid, balance: totalUsd - lockedUsd, total: totalUsd, locked: lockedUsd });
 });
 
-const pendingPayPalOrders = new Map();
+let pendingPayPalOrders = new Map();
+const PAYPAL_ORDERS_FILE = path.join(process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd(), 'paypal_orders.json');
+
+function loadPayPalOrders() {
+    try {
+        if (fs.existsSync(PAYPAL_ORDERS_FILE)) {
+            const data = JSON.parse(fs.readFileSync(PAYPAL_ORDERS_FILE, 'utf8'));
+            pendingPayPalOrders = new Map(data);
+            console.log(chalk.green("[PAYPAL] Restored pending payment mapping from disk."));
+        }
+    } catch(e) { console.warn("[PAYPAL] New payment mapping initialization."); }
+}
+function savePayPalOrders() {
+    try { fs.writeFileSync(PAYPAL_ORDERS_FILE, JSON.stringify(Array.from(pendingPayPalOrders.entries()))); } catch(e) {}
+}
+loadPayPalOrders();
 
 setInterval(() => {
     const now = Date.now();
+    let updated = false;
     for (const [orderId, orderData] of pendingPayPalOrders.entries()) {
         if (now - orderData.timestamp > 24 * 60 * 60 * 1000) {
             pendingPayPalOrders.delete(orderId);
+            updated = true;
         }
     }
+    if (updated) savePayPalOrders();
 }, 60 * 60 * 1000);
 
 app.post('/create-paypal-order', requireWeb3Auth, async (req, res) => {
@@ -513,7 +537,10 @@ app.post('/create-paypal-order', requireWeb3Auth, async (req, res) => {
         });
         const data = await response.json();
         if (!response.ok) throw new Error(data.message);
+        
         pendingPayPalOrders.set(data.id, { uid: req.user.uid, timestamp: Date.now() });
+        savePayPalOrders();
+        
         res.json({ id: data.id });
     } catch (error) { res.status(500).json({ error: "[Sys-err] Payment system offline. Check configuration." }); }
 });
@@ -533,6 +560,8 @@ app.post('/capture-paypal-order', requireWeb3Auth, async (req, res) => {
         if (!response.ok) throw new Error(data.message);
         
         pendingPayPalOrders.delete(req.body.orderID);
+        savePayPalOrders();
+        
         const capturedAmount = parseFloat(data.purchase_units[0].payments.captures[0].amount.value);
         mempool.addTransaction({ from: "paypal-gateway", to: req.user.uid, amount: capturedAmount, type: 'USD_DEPOSIT', timestamp: Date.now(), isSystemGenerated: true });
         res.json({ status: 'COMPLETED', amount: capturedAmount });
@@ -544,6 +573,9 @@ app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
         const { uid, amount, paypalEmail } = req.body;
         if (uid !== req.user.uid) return res.status(403).json({ error: "Forbidden" });
         if (typeof amount !== 'number' || amount < 10) return res.status(400).json({ error: "Invalid withdrawal amount." });
+        
+        if (!paypalEmail || !paypalEmail.includes('@')) return res.status(400).json({ error: "Valid PayPal email is required to process withdrawals." });
+        
         if ((nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, "SYR")) < amount) return res.status(400).json({ error: "Insufficient available USD." });
 
         try {
@@ -553,7 +585,7 @@ app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
                 headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
                 body: JSON.stringify({
                     sender_batch_header: { sender_batch_id: `wdr_${Date.now()}_${uid.substring(0,6)}`, email_subject: "Syrpts Node Withdrawal" },
-                    items: [{ recipient_type: "EMAIL", amount: { value: amount.toFixed(2), currency: "USD" }, receiver: paypalEmail || "placeholder@example.com" }]
+                    items: [{ recipient_type: "EMAIL", amount: { value: amount.toFixed(2), currency: "USD" }, receiver: paypalEmail }]
                 })
             });
             const payoutData = await payoutRes.json();

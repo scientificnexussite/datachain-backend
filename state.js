@@ -32,7 +32,7 @@ class State {
     return true;
   }
 
-  applyTransaction(tx, currentPrice = 0, isReplay = false) {
+  applyTransaction(tx, currentPrice = 0) {
     const { from, to, amount, type } = tx;
     const tokenSymbol = tx.tokenSymbol || "SYR"; 
     
@@ -40,9 +40,6 @@ class State {
 
     if (type === 'MINT') {
       this.balances[tokenSymbol][to] = fixDust((this.balances[tokenSymbol][to] || 0) + amount);
-      if (!isReplay && this.chain) {
-          this.saveSnapshot(this.chain.length - 1);
-      }
       return true;
     }
 
@@ -106,7 +103,7 @@ class State {
       const block = chain[i];
       if (typeof block.data === 'string') continue;
       for (const tx of block.data) {
-        this.applyTransaction(tx, 0, true); 
+        this.applyTransaction(tx, 0); 
       }
     }
   }

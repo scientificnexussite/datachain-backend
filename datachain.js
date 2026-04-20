@@ -47,6 +47,7 @@ class DataChain {
     this.difficulty = 2;
     this.state = new State();
     this.priceHistoryCache = [];
+    this.mintedSupply = {};
     
     const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd();
     this.chainFile = path.join(volumePath, 'chain.json');
@@ -59,9 +60,23 @@ class DataChain {
   }
 
   loadChain() {
-    try {
-        if (fs.existsSync(this.chainFile)) {
+    let loadedPrimary = false;
+    
+    if (fs.existsSync(this.chainFile)) {
+        try {
             const data = fs.readFileSync(this.chainFile, 'utf8');
+            JSON.parse(data); 
+            loadedPrimary = true;
+        } catch (e) {
+            console.error(chalk.red("[DATACHAIN] chain.json is corrupted. Attempting backup recovery..."));
+        }
+    }
+
+    let targetFile = loadedPrimary ? this.chainFile : this.backupFile;
+
+    try {
+        if (fs.existsSync(targetFile)) {
+            const data = fs.readFileSync(targetFile, 'utf8');
             const parsed = JSON.parse(data);
             this.chain = parsed.map(b => {
                 const block = new Block(b.index, b.timestamp, b.data, b.previousHash);
@@ -69,18 +84,24 @@ class DataChain {
                 block.hash = b.hash;
                 return block;
             });
+            
             this.state.loadSnapshot(this.chain);
+            this.rebuildSupplyCache();
             this.rebuildPriceHistory();
-            console.log(chalk.green(`[DATACHAIN] Successfully loaded ${this.chain.length} blocks from disk.`));
-        } else {
-            this.chain = [this.createGenesisBlock()];
-            this.rebuildPriceHistory();
+            this.recalculateDifficulty();
+            
+            console.log(chalk.green(`[DATACHAIN] Successfully loaded ${this.chain.length} blocks.`));
+            return;
         }
     } catch (e) {
-        console.error(chalk.red("[DATACHAIN] Failed to load chain from disk, starting fresh."));
-        this.chain = [this.createGenesisBlock()];
-        this.rebuildPriceHistory();
+        console.error(chalk.red("[DATACHAIN] Critical Error: Backup is also missing or corrupted."));
     }
+
+    console.warn(chalk.yellow("[DATACHAIN] Starting fresh chain from genesis."));
+    this.chain = [this.createGenesisBlock()];
+    this.rebuildSupplyCache();
+    this.rebuildPriceHistory();
+    this.difficulty = 2;
   }
 
   async saveChain() {
@@ -96,9 +117,7 @@ class DataChain {
           await fs.promises.writeFile(tempFile, JSON.stringify(this.chain));
           await fs.promises.rename(tempFile, this.chainFile);
           
-          if (this.chain.length % 50 === 0) {
-              await fs.promises.copyFile(this.chainFile, this.backupFile);
-          }
+          await fs.promises.copyFile(this.chainFile, this.backupFile);
       } catch (e) {
           console.error(chalk.red("[DATACHAIN] Error saving chain to disk"));
       } finally {
@@ -115,16 +134,32 @@ class DataChain {
     return this.chain[this.chain.length - 1];
   }
 
-  getRemainingSupply(tokenSymbol = "SYR") {
-    let minted = 0;
+  rebuildSupplyCache() {
+    this.mintedSupply = {};
     for (const block of this.chain) {
       if (typeof block.data === 'string') continue;
       for (const tx of block.data) {
-        if (tx.type === 'MINT' && (tx.tokenSymbol === tokenSymbol || (!tx.tokenSymbol && tokenSymbol === "SYR"))) {
-          minted += tx.amount;
+        if (tx.type === 'MINT') {
+          const sym = tx.tokenSymbol || "SYR";
+          this.mintedSupply[sym] = (this.mintedSupply[sym] || 0) + tx.amount;
         }
       }
     }
+  }
+
+  updateSupplyCache(block) {
+    if (typeof block.data === 'string') return;
+    for (const tx of block.data) {
+      if (tx.type === 'MINT') {
+        const sym = tx.tokenSymbol || "SYR";
+        this.mintedSupply[sym] = (this.mintedSupply[sym] || 0) + tx.amount;
+      }
+    }
+  }
+
+  getRemainingSupply(tokenSymbol = "SYR") {
+    if (tokenSymbol !== "SYR") return 0; 
+    const minted = this.mintedSupply[tokenSymbol] || 0;
     return Math.max(0, 6000000000 - minted);
   }
 
@@ -162,6 +197,29 @@ class DataChain {
       this.priceHistoryCache = Array.from(unique.entries())
           .map(([t, p]) => ({ timestamp: t * 1000, price: p }))
           .sort((a, b) => a.timestamp - b.timestamp);
+  }
+
+  appendPriceHistory(block) {
+      if (typeof block.data === 'string') return;
+      let added = false;
+      for (const tx of block.data) {
+          if ((tx.tokenSymbol === 'SYR' || !tx.tokenSymbol)) {
+              if (tx.type === 'MARKET_TRADE' && tx.amountUsd && tx.amount) {
+                  this.priceHistoryCache.push({ timestamp: tx.timestamp, price: tx.amountUsd / tx.amount });
+                  added = true;
+              } else if ((tx.type === 'BUY' || tx.type === 'SELL') && tx.priceUsd) {
+                  this.priceHistoryCache.push({ timestamp: tx.timestamp, price: tx.priceUsd });
+                  added = true;
+              }
+          }
+      }
+      if (added) {
+          const unique = new Map();
+          this.priceHistoryCache.forEach(d => unique.set(Math.floor(d.timestamp / 1000), d.price));
+          this.priceHistoryCache = Array.from(unique.entries())
+              .map(([t, p]) => ({ timestamp: t * 1000, price: p }))
+              .sort((a, b) => a.timestamp - b.timestamp);
+      }
   }
 
   async addBlock(transactions, currentPrice = 0) {
@@ -209,13 +267,30 @@ class DataChain {
     this.state = tempState;
     
     this.adjustDifficulty();
-    this.rebuildPriceHistory(); 
+    this.updateSupplyCache(newBlock);
+    this.appendPriceHistory(newBlock); 
     await this.saveChain(); 
+    this.state.saveSnapshot(this.chain.length - 1); 
+    
     return true;
   }
 
   getBalance(address, tokenSymbol = "SYR") { 
       return this.state.getBalance(address, tokenSymbol); 
+  }
+
+  recalculateDifficulty() {
+    const TARGET_TIME = 10000;
+    const ADJUSTMENT_INTERVAL = 10;
+    this.difficulty = 2;
+    for (let i = ADJUSTMENT_INTERVAL; i < this.chain.length; i += ADJUSTMENT_INTERVAL) {
+        const prev = this.chain[i - ADJUSTMENT_INTERVAL];
+        const curr = this.chain[i];
+        const timeTaken = curr.timestamp - prev.timestamp;
+        const timeExpected = TARGET_TIME * ADJUSTMENT_INTERVAL;
+        if (timeTaken < timeExpected / 2) this.difficulty++;
+        else if (timeTaken > timeExpected * 2 && this.difficulty > 1) this.difficulty--;
+    }
   }
 
   adjustDifficulty() {

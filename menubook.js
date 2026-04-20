@@ -8,7 +8,7 @@ class MenuBook {
   constructor() {
     this.books = { "SYR": { bids: [], asks: [], lastTradePrice: 0.01 } };
     this.orderCounter = 0;
-    this.activeMintLocks = new Set();
+    this.activeMintLocks = {};
     
     const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd();
     this.ordersFile = path.join(volumePath, 'orders.json');
@@ -31,12 +31,12 @@ class MenuBook {
               const data = JSON.parse(fs.readFileSync(this.ordersFile, 'utf8'));
               this.books = data.books || { "SYR": { bids: [], asks: [], lastTradePrice: 0.01 } };
               this.orderCounter = data.orderCounter || 0;
-              this.activeMintLocks = new Set(data.activeMintLocks || []);
+              this.activeMintLocks = data.activeMintLocks || {};
               console.log(chalk.green("[MENU BOOK] Orders successfully loaded from disk."));
           }
       } catch (e) {
           console.warn(chalk.yellow("[MENU BOOK] No persistent orders found, starting fresh."));
-          this.activeMintLocks = new Set();
+          this.activeMintLocks = {};
       }
   }
 
@@ -52,7 +52,7 @@ class MenuBook {
           const data = { 
               books: this.books, 
               orderCounter: this.orderCounter,
-              activeMintLocks: Array.from(this.activeMintLocks || [])
+              activeMintLocks: this.activeMintLocks
           };
           const tempFile = this.ordersFile + '.tmp';
           await fs.promises.writeFile(tempFile, JSON.stringify(data, null, 2));
@@ -65,9 +65,29 @@ class MenuBook {
       }
   }
 
-  hasMintLock(uid) { return this.activeMintLocks ? this.activeMintLocks.has(uid) : false; }
-  addMintLock(uid) { if(!this.activeMintLocks) this.activeMintLocks = new Set(); this.activeMintLocks.add(uid); this.saveOrders(); }
-  removeMintLock(uid) { if(this.activeMintLocks) { this.activeMintLocks.delete(uid); this.saveOrders(); } }
+  hasMintLock(uid) { 
+      const lockTime = this.activeMintLocks ? this.activeMintLocks[uid] : null;
+      if (!lockTime) return false;
+      if (Date.now() - lockTime > 15 * 60 * 1000) { 
+          delete this.activeMintLocks[uid];
+          this.saveOrders();
+          return false;
+      }
+      return true;
+  }
+  
+  addMintLock(uid) { 
+      if(!this.activeMintLocks) this.activeMintLocks = {}; 
+      this.activeMintLocks[uid] = Date.now(); 
+      this.saveOrders(); 
+  }
+  
+  removeMintLock(uid) { 
+      if(this.activeMintLocks && this.activeMintLocks[uid]) { 
+          delete this.activeMintLocks[uid]; 
+          this.saveOrders(); 
+      } 
+  }
 
   async setInitialPrice(price, token = "SYR") {
       this._initTokenBook(token);

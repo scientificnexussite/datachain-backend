@@ -36,78 +36,61 @@ class State {
     const { from, to, amount, type } = tx;
     const tokenSymbol = tx.tokenSymbol || "SYR"; 
     
-    if (!this.balances[tokenSymbol]) {
-        this.balances[tokenSymbol] = {};
+    if (!this.balances[tokenSymbol]) this.balances[tokenSymbol] = {};
+
+    if (type === 'MINT') {
+      this.balances[tokenSymbol][to] = fixDust((this.balances[tokenSymbol][to] || 0) + amount);
+      if (!isReplay && this.chain) {
+          this.saveSnapshot(this.chain.length - 1);
+      }
+      return true;
     }
 
-    if (type === "MINT" && from === "system") {
+    if (type === 'USD_DEPOSIT') {
+      this.addUsd(to, amount);
+      return true;
+    }
+
+    if (type === 'USD_WITHDRAWAL') {
+      return this.deductUsd(from, amount);
+    }
+
+    const fromBalance = this.balances[tokenSymbol][from] || 0;
+
+    if (type === 'TRANSFER') {
+      if (fromBalance < amount && from !== 'system') return false;
+      if (from !== 'system') this.balances[tokenSymbol][from] = fixDust(fromBalance - amount);
       this.balances[tokenSymbol][to] = fixDust((this.balances[tokenSymbol][to] || 0) + amount);
       return true;
     }
 
-    if (type === "USD_DEPOSIT") {
-        this.addUsd(to, amount);
-        return true;
+    if (type === 'MARKET_TRADE') {
+      if (fromBalance < amount && from !== 'system') return false;
+      const tradeUsdValue = tx.amountUsd; 
+
+      if (to !== 'system') {
+          if (!this.deductUsd(to, tradeUsdValue)) return false; 
+      }
+
+      if (from !== 'system') {
+          this.balances[tokenSymbol][from] = fixDust(fromBalance - amount);
+          this.addUsd(from, tradeUsdValue);
+      }
+
+      this.balances[tokenSymbol][to] = fixDust((this.balances[tokenSymbol][to] || 0) + amount);
+      return true;
     }
 
-    if (type === "USD_WITHDRAWAL") {
-        if (!isReplay && !this.deductUsd(from, amount)) return false;
-        if (isReplay) this.usd_balances[from] = fixDust((this.usd_balances[from] || 0) - amount);
-        return true;
-    }
-
-    if (type === "MARKET_TRADE") {
-        const { amountUsd } = tx;
-        if (!isReplay && !this.deductUsd(to, amountUsd)) return false; 
-        
-        const sellerBalance = this.balances[tokenSymbol][from] || 0;
-        if (!isReplay && sellerBalance < amount) return false; 
-        
-        if (isReplay) this.usd_balances[to] = fixDust((this.usd_balances[to] || 0) - amountUsd);
-        this.balances[tokenSymbol][from] = fixDust((this.balances[tokenSymbol][from] || 0) - amount);
-        this.balances[tokenSymbol][to] = fixDust((this.balances[tokenSymbol][to] || 0) + amount);
-        this.addUsd(from, amountUsd);
-        return true;
-    }
-
-    if (type === "BUY") {
-        const cost = tx.amountUsd !== undefined ? tx.amountUsd : (amount * currentPrice);
-        if (!isReplay && !this.deductUsd(to, cost)) return false; 
-        
-        const sysBalance = this.balances[tokenSymbol][from] || 0;
-        if (!isReplay && sysBalance < amount) return false;
-        
-        if (isReplay) this.usd_balances[to] = fixDust((this.usd_balances[to] || 0) - cost);
-        this.balances[tokenSymbol][from] = fixDust((this.balances[tokenSymbol][from] || 0) - amount);
-        this.balances[tokenSymbol][to] = fixDust((this.balances[tokenSymbol][to] || 0) + amount);
-        return true;
-    }
-
-    if (type === "SELL") {
-        const senderBalance = this.balances[tokenSymbol][from] || 0;
-        if (!isReplay && senderBalance < amount) return false;
-        
-        const revenue = tx.amountUsd !== undefined ? tx.amountUsd : (amount * currentPrice);
-        this.addUsd(from, revenue); 
-        
-        this.balances[tokenSymbol][from] = fixDust((this.balances[tokenSymbol][from] || 0) - amount);
-        this.balances[tokenSymbol][to] = fixDust((this.balances[tokenSymbol][to] || 0) + amount);
-        return true;
-    }
-
-    const senderBalance = this.balances[tokenSymbol][from] || 0;
-    if (!isReplay && senderBalance < amount) return false;
-    
-    this.balances[tokenSymbol][from] = fixDust((this.balances[tokenSymbol][from] || 0) - amount);
-    this.balances[tokenSymbol][to] = fixDust((this.balances[tokenSymbol][to] || 0) + amount);
-    return true;
+    return false; 
   }
 
-  rebuild(chain) {
-    this.balances = { "SYR": {} };
-    this.usd_balances = {};
-    let startIndex = 0;
+  getBalance(address, tokenSymbol = "SYR") {
+    if (!this.balances[tokenSymbol]) return 0;
+    return this.balances[tokenSymbol][address] || 0;
+  }
 
+  loadSnapshot(chain) {
+    let startIndex = 0;
     try {
         if (fs.existsSync(this.snapshotFile)) {
             const snapshot = JSON.parse(fs.readFileSync(this.snapshotFile, 'utf8'));
@@ -147,11 +130,6 @@ class State {
           this.isSaving = false;
           if (this.saveQueue) this.saveSnapshot(lastIndex);
       }
-  }
-
-  getBalance(address, tokenSymbol = "SYR") { 
-    if (!this.balances[tokenSymbol]) return 0;
-    return this.balances[tokenSymbol][address] || 0; 
   }
 }
 

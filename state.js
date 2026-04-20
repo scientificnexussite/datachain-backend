@@ -33,8 +33,17 @@ class State {
     this.usd_balances = {}; 
     
     // Strict /app/data implementation for Railway double-backup integrity
-    const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
-    this.snapshotFile = path.join(volumePath, 'state_snapshot.json');
+    const volumeDir = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
+    this.snapshotFile = path.join(volumeDir, 'state_snapshot.json');
+
+    // PATH LOCATOR: Finds legacy snapshot from before the volume was mounted
+    const legacySnapshot = path.join(process.cwd(), 'state_snapshot.json');
+    if (!fs.existsSync(this.snapshotFile) && fs.existsSync(legacySnapshot)) {
+        try {
+            if (!fs.existsSync(volumeDir)) fs.mkdirSync(volumeDir, { recursive: true });
+            fs.copyFileSync(legacySnapshot, this.snapshotFile);
+        } catch(e) {}
+    }
     
     this.isSaving = false;
     this.saveQueue = false;
@@ -93,9 +102,12 @@ class State {
       return true;
     }
 
-    if (type === 'MARKET_TRADE') {
+    // FIX: Map legacy 'BUY' and 'SELL' transactions to modern MARKET_TRADE ledger logic
+    if (type === 'MARKET_TRADE' || type === 'BUY' || type === 'SELL') {
       if (from !== 'system' && fromBalance < amount) return false; 
-      const tradeUsdValue = tx.amountUsd; 
+      
+      let tradeUsdValue = tx.amountUsd || 0;
+      if (!tradeUsdValue && tx.priceUsd) tradeUsdValue = amount * tx.priceUsd;
 
       if (to !== 'system') {
           if (!isReplay) {
@@ -121,36 +133,22 @@ class State {
   }
 
   async loadSnapshot(chain) {
-    let startIndex = 0;
-    try {
-        const metaRes = await pool.query('SELECT last_index FROM state_meta WHERE id = 1');
-        if (metaRes.rows.length) {
-            startIndex = metaRes.rows[0].last_index + 1;
-        }
+    // FORCED REPLAY INJECTION: We bypass the saved state shortcut and rebuild mathematically from Block 0.
+    // This guarantees that the newly mapped legacy BUY/SELL transactions are properly credited to user wallets.
+    console.log(chalk.yellow("[STATE] Rebuilding ledger state mathematically from Genesis Block..."));
 
-        const usdRes = await pool.query('SELECT address, balance FROM state_usd_balances');
-        for (const row of usdRes.rows) {
-            this.usd_balances[row.address] = parseFloat(row.balance);
-        }
+    this.balances = { "SYR": {} };
+    this.usd_balances = {};
 
-        const balRes = await pool.query('SELECT address, token_symbol, balance FROM state_balances');
-        for (const row of balRes.rows) {
-            if (!this.balances[row.token_symbol]) this.balances[row.token_symbol] = {};
-            this.balances[row.token_symbol][row.address] = parseFloat(row.balance);
-        }
-        console.log(chalk.green(`[STATE] PostgreSQL Snapshot loaded successfully. Replaying from Block ${startIndex}...`));
-    } catch (e) {
-        console.warn(chalk.yellow("[STATE] No valid PostgreSQL snapshot found or DB unavailable. Running full chain replay."));
-        startIndex = 0;
-    }
-
-    for (let i = startIndex; i < chain.length; i++) {
+    for (let i = 0; i < chain.length; i++) {
       const block = chain[i];
       if (typeof block.data === 'string') continue;
       for (const tx of block.data) {
         this.applyTransaction(tx, 0, true); 
       }
     }
+    
+    console.log(chalk.green(`[STATE] Full mathematical replay complete. Ledger state fully restored.`));
   }
 
   async saveSnapshot(lastIndex) {
@@ -177,16 +175,14 @@ class State {
           
           for (const address in this.usd_balances) {
               await client.query(
-                  'INSERT INTO state_usd_balances (address, balance) VALUES ($1, $2) ON CONFLICT (address) DO UPDATE SET balance = $2',
-                  [address, this.usd_balances[address]]
+                  'INSERT INTO state_usd_balances (address, balance) VALUES ($1, $2) ON CONFLICT (address) DO UPDATE SET balance = $2',\n                  [address, this.usd_balances[address]]
               );
           }
 
           for (const tokenSymbol in this.balances) {
               for (const address in this.balances[tokenSymbol]) {
                   await client.query(
-                      'INSERT INTO state_balances (address, token_symbol, balance) VALUES ($1, $2, $3) ON CONFLICT (address, token_symbol) DO UPDATE SET balance = $3',
-                      [address, tokenSymbol, this.balances[tokenSymbol][address]]
+                      'INSERT INTO state_balances (address, token_symbol, balance) VALUES ($1, $2, $3) ON CONFLICT (address, token_symbol) DO UPDATE SET balance = $3',\n                      [address, tokenSymbol, this.balances[tokenSymbol][address]]
                   );
               }
           }

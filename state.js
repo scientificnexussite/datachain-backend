@@ -32,11 +32,9 @@ class State {
     this.balances = { "SYR": {} };     
     this.usd_balances = {}; 
     
-    // Strict /app/data implementation for Railway double-backup integrity
     const volumeDir = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
     this.snapshotFile = path.join(volumeDir, 'state_snapshot.json');
 
-    // PATH LOCATOR: Finds legacy snapshot from before the volume was mounted
     const legacySnapshot = path.join(process.cwd(), 'state_snapshot.json');
     if (!fs.existsSync(this.snapshotFile) && fs.existsSync(legacySnapshot)) {
         try {
@@ -74,12 +72,13 @@ class State {
     if (!this.balances[tokenSymbol]) this.balances[tokenSymbol] = {};
 
     if (type === 'MINT') {
-      this.balances[tokenSymbol][to] = fixDust((this.balances[tokenSymbol][to] || 0) + amount);
+      const receiver = to || from;
+      this.balances[tokenSymbol][receiver] = fixDust((this.balances[tokenSymbol][receiver] || 0) + amount);
       return true;
     }
 
     if (type === 'USD_DEPOSIT') {
-      this.addUsd(to, amount);
+      this.addUsd(to || from, amount);
       return true;
     }
 
@@ -87,41 +86,48 @@ class State {
       return this.deductUsd(from, amount);
     }
 
-    let fromBalance = this.balances[tokenSymbol][from] || 0;
+    // --- LEGACY TRANSLATION PROTOCOL ---
+    let sender = from;
+    let receiver = to;
 
-    // LEGACY REPLAY PROTECTION: Infinitely fund the system wallet so old history doesn't fail math validations
-    if (from === 'system' && fromBalance < amount) {
-        this.balances[tokenSymbol][from] = fixDust(fromBalance + amount);
-        fromBalance = this.balances[tokenSymbol][from];
+    // FIX: Legacy systems recorded the buyer as 'from'. We must route the tokens TO them.
+    if (type === 'BUY') {
+        receiver = (to && to !== 'system') ? to : from; 
+        sender = 'system';
+    }
+    else if (type === 'SELL') {
+        sender = (from && from !== 'system') ? from : to;
+        receiver = 'system';
     }
 
-    if (type === 'TRANSFER') {
-      if (from !== 'system' && fromBalance < amount) return false; 
-      this.balances[tokenSymbol][from] = fixDust(fromBalance - amount);
-      this.balances[tokenSymbol][to] = fixDust((this.balances[tokenSymbol][to] || 0) + amount);
-      return true;
+    let senderBalance = this.balances[tokenSymbol][sender] || 0;
+
+    // Infinitely fund the system wallet during replay so your legacy buys process successfully
+    if (sender === 'system' && senderBalance < amount) {
+        this.balances[tokenSymbol][sender] = fixDust(senderBalance + amount);
+        senderBalance = this.balances[tokenSymbol][sender];
     }
 
-    // FIX: Map legacy 'BUY' and 'SELL' transactions to modern MARKET_TRADE ledger logic
-    if (type === 'MARKET_TRADE' || type === 'BUY' || type === 'SELL') {
-      if (from !== 'system' && fromBalance < amount) return false; 
-      
-      let tradeUsdValue = tx.amountUsd || 0;
-      if (!tradeUsdValue && tx.priceUsd) tradeUsdValue = amount * tx.priceUsd;
+    if (type === 'TRANSFER' || type === 'MARKET_TRADE' || type === 'BUY' || type === 'SELL') {
+        // Reject invalid transfers unless it's a forced historical replay
+        if (!isReplay && sender !== 'system' && senderBalance < amount) return false; 
+        
+        let tradeUsdValue = tx.amountUsd || 0;
+        if (!tradeUsdValue && tx.priceUsd) tradeUsdValue = amount * tx.priceUsd;
 
-      if (to !== 'system') {
-          if (!isReplay) {
-              if (!this.deductUsd(to, tradeUsdValue)) return false; 
-          }
-      }
+        if (type === 'MARKET_TRADE' || type === 'BUY' || type === 'SELL') {
+            if (receiver !== 'system' && !isReplay) {
+                if (!this.deductUsd(receiver, tradeUsdValue)) return false; 
+            }
+            if (sender !== 'system') {
+                this.addUsd(sender, tradeUsdValue);
+            }
+        }
 
-      if (from !== 'system') {
-          this.addUsd(from, tradeUsdValue);
-      }
-
-      this.balances[tokenSymbol][from] = fixDust(fromBalance - amount);
-      this.balances[tokenSymbol][to] = fixDust((this.balances[tokenSymbol][to] || 0) + amount);
-      return true;
+        // Execute the mathematical transfer
+        this.balances[tokenSymbol][sender] = fixDust(senderBalance - amount);
+        this.balances[tokenSymbol][receiver] = fixDust((this.balances[tokenSymbol][receiver] || 0) + amount);
+        return true;
     }
 
     return false; 
@@ -133,8 +139,8 @@ class State {
   }
 
   async loadSnapshot(chain) {
-    // FORCED REPLAY INJECTION: We bypass the saved state shortcut and rebuild mathematically from Block 0.
-    // This guarantees that the newly mapped legacy BUY/SELL transactions are properly credited to user wallets.
+    // MATHEMATICAL OVERRIDE: We ignore the database state and force calculate every transaction from Block 0.
+    // This forces the system to recognize your 5.98 Billion buys and credit your wallets.
     console.log(chalk.yellow("[STATE] Rebuilding ledger state mathematically from Genesis Block..."));
 
     this.balances = { "SYR": {} };
@@ -159,7 +165,6 @@ class State {
       this.isSaving = true;
       this.saveQueue = false;
 
-      // Keep the local JSON snapshot as a secondary backup
       try {
           const snapshot = { balances: this.balances, usd_balances: this.usd_balances, lastIndex };
           const tempFile = this.snapshotFile + '.tmp';

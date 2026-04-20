@@ -94,7 +94,6 @@ class DataChain {
     const legacyChain = path.join(process.cwd(), 'chain.json');
     const legacyBackup = path.join(process.cwd(), 'chain_backup.json');
 
-    // 1. ULTIMATE AUTO-HEAL: Scan every possible location and find the longest chain
     let bestChainData = null;
     let bestLen = 0;
     
@@ -111,7 +110,6 @@ class DataChain {
         }
     }
 
-    // 2. Force the absolute best chain found into the secure volume
     if (bestChainData && bestLen > 0) {
         try {
             if (!fs.existsSync(this.volumeDir)) fs.mkdirSync(this.volumeDir, { recursive: true });
@@ -125,7 +123,6 @@ class DataChain {
         dbBlockCount = parseInt(countRes.rows[0].count);
     } catch(e) {}
 
-    // 3. GENESIS MISMATCH PROTOCOL: Drop the database if it's a fake blank slate
     if (dbBlockCount > 0 && bestLen > 0) {
         try {
             const dbGen = await pool.query('SELECT hash FROM blocks WHERE index = 0');
@@ -141,7 +138,6 @@ class DataChain {
         } catch(e) {}
     }
 
-    // 4. DB Load (If DB survived the validation above)
     if (dbBlockCount > 0) {
         try {
             const blockRes = await pool.query('SELECT * FROM blocks ORDER BY index ASC');
@@ -179,7 +175,6 @@ class DataChain {
         }
     }
 
-    // 5. JSON Load (Executes if DB was empty or just wiped)
     if (bestChainData && bestLen > 0) {
         this.chain = bestChainData.map(b => {
             const block = new Block(b.index, b.timestamp, b.data, b.previousHash);

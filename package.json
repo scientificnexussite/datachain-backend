@@ -4,6 +4,9 @@
   "description": "Scientific Nexus DataChain P2P Node",
   "main": "api.js",
   "type": "module",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "scripts": {
     "start": "node api.js",
     "p2p": "node p2p.js"

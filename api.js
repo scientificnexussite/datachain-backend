@@ -120,7 +120,6 @@ async function updateMarketEconomics() {
         await menuBook.setInitialPrice(currentPrice, "SYR");
 
         const remaining = nexusChain.getRemainingSupply("SYR");
-        const circulating = MAX_SUPPLY - remaining;
 
         menuBook.books["SYR"].asks = menuBook.books["SYR"].asks.filter(a => a.uid !== "system");
         menuBook.books["SYR"].bids = menuBook.books["SYR"].bids.filter(a => a.uid !== "system");
@@ -143,12 +142,6 @@ async function updateMarketEconomics() {
             menuBook.books["SYR"].asks.sort((a, b) => a.priceUsd - b.priceUsd || a.timestamp - b.timestamp);
         }
 
-        const hasUserBids = menuBook.books["SYR"].bids.some(b => b.uid !== "system");
-        if (circulating > 0 && !hasUserBids) {
-            const floorPrice = currentPrice > 0 ? currentPrice * 0.90 : config.blockchain.starting_price * 0.9;
-            menuBook.books["SYR"].bids.push({ id: 'sys-liquidity-bid', uid: 'system', amountSyr: Math.min(circulating, 5000), priceUsd: floorPrice, timestamp: Date.now() });
-            menuBook.books["SYR"].bids.sort((a, b) => b.priceUsd - a.priceUsd || a.timestamp - b.timestamp);
-        }
         await menuBook.saveOrders();
 
         apiCache.stats.time = 0;
@@ -261,16 +254,18 @@ app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
         const parsedPrice = parseFloat(priceUsd);
 
         if (side === 'BUY') {
-            const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, tokenSymbol);
+            const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, tokenSymbol) - mempool.getPendingUsdSpend(uid);
             if (availableUsd < parsedAmount * parsedPrice) return res.status(400).json({ error: "Insufficient available USD." });
         } else {
-            const availableToken = nexusChain.getBalance(uid, tokenSymbol) - menuBook.getLockedToken(uid, tokenSymbol);
+            const availableToken = nexusChain.getBalance(uid, tokenSymbol) - menuBook.getLockedToken(uid, tokenSymbol) - mempool.getPendingTokenSpend(uid, tokenSymbol);
             if (availableToken < parsedAmount) return res.status(400).json({ error: `Insufficient available ${tokenSymbol}.` });
         }
 
         let remainingAmount = parsedAmount;
         let executedTrades = [];
-        const fundsToCheck = side === 'BUY' ? (nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, tokenSymbol)) : (nexusChain.getBalance(uid, tokenSymbol) - menuBook.getLockedToken(uid, tokenSymbol));
+        const fundsToCheck = side === 'BUY' 
+            ? (nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, tokenSymbol) - mempool.getPendingUsdSpend(uid)) 
+            : (nexusChain.getBalance(uid, tokenSymbol) - menuBook.getLockedToken(uid, tokenSymbol) - mempool.getPendingTokenSpend(uid, tokenSymbol));
         
         const matchResult = await menuBook.matchMarketOrder(uid, side, remainingAmount, fundsToCheck, parsedPrice, tokenSymbol);
         executedTrades = matchResult.trades;
@@ -295,7 +290,10 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
 
         if (!['BUY', 'SELL'].includes(side) || amountSyr <= 0) return res.status(400).json({ error: "Invalid market order parameters." });
 
-        const fundsToCheck = side === 'BUY' ? (nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, tokenSymbol)) : (nexusChain.getBalance(uid, tokenSymbol) - menuBook.getLockedToken(uid, tokenSymbol));
+        const fundsToCheck = side === 'BUY' 
+            ? (nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, tokenSymbol) - mempool.getPendingUsdSpend(uid)) 
+            : (nexusChain.getBalance(uid, tokenSymbol) - menuBook.getLockedToken(uid, tokenSymbol) - mempool.getPendingTokenSpend(uid, tokenSymbol));
+            
         const matchResult = await menuBook.matchMarketOrder(uid, side, parseFloat(amountSyr), fundsToCheck, null, tokenSymbol);
 
         if (matchResult.trades.length === 0) return res.status(400).json({ error: "No liquidity available in Menu Book to match order." });
@@ -378,10 +376,10 @@ app.post('/tx/new', txLimiter, requireWeb3Auth, (req, res) => {
       
       if (type === 'TRANSFER') {
           if (from !== req.user.uid) return res.status(403).json({ error: "Forbidden: Originating address mismatch." });
-          if ((nexusChain.getBalance(from, tokenSymbol) - menuBook.getLockedToken(from, tokenSymbol)) < tx.amount) return res.status(400).json({ error: `Insufficient ${tokenSymbol} balance.` });
+          if ((nexusChain.getBalance(from, tokenSymbol) - menuBook.getLockedToken(from, tokenSymbol) - mempool.getPendingTokenSpend(from, tokenSymbol)) < tx.amount) return res.status(400).json({ error: `Insufficient ${tokenSymbol} balance.` });
       } else if (type === 'USD_WITHDRAWAL') {
           if (from !== req.user.uid) return res.status(403).json({ error: "Forbidden: Originating address mismatch." });
-          if ((nexusChain.state.getUsd(from) - menuBook.getLockedUsd(from, tokenSymbol)) < tx.amount) return res.status(400).json({ error: `Insufficient USD balance.` });
+          if ((nexusChain.state.getUsd(from) - menuBook.getLockedUsd(from, tokenSymbol) - mempool.getPendingUsdSpend(from)) < tx.amount) return res.status(400).json({ error: `Insufficient USD balance.` });
       } else if (type === 'MINT' && from !== 'system') {
           return res.status(403).json({ error: "Forbidden: Only system can mint assets." });
       } else if (type === 'USD_DEPOSIT' && from !== 'paypal-gateway') {
@@ -468,7 +466,7 @@ app.post('/mint-new-cash', txLimiter, requireWeb3Auth, (req, res) => {
         if (menuBook.hasMintLock(uid)) return res.status(400).json({ error: "You already have a minting transaction pending." });
 
         const deployFee = 100;
-        if ((nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, "SYR")) < deployFee) return res.status(400).json({ error: `Deploying costs $${deployFee} USD. Insufficient funds.` });
+        if ((nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, "SYR") - mempool.getPendingUsdSpend(uid)) < deployFee) return res.status(400).json({ error: `Deploying costs $${deployFee} USD. Insufficient funds.` });
 
         mempool.addTransaction({ from: uid, to: "system", amount: deployFee, type: 'USD_WITHDRAWAL', timestamp: Date.now(), isSystemGenerated: true });
         
@@ -576,7 +574,7 @@ app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
         
         if (!paypalEmail || !paypalEmail.includes('@')) return res.status(400).json({ error: "Valid PayPal email is required to process withdrawals." });
         
-        if ((nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, "SYR")) < amount) return res.status(400).json({ error: "Insufficient available USD." });
+        if ((nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, "SYR") - mempool.getPendingUsdSpend(uid)) < amount) return res.status(400).json({ error: "Insufficient available USD." });
 
         try {
             const accessToken = await getPayPalAccessToken();
@@ -607,7 +605,7 @@ app.use((req, res) => { res.status(404).json({ error: "API Node Endpoint Not Fou
     await menuBook.setInitialPrice(currentPrice, "SYR");
     
     if (nexusChain.getBalance("system", "SYR") === 0 && nexusChain.chain.length <= 1) {
-        const initTx = { from: "system", to: "system", amount: MAX_SUPPLY, type: "MINT", tokenSymbol: "SYR", timestamp: Date.now() };
+        const initTx = { from: "system", to: "system", amount: MAX_SUPPLY, type: "MINT", tokenSymbol: "SYR", timestamp: Date.now(), isSystemGenerated: true };
         await nexusChain.addBlock([initTx]);
     }
     

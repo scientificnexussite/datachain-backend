@@ -47,7 +47,6 @@ class DataChain {
     this.difficulty = 2;
     this.state = new State();
     this.priceHistoryCache = [];
-    this.mintedSupply = {};
     
     const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || process.cwd();
     this.chainFile = path.join(volumePath, 'chain.json');
@@ -86,7 +85,6 @@ class DataChain {
             });
             
             this.state.loadSnapshot(this.chain);
-            this.rebuildSupplyCache();
             this.rebuildPriceHistory();
             this.recalculateDifficulty();
             
@@ -99,7 +97,6 @@ class DataChain {
 
     console.warn(chalk.yellow("[DATACHAIN] Starting fresh chain from genesis."));
     this.chain = [this.createGenesisBlock()];
-    this.rebuildSupplyCache();
     this.rebuildPriceHistory();
     this.difficulty = 2;
   }
@@ -134,33 +131,20 @@ class DataChain {
     return this.chain[this.chain.length - 1];
   }
 
-  rebuildSupplyCache() {
-    this.mintedSupply = {};
-    for (const block of this.chain) {
-      if (typeof block.data === 'string') continue;
-      for (const tx of block.data) {
-        if (tx.type === 'MINT') {
-          const sym = tx.tokenSymbol || "SYR";
-          this.mintedSupply[sym] = (this.mintedSupply[sym] || 0) + tx.amount;
-        }
-      }
-    }
-  }
-
-  updateSupplyCache(block) {
-    if (typeof block.data === 'string') return;
-    for (const tx of block.data) {
-      if (tx.type === 'MINT') {
-        const sym = tx.tokenSymbol || "SYR";
-        this.mintedSupply[sym] = (this.mintedSupply[sym] || 0) + tx.amount;
-      }
-    }
-  }
-
   getRemainingSupply(tokenSymbol = "SYR") {
-    if (tokenSymbol !== "SYR") return 0; 
-    const minted = this.mintedSupply[tokenSymbol] || 0;
-    return Math.max(0, 6000000000 - minted);
+    if (tokenSymbol !== "SYR") return 0;
+    
+    // Dynamically calculate circulating supply to account for legacy MINT blocks
+    let totalCirculating = 0;
+    const syrBalances = this.state.balances["SYR"] || {};
+    
+    for (const address in syrBalances) {
+        if (address !== "system") {
+            totalCirculating += syrBalances[address];
+        }
+    }
+    
+    return Math.max(0, 6000000000 - totalCirculating);
   }
 
   getLastMarketPrice(defaultPrice) {
@@ -237,9 +221,10 @@ class DataChain {
         from: "system",
         to: config.blockchain.miner_address,
         amount: rewardAmount,
-        type: "MINT",
+        type: "TRANSFER",
         tokenSymbol: "SYR", 
-        timestamp: Date.now()
+        timestamp: Date.now(),
+        isSystemGenerated: true
     };
 
     const tempState = new State();
@@ -267,7 +252,6 @@ class DataChain {
     this.state = tempState;
     
     this.adjustDifficulty();
-    this.updateSupplyCache(newBlock);
     this.appendPriceHistory(newBlock); 
     await this.saveChain(); 
     this.state.saveSnapshot(this.chain.length - 1); 

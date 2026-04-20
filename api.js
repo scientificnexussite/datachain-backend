@@ -119,29 +119,29 @@ async function updateMarketEconomics() {
         currentPrice = menuBook.books["SYR"].lastTradePrice > 0 ? menuBook.books["SYR"].lastTradePrice : chainPrice;
         await menuBook.setInitialPrice(currentPrice, "SYR");
 
-        const remaining = nexusChain.getRemainingSupply("SYR");
-
         menuBook.books["SYR"].asks = menuBook.books["SYR"].asks.filter(a => a.uid !== "system");
         menuBook.books["SYR"].bids = menuBook.books["SYR"].bids.filter(a => a.uid !== "system");
 
         const hasUserAsks = menuBook.books["SYR"].asks.some(a => a.uid !== "system");
-        if (remaining > 0 && !hasUserAsks) {
+        if (!hasUserAsks) {
             const tiers = [
-                { multiplier: 1.02, amount: Math.min(remaining, 10000) },
-                { multiplier: 1.05, amount: Math.min(remaining, 25000) },
-                { multiplier: 1.10, amount: Math.min(remaining, 50000) },
+                { multiplier: 1.02, amount: 50000 },
+                { multiplier: 1.05, amount: 100000 },
+                { multiplier: 1.10, amount: 250000 }
             ];
-            let tierRemaining = remaining;
             for (const tier of tiers) {
-                if (tierRemaining <= 0) break;
-                const tierAmount = Math.min(tier.amount, tierRemaining);
                 const tierPrice = currentPrice > 0 ? currentPrice * tier.multiplier : config.blockchain.starting_price * tier.multiplier;
-                menuBook.books["SYR"].asks.push({ id: `sys-liquidity-ask-${tier.multiplier}`, uid: 'system', amountSyr: tierAmount, priceUsd: tierPrice, timestamp: Date.now() });
-                tierRemaining -= tierAmount;
+                menuBook.books["SYR"].asks.push({ id: `sys-liquidity-ask-${tier.multiplier}`, uid: 'system', amountSyr: tier.amount, priceUsd: tierPrice, timestamp: Date.now() });
             }
             menuBook.books["SYR"].asks.sort((a, b) => a.priceUsd - b.priceUsd || a.timestamp - b.timestamp);
         }
 
+        const hasUserBids = menuBook.books["SYR"].bids.some(b => b.uid !== "system");
+        if (!hasUserBids) {
+            const floorPrice = currentPrice > 0 ? currentPrice * 0.90 : config.blockchain.starting_price * 0.9;
+            menuBook.books["SYR"].bids.push({ id: 'sys-liquidity-bid', uid: 'system', amountSyr: 100000, priceUsd: floorPrice, timestamp: Date.now() });
+            menuBook.books["SYR"].bids.sort((a, b) => b.priceUsd - a.priceUsd || a.timestamp - b.timestamp);
+        }
         await menuBook.saveOrders();
 
         apiCache.stats.time = 0;
@@ -287,16 +287,30 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const { side, amountSyr, tokenSymbol = "SYR" } = req.body;
         const uid = req.user.uid;
+        const parsedAmount = parseFloat(amountSyr);
 
-        if (!['BUY', 'SELL'].includes(side) || amountSyr <= 0) return res.status(400).json({ error: "Invalid market order parameters." });
+        if (!['BUY', 'SELL'].includes(side) || isNaN(parsedAmount) || parsedAmount <= 0) return res.status(400).json({ error: "Invalid market order parameters." });
 
-        const fundsToCheck = side === 'BUY' 
-            ? (nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, tokenSymbol) - mempool.getPendingUsdSpend(uid)) 
-            : (nexusChain.getBalance(uid, tokenSymbol) - menuBook.getLockedToken(uid, tokenSymbol) - mempool.getPendingTokenSpend(uid, tokenSymbol));
-            
-        const matchResult = await menuBook.matchMarketOrder(uid, side, parseFloat(amountSyr), fundsToCheck, null, tokenSymbol);
+        const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, tokenSymbol) - mempool.getPendingUsdSpend(uid);
+        const availableToken = nexusChain.getBalance(uid, tokenSymbol) - menuBook.getLockedToken(uid, tokenSymbol) - mempool.getPendingTokenSpend(uid, tokenSymbol);
 
-        if (matchResult.trades.length === 0) return res.status(400).json({ error: "No liquidity available in Menu Book to match order." });
+        if (side === 'SELL' && parsedAmount > availableToken) {
+            return res.status(400).json({ error: `Insufficient ${tokenSymbol} balance to execute trade.` });
+        }
+        
+        if (side === 'BUY' && availableUsd <= 0) {
+            return res.status(400).json({ error: `Insufficient USD balance. Deposit funds to execute trade.` });
+        }
+
+        const fundsToCheck = side === 'BUY' ? availableUsd : availableToken;
+        const matchResult = await menuBook.matchMarketOrder(uid, side, parsedAmount, fundsToCheck, null, tokenSymbol);
+
+        if (matchResult.trades.length === 0) {
+            if (fundsToCheck <= 1e-8) {
+                return res.status(400).json({ error: side === 'BUY' ? "Insufficient USD balance." : `Insufficient ${tokenSymbol} balance.` });
+            }
+            return res.status(400).json({ error: "No liquidity available in Menu Book to match order." });
+        }
 
         for (const trade of matchResult.trades) {
             mempool.addTransaction({ from: trade.seller, to: trade.buyer, amount: trade.amountSyr, amountUsd: trade.amountUsd, type: 'MARKET_TRADE', tokenSymbol: tokenSymbol, timestamp: Date.now() });

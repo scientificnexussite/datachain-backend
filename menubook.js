@@ -131,7 +131,16 @@ class MenuBook {
 
   async matchMarketOrder(uid, side, amountSyr, availableFunds, limitPrice = null, token = "SYR") {
     this._initTokenBook(token);
+    
+    if (availableFunds <= 1e-8) {
+        return { trades: [], remaining: fixDust(amountSyr), totalUsdCost: 0, slippage: 0, executedSyr: 0 };
+    }
+
     let remaining = fixDust(amountSyr);
+    if (side === 'SELL' && remaining > availableFunds) {
+        remaining = fixDust(availableFunds); 
+    }
+
     let totalUsdCost = 0;
     let trades = [];
     

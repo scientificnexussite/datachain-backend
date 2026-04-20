@@ -146,8 +146,9 @@ class State {
   }
 
   async loadSnapshot(chain) {
-    // MATHEMATICAL OVERRIDE: We ignore the database state and force calculate every transaction from Block 0.
-    console.log(chalk.yellow("[STATE] Rebuilding ledger state mathematically from Genesis Block..."));
+    // ULTIMATE OVERRIDE: We completely ignore corrupted saved balances from the database.
+    // We forcibly run the math on every single historical block to guarantee the 5.98B is restored.
+    console.log(chalk.magenta.bold("[STATE OVERRIDE] Bypassing corrupted DB balances. Forcing complete mathematical ledger recalculation..."));
 
     this.balances = { "SYR": {} };
     this.usd_balances = {};
@@ -160,7 +161,10 @@ class State {
       }
     }
     
-    console.log(chalk.green(`[STATE] Full mathematical replay complete. Ledger state fully restored.`));
+    console.log(chalk.green.bold(`[STATE OVERRIDE] Mathematical replay complete. True balances restored.`));
+    
+    // Save the correct numbers back into the database
+    await this.saveSnapshot(chain.length - 1);
   }
 
   async saveSnapshot(lastIndex) {

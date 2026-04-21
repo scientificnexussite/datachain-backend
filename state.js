@@ -7,7 +7,7 @@ const { Pool } = pkg;
 const fixDust = (num) => Number(Number(num).toFixed(8));
 
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL || "postgresql://postgres:MuTxOCYQHBfxbSgexbWOdGdbkgjBCsIv@postgres.railway.internal:5432/railway",
+    connectionString: process.env.DATABASE_URL
 });
 
 pool.query(`

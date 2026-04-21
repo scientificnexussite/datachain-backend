@@ -21,8 +21,9 @@ const PAYPAL_API_BASE = "https://api-m.paypal.com";
 
 const { Pool } = pkg;
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL || "postgresql://postgres:MuTxOCYQHBfxbSgexbWOdGdbkgjBCsIv@postgres.railway.internal:5432/railway",
+    connectionString: process.env.DATABASE_URL
 });
+
 pool.query(`
     CREATE TABLE IF NOT EXISTS api_state (
         id VARCHAR(50) PRIMARY KEY,
@@ -114,7 +115,6 @@ async function getPayPalAccessToken() {
     return data.access_token;
 }
 
-// RESTORED 6 BILLION MAX SUPPLY
 const MAX_SUPPLY = 6000000000;
 let currentPrice = config.blockchain.starting_price; 
 
@@ -222,6 +222,39 @@ app.get('/pricehistory', (req, res) => {
     res.json(nexusChain.priceHistoryCache);
 });
 
+// ENTERPRISE FIX: Added OHLC Kline formatting to supply native Red/Green candles to TradingView
+app.get('/api/chart/kline', async (req, res) => {
+    try {
+        const { symbol = 'SYR' } = req.query;
+        const query = `
+            SELECT 
+                date_trunc('hour', to_timestamp(timestamp_ms / 1000)) as time,
+                (array_agg(amount_usd / amount ORDER BY timestamp_ms ASC))[1] as open,
+                MAX(amount_usd / amount) as high,
+                MIN(amount_usd / amount) as low,
+                (array_agg(amount_usd / amount ORDER BY timestamp_ms DESC))[1] as close,
+                SUM(amount) as volume
+            FROM transactions
+            WHERE token_symbol = $1 AND type = 'MARKET_TRADE' AND amount > 0 AND amount_usd > 0
+            GROUP BY time
+            ORDER BY time ASC
+            LIMIT 500;
+        `;
+        const dbRes = await pool.query(query, [symbol]);
+        const formatted = dbRes.rows.map(r => ({
+            time: new Date(r.time).getTime(),
+            open: parseFloat(r.open),
+            high: parseFloat(r.high),
+            low: parseFloat(r.low),
+            close: parseFloat(r.close),
+            volume: parseFloat(r.volume)
+        }));
+        res.json(formatted);
+    } catch(e) {
+        res.status(500).json({error: "Chart data unavailable"});
+    }
+});
+
 app.get('/tokens', (req, res) => {
     const tokens = Object.keys(nexusChain.state.balances).map(ticker => {
         let totalCirculating = 0;
@@ -236,7 +269,8 @@ app.get('/tokens', (req, res) => {
     res.json(tokens);
 });
 
-app.post('/positions/:uid', requireWeb3Auth, (req, res) => {
+// ENTERPRISE FIX: Database Query replaces the single-threaded JSON array loop bottleneck
+app.post('/positions/:uid', requireWeb3Auth, async (req, res) => {
     const uid = req.params.uid;
     if (req.user.uid !== uid) return res.status(403).json({ error: "Forbidden" });
 
@@ -248,15 +282,20 @@ app.post('/positions/:uid', requireWeb3Auth, (req, res) => {
         if (currentBal > 0) {
             let totalSpent = 0;
             let totalAcquired = 0;
-            for (const block of nexusChain.chain) {
-                if (typeof block.data === 'string') continue;
-                for (const tx of block.data) {
-                    if (tx.to === uid && tx.tokenSymbol === token && (tx.type === 'MARKET_TRADE' || tx.type === 'BUY')) {
-                        totalSpent += (tx.amountUsd || 0);
-                        totalAcquired += tx.amount;
-                    }
+            
+            try {
+                const txRes = await pool.query(
+                    "SELECT amount, amount_usd FROM transactions WHERE to_address = $1 AND token_symbol = $2 AND (type = 'MARKET_TRADE' OR type = 'BUY')", 
+                    [uid, token]
+                );
+                for (const row of txRes.rows) {
+                    totalSpent += (parseFloat(row.amount_usd) || 0);
+                    totalAcquired += parseFloat(row.amount);
                 }
+            } catch(e) {
+                console.error(chalk.red("[API] Positions DB query failed"), e);
             }
+            
             const avgPrice = totalAcquired > 0 ? (totalSpent / totalAcquired) : (token === "SYR" ? currentPrice : 0);
             positionsArr.push({ asset: token, qty: currentBal, avgPrice: avgPrice });
         }
@@ -358,8 +397,13 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                     isSystemGenerated: true
                 });
 
-                const pumpFactor = 1 + (0.001 * (tradeAmount / 10)); 
-                currentPrice = parseFloat((currentPrice * pumpFactor).toFixed(6));
+                // ENTERPRISE FIX: Automated Market Maker (AMM) Constant Product Formula x * y = k
+                const virtualSyrReserve = 1000000; 
+                const virtualUsdReserve = virtualSyrReserve * currentPrice;
+                const newSyrReserve = virtualSyrReserve - tradeAmount;
+                const newUsdReserve = (virtualSyrReserve * virtualUsdReserve) / newSyrReserve;
+                
+                currentPrice = parseFloat((newUsdReserve / newSyrReserve).toFixed(6));
                 menuBook.books[tokenSymbol].lastTradePrice = currentPrice;
                 await menuBook.saveOrders();
 
@@ -368,7 +412,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                     executedSyr: tradeAmount,
                     remainingUnfilled: parseFloat((parsedAmount - tradeAmount).toFixed(8)),
                     totalUsdCost: tradeUsd,
-                    slippagePercentage: "0.00%",
+                    slippagePercentage: "AMM Variable",
                     trades: [{ buyer: uid, seller: 'system', amountSyr: tradeAmount, amountUsd: tradeUsd, price: currentPrice, tokenSymbol }]
                 });
             }

@@ -9,7 +9,7 @@ import pkg from 'pg';
 
 const { Pool } = pkg;
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL || "postgresql://postgres:MuTxOCYQHBfxbSgexbWOdGdbkgjBCsIv@postgres.railway.internal:5432/railway",
+    connectionString: process.env.DATABASE_URL
 });
 
 pool.query(`
@@ -58,7 +58,8 @@ class Block {
     return new Promise((resolve) => {
       const target = Array(difficulty + 1).join("0");
       const mineChunk = () => {
-        for (let i = 0; i < 2000; i++) {
+        // Enterprise Fix: Reduced iterations from 2000 to 250 to heavily unblock the Event Loop
+        for (let i = 0; i < 250; i++) {
           if (this.hash.substring(0, difficulty) === target) {
             console.log(chalk.cyan(`[DATACHAIN] Block Mined: ${this.hash}`));
             return resolve(true);
@@ -270,8 +271,6 @@ class DataChain {
           }
       }
       
-      // If circulating supply is under 5.98 Billion, the legacy history was destroyed by Railway.
-      // We will explicitly recreate it right here with your precise addresses.
       if (totalCirculating < 5980000000) {
           console.log(chalk.magenta.bold("[HARD FORK] Legacy history missing. Executing 5.98 Billion Genesis Airdrop..."));
           

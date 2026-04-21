@@ -1,10 +1,34 @@
 import chalk from 'chalk';
 import crypto from 'crypto';
+import pkg from 'pg';
+
+const { Pool } = pkg;
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL
+});
+
+pool.query(`
+    CREATE TABLE IF NOT EXISTS mempool_store (
+        hash VARCHAR(64) PRIMARY KEY,
+        tx_data JSONB
+    );
+`).catch(err => console.error(chalk.red("[DB] Mempool init failed"), err));
 
 class Mempool {
   constructor() {
     this.pendingTransactions = [];
     this.MAX_MEMPOOL_SIZE = 1000; 
+    this.loadMempool();
+  }
+
+  async loadMempool() {
+      try {
+          const res = await pool.query('SELECT tx_data FROM mempool_store');
+          this.pendingTransactions = res.rows.map(row => row.tx_data);
+          if (this.pendingTransactions.length > 0) {
+              console.log(chalk.green(`[MEMPOOL] Restored ${this.pendingTransactions.length} pending transactions from Database.`));
+          }
+      } catch(e) {}
   }
 
   addTransaction(tx) {
@@ -28,6 +52,10 @@ class Mempool {
     if (isDuplicate) return false;
 
     this.pendingTransactions.push(tx);
+    
+    // Enterprise Fix: Save to Postgres to prevent RAM wipe data loss on reboot
+    pool.query('INSERT INTO mempool_store (hash, tx_data) VALUES ($1, $2) ON CONFLICT DO NOTHING', [txHash, tx]).catch(()=>{});
+
     console.log(chalk.magenta(`[MEMPOOL] Transaction Added. Total Pending: ${this.pendingTransactions.length}`));
     return true;
   }
@@ -49,15 +77,16 @@ class Mempool {
           return sum;
       }, 0);
   }
-
+  
   getPendingCount() {
-    return this.pendingTransactions.length;
+      return this.pendingTransactions.length;
   }
 
   getAndClear() {
-    const txs = [...this.pendingTransactions];
-    this.pendingTransactions = [];
-    return txs;
+      const currentTxs = [...this.pendingTransactions];
+      this.pendingTransactions = [];
+      pool.query('TRUNCATE mempool_store').catch(()=>{});
+      return currentTxs;
   }
 }
 

@@ -5,7 +5,7 @@ import pkg from 'pg';
 
 const { Pool } = pkg;
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL || "postgresql://postgres:MuTxOCYQHBfxbSgexbWOdGdbkgjBCsIv@postgres.railway.internal:5432/railway",
+    connectionString: process.env.DATABASE_URL
 });
 
 pool.query(`
@@ -23,7 +23,6 @@ class MenuBook {
     this.orderCounter = 0;
     this.activeMintLocks = {};
     
-    // Strict /app/data implementation for Railway double-backup integrity
     const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
     this.ordersFile = path.join(volumePath, 'orders.json');
     

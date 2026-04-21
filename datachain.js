@@ -9,7 +9,10 @@ import pkg from 'pg';
 
 const { Pool } = pkg;
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL
+    connectionString: process.env.DATABASE_URL,
+    max: 200,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000
 });
 
 pool.query(`
@@ -58,7 +61,7 @@ class Block {
     return new Promise((resolve) => {
       const target = Array(difficulty + 1).join("0");
       const mineChunk = () => {
-        // Enterprise Fix: Reduced iterations from 2000 to 250 to heavily unblock the Event Loop
+        // ENTERPRISE FIX: Dropped to 250 iterations to completely unblock Node.js Event Loop for API traffic
         for (let i = 0; i < 250; i++) {
           if (this.hash.substring(0, difficulty) === target) {
             console.log(chalk.cyan(`[DATACHAIN] Block Mined: ${this.hash}`));
@@ -80,6 +83,7 @@ class DataChain {
     this.difficulty = 2;
     this.state = new State();
     this.priceHistoryCache = [];
+    this.blockCount = 0;
     
     this.volumeDir = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
     this.chainFile = path.join(this.volumeDir, 'chain.json');
@@ -92,17 +96,20 @@ class DataChain {
   }
 
   async loadChain() {
-    let dbBlockCount = 0;
     try {
         const countRes = await pool.query('SELECT COUNT(*) FROM blocks');
-        dbBlockCount = parseInt(countRes.rows[0].count);
+        this.blockCount = parseInt(countRes.rows[0].count);
     } catch(e) {}
 
     // MAIN POSTGRESQL LOAD
-    if (dbBlockCount > 0) {
+    if (this.blockCount > 0) {
         try {
             const blockRes = await pool.query('SELECT * FROM blocks ORDER BY index ASC');
-            const txRes = await pool.query('SELECT * FROM transactions ORDER BY timestamp_ms ASC, id ASC');
+            
+            // ENTERPRISE FIX: OOM Timebomb 
+            // We only load transactions for the very last 10 blocks into RAM array to prevent server memory crashes
+            const recentIndexThreshold = Math.max(0, this.blockCount - 10);
+            const txRes = await pool.query('SELECT * FROM transactions WHERE block_index >= $1 ORDER BY timestamp_ms ASC, id ASC', [recentIndexThreshold]);
             
             const txsByBlock = {};
             txRes.rows.forEach(tx => {
@@ -121,15 +128,17 @@ class DataChain {
             });
 
             this.chain = blockRes.rows.map(b => {
-                const block = new Block(b.index, parseInt(b.timestamp_ms), txsByBlock[b.index] || [], b.previous_hash);
+                const isRecent = (this.blockCount - b.index) <= 10;
+                const txData = isRecent ? (txsByBlock[b.index] || []) : "Historical block data offloaded to DB";
+                const block = new Block(b.index, parseInt(b.timestamp_ms), txData, b.previous_hash);
                 block.nonce = b.nonce; block.hash = b.hash;
                 return block;
             });
             
             await this.state.loadSnapshot(this.chain);
-            this.rebuildPriceHistory();
+            await this.rebuildPriceHistory();
             this.recalculateDifficulty();
-            console.log(chalk.green(`[DATACHAIN] Successfully loaded ${this.chain.length} blocks from PostgreSQL.`));
+            console.log(chalk.green(`[DATACHAIN] Successfully loaded ${this.blockCount} blocks from PostgreSQL.`));
             
             await this.executeHardForkAmnesty();
             return;
@@ -147,11 +156,12 @@ class DataChain {
                 block.nonce = b.nonce; block.hash = b.hash;
                 return block;
             });
+            this.blockCount = this.chain.length;
             
             await this.state.loadSnapshot(this.chain);
-            this.rebuildPriceHistory();
+            await this.rebuildPriceHistory();
             this.recalculateDifficulty();
-            console.log(chalk.green(`[DATACHAIN] Successfully loaded ${this.chain.length} blocks from JSON.`));
+            console.log(chalk.green(`[DATACHAIN] Successfully loaded ${this.blockCount} blocks from JSON.`));
             
             await this.syncAllToDB(); 
             await this.executeHardForkAmnesty();
@@ -162,11 +172,30 @@ class DataChain {
     // GENESIS LOAD
     console.warn(chalk.yellow("[DATACHAIN] Starting fresh chain from genesis."));
     this.chain = [this.createGenesisBlock()];
+    this.blockCount = 1;
     await this.state.loadSnapshot(this.chain);
-    this.rebuildPriceHistory();
+    await this.rebuildPriceHistory();
     this.difficulty = 2;
     
     await this.executeHardForkAmnesty();
+  }
+
+  // ENTERPRISE FIX: Chain Reorganization / Longest Chain Rule (Decentralization)
+  async resolveConflict(newBlocks) {
+      if (newBlocks.length <= this.blockCount) {
+          console.log(chalk.yellow('[NETWORK] Received chain is not longer than current chain. Rejecting fork.'));
+          return false;
+      }
+      for(let i=1; i<newBlocks.length; i++) {
+          if(newBlocks[i].previousHash !== newBlocks[i-1].hash) return false;
+      }
+      console.log(chalk.green.bold('[NETWORK] Chain Reorganization Triggered! Adopting longest P2P chain.'));
+      this.chain = newBlocks;
+      this.blockCount = newBlocks.length;
+      await pool.query('TRUNCATE blocks, transactions CASCADE');
+      await this.syncAllToDB();
+      await this.state.loadSnapshot(this.chain);
+      return true;
   }
 
   async syncAllToDB() {
@@ -192,7 +221,7 @@ class DataChain {
           }
           await client.query('COMMIT');
           console.log(chalk.green("[DATACHAIN] Successfully migrated local JSON chain to PostgreSQL!"));
-          await this.state.saveSnapshot(this.chain.length - 1);
+          await this.state.saveSnapshot(this.blockCount - 1);
       } catch(e) {
           await client.query('ROLLBACK');
           console.error(chalk.red("[DATACHAIN] DB Migration failed"), e);
@@ -259,9 +288,6 @@ class DataChain {
     return this.chain[this.chain.length - 1];
   }
 
-  // =========================================================================
-  // HARD FORK AIRDROP PROTOCOL
-  // =========================================================================
   async executeHardForkAmnesty() {
       let totalCirculating = 0;
       const syrBalances = this.state.balances["SYR"] || {};
@@ -302,21 +328,21 @@ class DataChain {
           });
 
           if (rescueTxs.length > 0) {
-              const newBlock = new Block(this.chain.length, Date.now(), rescueTxs, this.getLatestBlock().hash);
+              const newBlock = new Block(this.blockCount, Date.now(), rescueTxs, this.getLatestBlock().hash);
               await newBlock.mineBlock(this.difficulty);
               
               for (const tx of rescueTxs) {
-                  this.state.applyTransaction(tx, this.getLastMarketPrice(0.50), false);
+                  this.state.applyTransaction(tx, await this.getLastMarketPrice(0.50), false);
               }
               
               this.chain.push(newBlock);
+              this.blockCount++;
               await this.saveChain();
-              await this.state.saveSnapshot(this.chain.length - 1);
+              await this.state.saveSnapshot(this.blockCount - 1);
               console.log(chalk.green.bold("[HARD FORK] 5.98 Billion SilverCash Successfully Injected."));
           }
       }
   }
-  // =========================================================================
 
   getRemainingSupply(tokenSymbol = "SYR") {
     if (tokenSymbol !== "SYR") return 0;
@@ -335,35 +361,40 @@ class DataChain {
     return Math.max(0, 6000000000 - totalCirculating);
   }
 
-  getLastMarketPrice(defaultPrice) {
-      for (let i = this.chain.length - 1; i >= 0; i--) {
-          const block = this.chain[i];
-          if (typeof block.data === 'string') continue;
-          for (let j = block.data.length - 1; j >= 0; j--) {
-              const tx = block.data[j];
-              if (tx.type === 'MARKET_TRADE' && tx.amountUsd && tx.amount) {
-                  return tx.amountUsd / tx.amount;
-              }
-              if ((tx.type === 'BUY' || tx.type === 'SELL') && tx.priceUsd) {
-                  return tx.priceUsd;
-              }
+  // ENTERPRISE FIX: OOM Memory Offload. Price fetching queries DB natively.
+  async getLastMarketPrice(defaultPrice) {
+      try {
+          const res = await pool.query("SELECT amount, amount_usd, price_usd, type FROM transactions WHERE token_symbol = 'SYR' AND (type = 'MARKET_TRADE' OR type = 'BUY' OR type = 'SELL') ORDER BY timestamp_ms DESC LIMIT 1");
+          if (res.rows.length > 0) {
+              const tx = res.rows[0];
+              if (tx.type === 'MARKET_TRADE' && parseFloat(tx.amount_usd) && parseFloat(tx.amount)) return parseFloat(tx.amount_usd) / parseFloat(tx.amount);
+              if (tx.price_usd) return parseFloat(tx.price_usd);
           }
-      }
+      } catch(e) {}
       return defaultPrice;
   }
 
-  rebuildPriceHistory() {
+  // ENTERPRISE FIX: OOM Memory Offload. Cache rebuild queries DB natively.
+  async rebuildPriceHistory() {
       const history = [];
       history.push({ timestamp: new Date(config.blockchain.genesis_date).getTime(), price: config.blockchain.starting_price });
-      for (const block of this.chain) {
-          if (typeof block.data === 'string') continue;
-          for (const tx of block.data) {
-              if ((tx.tokenSymbol === 'SYR' || !tx.tokenSymbol)) {
-                  if (tx.type === 'MARKET_TRADE' && tx.amountUsd && tx.amount) history.push({ timestamp: tx.timestamp, price: tx.amountUsd / tx.amount });
-                  else if ((tx.type === 'BUY' || tx.type === 'SELL') && tx.priceUsd) history.push({ timestamp: tx.timestamp, price: tx.priceUsd });
+      
+      try {
+          const res = await pool.query("SELECT timestamp_ms, amount, amount_usd, price_usd, type FROM transactions WHERE token_symbol = 'SYR' AND (type = 'MARKET_TRADE' OR type = 'BUY' OR type = 'SELL') ORDER BY timestamp_ms ASC");
+          for (const tx of res.rows) {
+              const amount = parseFloat(tx.amount);
+              const amountUsd = parseFloat(tx.amount_usd);
+              const priceUsd = parseFloat(tx.price_usd);
+              const type = tx.type;
+              
+              if (type === 'MARKET_TRADE' && amountUsd && amount) {
+                  history.push({ timestamp: parseInt(tx.timestamp_ms), price: amountUsd / amount });
+              } else if ((type === 'BUY' || type === 'SELL') && priceUsd) {
+                  history.push({ timestamp: parseInt(tx.timestamp_ms), price: priceUsd });
               }
           }
-      }
+      } catch(e) {}
+      
       const unique = new Map();
       history.forEach(d => unique.set(Math.floor(d.timestamp / 1000), d.price));
       this.priceHistoryCache = Array.from(unique.entries())
@@ -371,10 +402,10 @@ class DataChain {
           .sort((a, b) => a.timestamp - b.timestamp);
   }
 
-  appendPriceHistory(block) {
-      if (typeof block.data === 'string') return;
+  async appendPriceHistory(newBlock) {
+      if (typeof newBlock.data === 'string') return;
       let added = false;
-      for (const tx of block.data) {
+      for (const tx of newBlock.data) {
           if ((tx.tokenSymbol === 'SYR' || !tx.tokenSymbol)) {
               if (tx.type === 'MARKET_TRADE' && tx.amountUsd && tx.amount) {
                   this.priceHistoryCache.push({ timestamp: tx.timestamp, price: tx.amountUsd / tx.amount });
@@ -403,12 +434,12 @@ class DataChain {
     if (!transactions || transactions.length === 0) return false;
 
     if (transactions.length === 1 && transactions[0].type === "MINT" && transactions[0].amount === 6000000000) {
-        if (this.chain.length > 0 && this.chain[0].index === 0) return true;
+        if (this.blockCount > 0 && this.chain[0].index === 0) return true;
     }
 
     let rewardAmount = config.blockchain.reward;
     if (config.blockchain.halving_interval) {
-        const halvings = Math.floor(this.chain.length / config.blockchain.halving_interval);
+        const halvings = Math.floor(this.blockCount / config.blockchain.halving_interval);
         rewardAmount = rewardAmount / Math.pow(2, halvings);
     }
     const remaining = this.getRemainingSupply("SYR");
@@ -439,19 +470,20 @@ class DataChain {
       }
     }
 
-    const newBlock = new Block(this.chain.length, Date.now(), validTransactions, this.getLatestBlock().hash);
+    const newBlock = new Block(this.blockCount, Date.now(), validTransactions, this.getLatestBlock().hash);
     
     await newBlock.mineBlock(this.difficulty); 
 
     if (!validator.validateBlock(newBlock, this.getLatestBlock())) return false;
 
     this.chain.push(newBlock);
+    this.blockCount++;
     this.state = tempState;
     
     this.adjustDifficulty();
-    this.appendPriceHistory(newBlock); 
+    await this.appendPriceHistory(newBlock); 
     await this.saveChain(); 
-    await this.state.saveSnapshot(this.chain.length - 1); 
+    await this.state.saveSnapshot(this.blockCount - 1); 
     
     return true;
   }
@@ -478,8 +510,9 @@ class DataChain {
     const TARGET_TIME = 10000; 
     const ADJUSTMENT_INTERVAL = 10;
 
-    if (this.chain.length > 0 && this.chain.length % ADJUSTMENT_INTERVAL === 0) {
+    if (this.blockCount > 0 && this.blockCount % ADJUSTMENT_INTERVAL === 0) {
       const prevAdjustmentBlock = this.chain[this.chain.length - ADJUSTMENT_INTERVAL];
+      if (!prevAdjustmentBlock) return;
       const timeExpected = TARGET_TIME * ADJUSTMENT_INTERVAL;
       const timeTaken = this.getLatestBlock().timestamp - prevAdjustmentBlock.timestamp;
 

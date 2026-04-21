@@ -4,8 +4,12 @@ import path from 'path';
 import pkg from 'pg';
 
 const { Pool } = pkg;
+// ENTERPRISE FIX: Pool scaled for 200 Max Connections
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL
+    connectionString: process.env.DATABASE_URL,
+    max: 200,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000
 });
 
 pool.query(`

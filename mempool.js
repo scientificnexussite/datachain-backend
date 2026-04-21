@@ -3,8 +3,12 @@ import crypto from 'crypto';
 import pkg from 'pg';
 
 const { Pool } = pkg;
+// ENTERPRISE FIX: Pool configured for high traffic with 200 max connections
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL
+    connectionString: process.env.DATABASE_URL,
+    max: 200,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000
 });
 
 pool.query(`
@@ -17,7 +21,7 @@ pool.query(`
 class Mempool {
   constructor() {
     this.pendingTransactions = [];
-    this.MAX_MEMPOOL_SIZE = 1000; 
+    this.MAX_MEMPOOL_SIZE = 5000; 
     this.loadMempool();
   }
 
@@ -31,7 +35,7 @@ class Mempool {
       } catch(e) {}
   }
 
-  addTransaction(tx) {
+  async addTransaction(tx) {
     if (this.pendingTransactions.length >= this.MAX_MEMPOOL_SIZE) {
         console.log(chalk.red('[MEMPOOL] Rejected: Mempool is full.'));
         return false;
@@ -40,6 +44,18 @@ class Mempool {
     if (!tx.from || !tx.to || !tx.amount) {
       console.log(chalk.red('[MEMPOOL] Rejected: Invalid transaction structure.'));
       return false;
+    }
+
+    // ENTERPRISE FIX: Replay Attack Prevention
+    // Ensure this exact signed transaction hasn't already been mined in a historical block
+    if (tx.signature && tx.signature !== 'sys') {
+        try {
+            const dbCheck = await pool.query('SELECT 1 FROM transactions WHERE signature = $1 LIMIT 1', [tx.signature]);
+            if (dbCheck.rows.length > 0) {
+                console.log(chalk.red.bold('[SECURITY] REPLAY ATTACK BLOCKED: Transaction signature already exists in ledger.'));
+                return false;
+            }
+        } catch(e) {}
     }
 
     const txHash = crypto.createHash('sha256').update(JSON.stringify({from: tx.from, to: tx.to, amount: tx.amount, type: tx.type, sig: tx.signature || 'sys'})).digest('hex');
@@ -53,7 +69,7 @@ class Mempool {
 
     this.pendingTransactions.push(tx);
     
-    // Enterprise Fix: Save to Postgres to prevent RAM wipe data loss on reboot
+    // Write to postgres to prevent RAM loss during server restarts
     pool.query('INSERT INTO mempool_store (hash, tx_data) VALUES ($1, $2) ON CONFLICT DO NOTHING', [txHash, tx]).catch(()=>{});
 
     console.log(chalk.magenta(`[MEMPOOL] Transaction Added. Total Pending: ${this.pendingTransactions.length}`));

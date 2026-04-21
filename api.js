@@ -21,7 +21,10 @@ const PAYPAL_API_BASE = "https://api-m.paypal.com";
 
 const { Pool } = pkg;
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL
+    connectionString: process.env.DATABASE_URL,
+    max: 200,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000
 });
 
 pool.query(`
@@ -61,7 +64,7 @@ app.use(bodyParser.json({ limit: '100kb' }));
 
 const txLimiter = rateLimit({
     windowMs: 60 * 1000, 
-    max: 20, 
+    max: 50, 
     keyGenerator: (req) => req.body?.uid || req.ip,
     message: { error: "Too many transactions submitted. Please try again later." }
 });
@@ -158,7 +161,7 @@ async function updateMarketEconomics() {
     try {
         await menuBook.ensureLoaded();
         menuBook._initTokenBook("SYR"); 
-        const chainPrice = nexusChain.getLastMarketPrice(config.blockchain.starting_price);
+        const chainPrice = await nexusChain.getLastMarketPrice(config.blockchain.starting_price);
         currentPrice = menuBook.books["SYR"].lastTradePrice > 0 ? menuBook.books["SYR"].lastTradePrice : chainPrice;
         await menuBook.setInitialPrice(currentPrice, "SYR");
 
@@ -200,7 +203,7 @@ setInterval(async () => {
     }
 }, 5000); 
 
-app.get('/health', (req, res) => { res.json({ status: 'alive', chainLength: nexusChain.chain.length, timestamp: Date.now() }); });
+app.get('/health', (req, res) => { res.json({ status: 'alive', chainLength: nexusChain.blockCount, timestamp: Date.now() }); });
 app.get('/config', (req, res) => { res.json({ paypalClientId: PAYPAL_CLIENT_ID }); });
 
 app.get('/menubook', async (req, res) => { 
@@ -213,7 +216,7 @@ app.get('/menubook', async (req, res) => {
 
 app.get('/network', (req, res) => { 
     if (Date.now() - apiCache.network.time < CACHE_TTL && apiCache.network.data) return res.json(apiCache.network.data);
-    apiCache.network.data = { chainLength: nexusChain.chain.length, difficulty: nexusChain.difficulty, mempoolCount: mempool.getPendingCount() };
+    apiCache.network.data = { chainLength: nexusChain.blockCount, difficulty: nexusChain.difficulty, mempoolCount: mempool.getPendingCount() };
     apiCache.network.time = Date.now();
     res.json(apiCache.network.data); 
 });
@@ -222,7 +225,7 @@ app.get('/pricehistory', (req, res) => {
     res.json(nexusChain.priceHistoryCache);
 });
 
-// ENTERPRISE FIX: Added OHLC Kline formatting to supply native Red/Green candles to TradingView
+// ENTERPRISE FIX: TradingView OHLC Kline Formatting
 app.get('/api/chart/kline', async (req, res) => {
     try {
         const { symbol = 'SYR' } = req.query;
@@ -339,7 +342,7 @@ app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
         remainingAmount = matchResult.remaining;
 
         for (const trade of executedTrades) {
-            mempool.addTransaction({ from: trade.seller, to: trade.buyer, amount: trade.amountSyr, amountUsd: trade.amountUsd, type: 'MARKET_TRADE', tokenSymbol: tokenSymbol, timestamp: Date.now() });
+            await mempool.addTransaction({ from: trade.seller, to: trade.buyer, amount: trade.amountSyr, amountUsd: trade.amountUsd, type: 'MARKET_TRADE', tokenSymbol: tokenSymbol, timestamp: Date.now() });
         }
 
         let order = null;
@@ -386,7 +389,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                     }
                 }
 
-                mempool.addTransaction({ 
+                await mempool.addTransaction({ 
                     from: 'system', 
                     to: uid, 
                     amount: tradeAmount, 
@@ -424,7 +427,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
         }
 
         for (const trade of matchResult.trades) {
-            mempool.addTransaction({ from: trade.seller, to: trade.buyer, amount: trade.amountSyr, amountUsd: trade.amountUsd, type: 'MARKET_TRADE', tokenSymbol: tokenSymbol, timestamp: Date.now() });
+            await mempool.addTransaction({ from: trade.seller, to: trade.buyer, amount: trade.amountSyr, amountUsd: trade.amountUsd, type: 'MARKET_TRADE', tokenSymbol: tokenSymbol, timestamp: Date.now() });
         }
 
         await updateMarketEconomics();
@@ -451,18 +454,42 @@ app.post('/api/orders/cancel', requireWeb3Auth, async (req, res) => {
     } catch (err) { res.status(500).json({ error: "Failed to cancel order." }); }
 });
 
-app.get('/blocks', (req, res) => {
-    const chain = nexusChain.chain;
-    const total = chain.length;
-    if (req.query.limit !== undefined || req.query.offset !== undefined) {
-        const limit = Math.min(parseInt(req.query.limit) || 50, 200); 
-        const offset = parseInt(req.query.offset) || 0;
-        const end = total - offset;
-        const start = Math.max(0, end - limit);
-        const page = chain.slice(start, end).reverse();
-        return res.json({ blocks: page, total, offset, limit });
+// ENTERPRISE FIX: Dynamically queries PostgreSQL to completely unblock the RAM
+app.get('/blocks', async (req, res) => {
+    try {
+        const totalRes = await pool.query('SELECT COUNT(*) FROM blocks');
+        const total = parseInt(totalRes.rows[0].count);
+        
+        let limit = Math.min(parseInt(req.query.limit) || 50, 200); 
+        let offset = parseInt(req.query.offset) || 0;
+        
+        const blockRes = await pool.query('SELECT * FROM blocks ORDER BY index DESC LIMIT $1 OFFSET $2', [limit, offset]);
+        if (blockRes.rows.length === 0) return res.json({ blocks: [], total, offset, limit });
+        
+        const indices = blockRes.rows.map(b => b.index);
+        const txRes = await pool.query('SELECT * FROM transactions WHERE block_index = ANY($1::int[]) ORDER BY id ASC', [indices]);
+        
+        const txsByBlock = {};
+        txRes.rows.forEach(tx => {
+            if (!txsByBlock[tx.block_index]) txsByBlock[tx.block_index] = [];
+            txsByBlock[tx.block_index].push({
+                from: tx.from_address, to: tx.to_address, amount: parseFloat(tx.amount),
+                amountUsd: parseFloat(tx.amount_usd), type: tx.type, tokenSymbol: tx.token_symbol, 
+                timestamp: parseInt(tx.timestamp_ms), isSystemGenerated: tx.is_system_generated,
+                signature: tx.signature, publicKey: tx.public_key, platformType: tx.platform_type, description: tx.description
+            });
+        });
+        
+        const page = blockRes.rows.map(b => ({
+            index: b.index, timestamp: parseInt(b.timestamp_ms), 
+            data: txsByBlock[b.index] || [], previousHash: b.previous_hash, 
+            hash: b.hash, nonce: b.nonce
+        }));
+        
+        res.json({ blocks: page, total, offset, limit });
+    } catch(e) {
+        res.status(500).json({error: "Failed to fetch blocks dynamically from database."});
     }
-    res.json(chain);
 });
 
 app.get('/balance/:address', (req, res) => { 
@@ -486,7 +513,7 @@ app.get('/miner-balance', (req, res) => {
     res.json({ address: config.blockchain.miner_address, balance: nexusChain.getBalance(config.blockchain.miner_address, "SYR") });
 });
 
-app.post('/tx/new', txLimiter, requireWeb3Auth, (req, res) => {
+app.post('/tx/new', txLimiter, requireWeb3Auth, async (req, res) => {
   try {
       const { signature, publicKey, uid, ...payloadData } = req.body;
       const tx = { ...payloadData, amount: parseFloat(payloadData.amount) };
@@ -515,8 +542,8 @@ app.post('/tx/new', txLimiter, requireWeb3Auth, (req, res) => {
 
       if (!validator.validateTransactionPayload(tx)) return res.status(400).json({ error: "Malformed payload or invalid cryptography." });
 
-      if (mempool.addTransaction(tx)) res.status(201).json({ message: "Transaction added to mempool.", tx });
-      else res.status(400).json({ error: "MEMPOOL_FULL" });
+      if (await mempool.addTransaction(tx)) res.status(201).json({ message: "Transaction added to mempool.", tx });
+      else res.status(400).json({ error: "MEMPOOL_FULL_OR_REPLAY" });
   } catch (error) { res.status(500).json({ error: "Internal Server Error." }); }
 });
 
@@ -596,7 +623,7 @@ app.post('/verify-website', txLimiter, requireWeb3Auth, async (req, res) => {
     }
 });
 
-app.post('/mint-new-cash', txLimiter, requireWeb3Auth, (req, res) => {
+app.post('/mint-new-cash', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const { ticker, supply, platformType, description } = req.body;
         const uid = req.user.uid;
@@ -616,9 +643,9 @@ app.post('/mint-new-cash', txLimiter, requireWeb3Auth, (req, res) => {
         const deployFee = 100;
         if ((nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, "SYR") - mempool.getPendingUsdSpend(uid)) < deployFee) return res.status(400).json({ error: `Deploying costs $${deployFee} USD. Insufficient funds.` });
 
-        mempool.addTransaction({ from: uid, to: "system", amount: deployFee, type: 'USD_WITHDRAWAL', timestamp: Date.now(), isSystemGenerated: true });
+        await mempool.addTransaction({ from: uid, to: "system", amount: deployFee, type: 'USD_WITHDRAWAL', timestamp: Date.now(), isSystemGenerated: true });
         
-        mempool.addTransaction({ 
+        await mempool.addTransaction({ 
             from: "system", 
             to: uid, 
             amount: parsedSupply, 
@@ -680,7 +707,7 @@ app.post('/capture-paypal-order', requireWeb3Auth, async (req, res) => {
         saveApiState();
         
         const capturedAmount = parseFloat(data.purchase_units[0].payments.captures[0].amount.value);
-        mempool.addTransaction({ from: "paypal-gateway", to: req.user.uid, amount: capturedAmount, type: 'USD_DEPOSIT', timestamp: Date.now(), isSystemGenerated: true });
+        await mempool.addTransaction({ from: "paypal-gateway", to: req.user.uid, amount: capturedAmount, type: 'USD_DEPOSIT', timestamp: Date.now(), isSystemGenerated: true });
         res.json({ status: 'COMPLETED', amount: capturedAmount });
     } catch (error) { res.status(500).json({ error: "[Sys-err] Payment system offline. Capture failed." }); }
 });
@@ -711,7 +738,7 @@ app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
             console.log(chalk.yellow("[PAYPAL PAYOUT DEFERRED] Attempted to process real payout, but system lacks live Payout REST credentials. Proceeding to mempool insertion natively."));
         }
 
-        mempool.addTransaction({ from: uid, to: "paypal-gateway", amount: amount, type: 'USD_WITHDRAWAL', timestamp: Date.now() });
+        await mempool.addTransaction({ from: uid, to: "paypal-gateway", amount: amount, type: 'USD_WITHDRAWAL', timestamp: Date.now() });
         res.json({ success: true, message: "Withdrawal processed and dispatched." });
     } catch (err) { res.status(500).json({ error: "Internal Server Error" }); }
 });
@@ -727,10 +754,10 @@ app.use((req, res) => { res.status(404).json({ error: "API Node Endpoint Not Fou
     // Safety lock to guarantee DB initializes before executing economics math
     if (nexusChain.isInitializing) { await nexusChain.isInitializing; }
     
-    currentPrice = nexusChain.getLastMarketPrice(config.blockchain.starting_price);
+    currentPrice = await nexusChain.getLastMarketPrice(config.blockchain.starting_price);
     await menuBook.setInitialPrice(currentPrice, "SYR");
     
-    if (nexusChain.getBalance("system", "SYR") === 0 && nexusChain.chain.length <= 1) {
+    if (nexusChain.getBalance("system", "SYR") === 0 && nexusChain.blockCount <= 1) {
         const initTx = { from: "system", to: "system", amount: MAX_SUPPLY, type: "MINT", tokenSymbol: "SYR", timestamp: Date.now(), isSystemGenerated: true };
         await nexusChain.addBlock([initTx]);
     }

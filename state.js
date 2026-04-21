@@ -7,7 +7,10 @@ const { Pool } = pkg;
 const fixDust = (num) => Number(Number(num).toFixed(8));
 
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL
+    connectionString: process.env.DATABASE_URL,
+    max: 200,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000
 });
 
 pool.query(`
@@ -150,17 +153,31 @@ class State {
         }
         console.log(chalk.green(`[STATE] PostgreSQL Snapshot loaded successfully.`));
     } catch (e) {
-        console.log(chalk.yellow("[STATE] Database state empty or missing. Rebuilding ledger mathematically..."));
+        // ENTERPRISE FIX: OOM Memory Protection
+        // Pull transactions dynamically from Postgres instead of loading 5,000,000 blocks into RAM
+        console.log(chalk.yellow("[STATE] Database state empty or missing. Rebuilding ledger mathematically from DB Transactions..."));
         this.balances = { "SYR": {} };
         this.usd_balances = {};
 
-        for (let i = 0; i < chain.length; i++) {
-          const block = chain[i];
-          if (typeof block.data === 'string') continue;
-          for (const tx of block.data) {
-            this.applyTransaction(tx, 0, true); 
-          }
+        try {
+            const allTxs = await pool.query("SELECT * FROM transactions ORDER BY block_index ASC, timestamp_ms ASC, id ASC");
+            for (const row of allTxs.rows) {
+                const tx = {
+                    from: row.from_address, to: row.to_address, amount: parseFloat(row.amount),
+                    amountUsd: parseFloat(row.amount_usd), type: row.type, tokenSymbol: row.token_symbol,
+                    priceUsd: parseFloat(row.price_usd)
+                };
+                this.applyTransaction(tx, 0, true); 
+            }
+        } catch(dbErr) {
+             console.log(chalk.red("[STATE] DB Replay failed. Attempting memory object fallback..."));
+             for (let i = 0; i < chain.length; i++) {
+                const block = chain[i];
+                if (typeof block.data === 'string') continue;
+                for (const tx of block.data) this.applyTransaction(tx, 0, true); 
+             }
         }
+        
         console.log(chalk.green(`[STATE] Mathematical replay complete.`));
     }
   }

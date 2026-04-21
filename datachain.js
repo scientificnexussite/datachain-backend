@@ -8,7 +8,6 @@ import config from './config.json' with { type: "json" };
 import pkg from 'pg';
 
 const { Pool } = pkg;
-const fixDust = (num) => Number(Number(num).toFixed(8));
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL || "postgresql://postgres:MuTxOCYQHBfxbSgexbWOdGdbkgjBCsIv@postgres.railway.internal:5432/railway",
 });
@@ -98,7 +97,7 @@ class DataChain {
         dbBlockCount = parseInt(countRes.rows[0].count);
     } catch(e) {}
 
-    // Main PostgreSQL Load
+    // MAIN POSTGRESQL LOAD
     if (dbBlockCount > 0) {
         try {
             const blockRes = await pool.query('SELECT * FROM blocks ORDER BY index ASC');
@@ -131,15 +130,14 @@ class DataChain {
             this.recalculateDifficulty();
             console.log(chalk.green(`[DATACHAIN] Successfully loaded ${this.chain.length} blocks from PostgreSQL.`));
             
-            // Execute the rescue protocol to inject the missing 5.98B into the current state
-            await this.executeDynamicRescue();
+            await this.executeHardForkAmnesty();
             return;
         } catch(e) {
             console.warn(chalk.yellow("[DATACHAIN] PostgreSQL load error. Checking JSON fallback..."));
         }
     }
 
-    // JSON Fallback
+    // JSON FALLBACK LOAD
     if (fs.existsSync(this.chainFile)) {
         try {
             const data = JSON.parse(fs.readFileSync(this.chainFile, 'utf8'));
@@ -155,92 +153,19 @@ class DataChain {
             console.log(chalk.green(`[DATACHAIN] Successfully loaded ${this.chain.length} blocks from JSON.`));
             
             await this.syncAllToDB(); 
-            await this.executeDynamicRescue();
+            await this.executeHardForkAmnesty();
             return;
         } catch(e) {}
     }
 
+    // GENESIS LOAD
     console.warn(chalk.yellow("[DATACHAIN] Starting fresh chain from genesis."));
     this.chain = [this.createGenesisBlock()];
     await this.state.loadSnapshot(this.chain);
     this.rebuildPriceHistory();
     this.difficulty = 2;
     
-    await this.executeDynamicRescue();
-  }
-
-  async executeDynamicRescue() {
-      try {
-          // Check if rescue has already been performed to prevent duplicate minting
-          const rescueCheck = await pool.query("SELECT COUNT(*) FROM transactions WHERE description = 'Nexus Dynamic Rescue'");
-          if (parseInt(rescueCheck.rows[0].count) > 0) return;
-
-          // Search volume and root directories for intact legacy state files
-          const stateFiles = [
-              path.join(process.cwd(), 'state_snapshot.json'),
-              path.join(process.cwd(), 'state_snapshot_backup.json'),
-              path.join(this.volumeDir, 'state_snapshot.json'),
-              path.join(this.volumeDir, 'state_snapshot_backup.json')
-          ];
-
-          let targetBalances = null;
-          let highestFoundBal = 0;
-
-          for (const file of stateFiles) {
-              if (fs.existsSync(file)) {
-                  try {
-                      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-                      if (data.balances && data.balances["SYR"]) {
-                          for (const address in data.balances["SYR"]) {
-                              if (address !== 'system' && data.balances["SYR"][address] > highestFoundBal) {
-                                  highestFoundBal = data.balances["SYR"][address];
-                                  targetBalances = data;
-                              }
-                          }
-                      }
-                  } catch(e) {}
-              }
-          }
-
-          // If we found the massive legacy wallets, cross-reference and inject the missing funds
-          if (targetBalances && highestFoundBal >= 2000000000) {
-              const rescueTxs = [];
-
-              for (const address in targetBalances.balances["SYR"]) {
-                  if (address === 'system') continue;
-                  const legacyBal = targetBalances.balances["SYR"][address];
-                  const currentBal = this.getBalance(address, "SYR");
-                  
-                  // If DB is missing massive amounts, queue a Restoration Mint
-                  if (legacyBal > currentBal + 10000) {
-                      rescueTxs.push({
-                          from: "system", to: address, amount: fixDust(legacyBal - currentBal),
-                          type: "MINT", tokenSymbol: "SYR", timestamp: Date.now(),
-                          isSystemGenerated: true, description: "Nexus Dynamic Rescue"
-                      });
-                  }
-              }
-
-              if (rescueTxs.length > 0) {
-                  console.log(chalk.magenta.bold(`[RESCUE] Discovered missing Legacy Wealth. Injecting ${rescueTxs.length} recovery wallets...`));
-                  
-                  const newBlock = new Block(this.chain.length, Date.now(), rescueTxs, this.getLatestBlock().hash);
-                  await newBlock.mineBlock(this.difficulty);
-                  
-                  // Apply to live memory safely
-                  for (const tx of rescueTxs) {
-                      this.state.applyTransaction(tx, 0, false);
-                  }
-                  
-                  this.chain.push(newBlock);
-                  await this.saveChain();
-                  await this.state.saveSnapshot(this.chain.length - 1);
-                  console.log(chalk.green.bold("[RESCUE] 5.98 Billion SilverCash Successfully Restored to Live Database."));
-              }
-          }
-      } catch (error) {
-          console.error(chalk.red("[RESCUE] Rescue protocol deferred."));
-      }
+    await this.executeHardForkAmnesty();
   }
 
   async syncAllToDB() {
@@ -332,6 +257,67 @@ class DataChain {
   getLatestBlock() {
     return this.chain[this.chain.length - 1];
   }
+
+  // =========================================================================
+  // HARD FORK AIRDROP PROTOCOL
+  // =========================================================================
+  async executeHardForkAmnesty() {
+      let totalCirculating = 0;
+      const syrBalances = this.state.balances["SYR"] || {};
+      for (const address in syrBalances) {
+          if (address !== "system" && syrBalances[address] > 0) {
+              totalCirculating += syrBalances[address];
+          }
+      }
+      
+      // If circulating supply is under 5.98 Billion, the legacy history was destroyed by Railway.
+      // We will explicitly recreate it right here with your precise addresses.
+      if (totalCirculating < 5980000000) {
+          console.log(chalk.magenta.bold("[HARD FORK] Legacy history missing. Executing 5.98 Billion Genesis Airdrop..."));
+          
+          const walletWith3Billion = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE5z7IyY";
+          const walletWith2Billion980M = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEcZsKwt";
+          
+          const rescueTxs = [];
+          
+          rescueTxs.push({ 
+              from: "system", 
+              to: walletWith3Billion, 
+              amount: 3000000000, 
+              type: "MINT", 
+              tokenSymbol: "SYR", 
+              timestamp: Date.now(), 
+              isSystemGenerated: true,
+              description: "Nexus Genesis Airdrop Recovery"
+          });
+          
+          rescueTxs.push({ 
+              from: "system", 
+              to: walletWith2Billion980M, 
+              amount: 2980000000, 
+              type: "MINT", 
+              tokenSymbol: "SYR", 
+              timestamp: Date.now() + 1000, 
+              isSystemGenerated: true,
+              description: "Nexus Genesis Airdrop Recovery"
+          });
+
+          if (rescueTxs.length > 0) {
+              const newBlock = new Block(this.chain.length, Date.now(), rescueTxs, this.getLatestBlock().hash);
+              await newBlock.mineBlock(this.difficulty);
+              
+              for (const tx of rescueTxs) {
+                  this.state.applyTransaction(tx, this.getLastMarketPrice(0.50), false);
+              }
+              
+              this.chain.push(newBlock);
+              await this.saveChain();
+              await this.state.saveSnapshot(this.chain.length - 1);
+              console.log(chalk.green.bold("[HARD FORK] 5.98 Billion SilverCash Successfully Injected."));
+          }
+      }
+  }
+  // =========================================================================
 
   getRemainingSupply(tokenSymbol = "SYR") {
     if (tokenSymbol !== "SYR") return 0;

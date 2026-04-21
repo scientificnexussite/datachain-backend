@@ -308,6 +308,24 @@ app.post('/positions/:uid', requireWeb3Auth, async (req, res) => {
     res.json({ positions: positionsArr });
 });
 
+// BUG FIX: MOVED /cancel ENDPOINT ABOVE /:uid WILDCARD ENDPOINT TO PREVENT ROUTE SHADOWING
+app.post('/api/orders/cancel', requireWeb3Auth, async (req, res) => {
+    try {
+        const { orderId, tokenSymbol = "SYR" } = req.body;
+        const uid = req.user.uid;
+        
+        const parsedOrderId = parseInt(orderId);
+        
+        const success = await menuBook.cancelOrder(uid, parsedOrderId, tokenSymbol);
+        if (success) {
+            await updateMarketEconomics();
+            res.json({ success: true, message: "Order cancelled successfully." });
+        } else {
+            res.status(404).json({ error: "Order not found or already executed." });
+        }
+    } catch (err) { res.status(500).json({ error: "Failed to cancel order." }); }
+});
+
 app.post('/api/orders/:uid', requireWeb3Auth, (req, res) => {
     if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
     res.json(menuBook.getUserOrders(req.params.uid, "SYR"));
@@ -375,8 +393,6 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
         const fundsToCheck = side === 'BUY' ? availableUsd : availableToken;
         const matchResult = await menuBook.matchMarketOrder(uid, side, parsedAmount, fundsToCheck, null, tokenSymbol);
 
-        // HYBRID AMM LIQUIDITY POOL FIX
-        // If the P2P order book runs dry, automatically route the rest of the buy to the System's Liquidity Pool
         if (side === 'BUY' && matchResult.remaining > 1e-8 && tokenSymbol === 'SYR') {
             const systemBalance = nexusChain.getBalance('system', tokenSymbol) - mempool.getPendingTokenSpend('system', tokenSymbol);
             if (systemBalance > 0) {
@@ -405,7 +421,6 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                         isSystemGenerated: true
                     });
 
-                    // Constant Product Price Scaling (Price rises naturally as people buy)
                     const newSyrReserve = virtualSyrReserve - tradeAmount;
                     const newUsdReserve = (virtualSyrReserve * virtualUsdReserve) / newSyrReserve;
                     
@@ -438,24 +453,6 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
             slippagePercentage: (matchResult.slippage * 100).toFixed(2) + "%", trades: matchResult.trades
         });
     } catch (error) { res.status(500).json({ error: "Internal Server Error" }); }
-});
-
-// BUG FIX: Strictly parse Order ID as Integer to match backend Data Types
-app.post('/api/orders/cancel', requireWeb3Auth, async (req, res) => {
-    try {
-        const { orderId, tokenSymbol = "SYR" } = req.body;
-        const uid = req.user.uid;
-        
-        const parsedOrderId = parseInt(orderId);
-        
-        const success = await menuBook.cancelOrder(uid, parsedOrderId, tokenSymbol);
-        if (success) {
-            await updateMarketEconomics();
-            res.json({ success: true, message: "Order cancelled successfully." });
-        } else {
-            res.status(404).json({ error: "Order not found or already executed." });
-        }
-    } catch (err) { res.status(500).json({ error: "Failed to cancel order." }); }
 });
 
 app.get('/blocks', async (req, res) => {
@@ -549,7 +546,6 @@ app.post('/tx/new', txLimiter, requireWeb3Auth, async (req, res) => {
       else res.status(400).json({ error: "MEMPOOL_FULL_OR_REPLAY" });
   } catch (error) { res.status(500).json({ error: "Internal Server Error." }); }
 });
-
 
 setInterval(() => {
     const now = Date.now();

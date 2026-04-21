@@ -118,7 +118,8 @@ async function getPayPalAccessToken() {
     return data.access_token;
 }
 
-// ENTERPRISE UPGRADE: Max Supply elevated to 12 Billion to flawlessly support the new wealth distribution
+const fixDust = (num) => Number(Number(num).toFixed(8));
+
 const MAX_SUPPLY = 12000000000;
 let currentPrice = config.blockchain.starting_price; 
 
@@ -374,58 +375,60 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
         const fundsToCheck = side === 'BUY' ? availableUsd : availableToken;
         const matchResult = await menuBook.matchMarketOrder(uid, side, parsedAmount, fundsToCheck, null, tokenSymbol);
 
-        if (matchResult.trades.length === 0) {
+        // HYBRID AMM LIQUIDITY POOL FIX
+        // If the P2P order book runs dry, automatically route the rest of the buy to the System's Liquidity Pool
+        if (side === 'BUY' && matchResult.remaining > 1e-8 && tokenSymbol === 'SYR') {
             const systemBalance = nexusChain.getBalance('system', tokenSymbol) - mempool.getPendingTokenSpend('system', tokenSymbol);
-            if (side === 'BUY' && systemBalance > 0 && tokenSymbol === 'SYR') {
-                let tradeAmount = Math.min(parsedAmount, systemBalance);
-                let tradeUsd = parseFloat((tradeAmount * currentPrice).toFixed(8));
+            if (systemBalance > 0) {
+                let tradeAmount = Math.min(matchResult.remaining, systemBalance);
                 
-                if (fundsToCheck < tradeUsd) {
-                    tradeAmount = parseFloat((fundsToCheck / currentPrice).toFixed(8));
-                    tradeUsd = fundsToCheck; 
-                    if (tradeAmount <= 1e-8) {
-                        return res.status(400).json({ error: "Insufficient USD balance to buy from Remaining Supply." });
-                    }
+                const virtualSyrReserve = 5000000; 
+                const virtualUsdReserve = virtualSyrReserve * currentPrice;
+                
+                let stepTradeUsd = parseFloat((tradeAmount * currentPrice).toFixed(8));
+                let maxAffordableTradeUsd = fundsToCheck - matchResult.totalUsdCost;
+
+                if (maxAffordableTradeUsd < stepTradeUsd) {
+                    tradeAmount = parseFloat((maxAffordableTradeUsd / currentPrice).toFixed(8));
+                    stepTradeUsd = maxAffordableTradeUsd;
                 }
 
-                await mempool.addTransaction({ 
-                    from: 'system', 
-                    to: uid, 
-                    amount: tradeAmount, 
-                    amountUsd: tradeUsd, 
-                    type: 'MARKET_TRADE', 
-                    tokenSymbol: tokenSymbol, 
-                    timestamp: Date.now(),
-                    isSystemGenerated: true
-                });
+                if (tradeAmount > 1e-8) {
+                    await mempool.addTransaction({ 
+                        from: 'system', 
+                        to: uid, 
+                        amount: tradeAmount, 
+                        amountUsd: stepTradeUsd, 
+                        type: 'MARKET_TRADE', 
+                        tokenSymbol: tokenSymbol, 
+                        timestamp: Date.now(),
+                        isSystemGenerated: true
+                    });
 
-                const virtualSyrReserve = 1000000; 
-                const virtualUsdReserve = virtualSyrReserve * currentPrice;
-                const newSyrReserve = virtualSyrReserve - tradeAmount;
-                const newUsdReserve = (virtualSyrReserve * virtualUsdReserve) / newSyrReserve;
-                
-                currentPrice = parseFloat((newUsdReserve / newSyrReserve).toFixed(6));
-                menuBook.books[tokenSymbol].lastTradePrice = currentPrice;
-                await menuBook.saveOrders();
+                    // Constant Product Price Scaling (Price rises naturally as people buy)
+                    const newSyrReserve = virtualSyrReserve - tradeAmount;
+                    const newUsdReserve = (virtualSyrReserve * virtualUsdReserve) / newSyrReserve;
+                    
+                    currentPrice = parseFloat((newUsdReserve / newSyrReserve).toFixed(6));
+                    menuBook.books[tokenSymbol].lastTradePrice = currentPrice;
+                    await menuBook.saveOrders();
 
-                return res.status(201).json({
-                    message: "Purchased directly from Initial System Supply",
-                    executedSyr: tradeAmount,
-                    remainingUnfilled: parseFloat((parsedAmount - tradeAmount).toFixed(8)),
-                    totalUsdCost: tradeUsd,
-                    slippagePercentage: "AMM Variable",
-                    trades: [{ buyer: uid, seller: 'system', amountSyr: tradeAmount, amountUsd: tradeUsd, price: currentPrice, tokenSymbol }]
-                });
+                    matchResult.trades.push({ buyer: uid, seller: 'system', amountSyr: tradeAmount, amountUsd: stepTradeUsd, price: currentPrice, tokenSymbol });
+                    matchResult.executedSyr = fixDust(matchResult.executedSyr + tradeAmount);
+                    matchResult.remaining = fixDust(matchResult.remaining - tradeAmount);
+                    matchResult.totalUsdCost = fixDust(matchResult.totalUsdCost + stepTradeUsd);
+                }
             }
+        }
 
-            if (fundsToCheck <= 1e-8) {
-                return res.status(400).json({ error: side === 'BUY' ? "Insufficient USD balance." : `Insufficient ${tokenSymbol} balance.` });
-            }
+        if (matchResult.trades.length === 0) {
             return res.status(400).json({ error: "No liquidity available in Menu Book to match order." });
         }
 
         for (const trade of matchResult.trades) {
-            await mempool.addTransaction({ from: trade.seller, to: trade.buyer, amount: trade.amountSyr, amountUsd: trade.amountUsd, type: 'MARKET_TRADE', tokenSymbol: tokenSymbol, timestamp: Date.now() });
+            if (trade.seller !== 'system') {
+                await mempool.addTransaction({ from: trade.seller, to: trade.buyer, amount: trade.amountSyr, amountUsd: trade.amountUsd, type: 'MARKET_TRADE', tokenSymbol: tokenSymbol, timestamp: Date.now() });
+            }
         }
 
         await updateMarketEconomics();
@@ -437,13 +440,15 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
     } catch (error) { res.status(500).json({ error: "Internal Server Error" }); }
 });
 
-// BUG FIX: Strictly maps the cryptographically verified uid to safely cancel orders
+// BUG FIX: Strictly parse Order ID as Integer to match backend Data Types
 app.post('/api/orders/cancel', requireWeb3Auth, async (req, res) => {
     try {
         const { orderId, tokenSymbol = "SYR" } = req.body;
         const uid = req.user.uid;
         
-        const success = await menuBook.cancelOrder(uid, orderId, tokenSymbol);
+        const parsedOrderId = parseInt(orderId);
+        
+        const success = await menuBook.cancelOrder(uid, parsedOrderId, tokenSymbol);
         if (success) {
             await updateMarketEconomics();
             res.json({ success: true, message: "Order cancelled successfully." });
@@ -755,7 +760,6 @@ app.use((req, res) => { res.status(404).json({ error: "API Node Endpoint Not Fou
     await menuBook.setInitialPrice(currentPrice, "SYR");
     
     if (nexusChain.getBalance("system", "SYR") === 0 && nexusChain.blockCount <= 1) {
-        // Initializes with the new 12 Billion Math Cap
         const initTx = { from: "system", to: "system", amount: MAX_SUPPLY, type: "MINT", tokenSymbol: "SYR", timestamp: Date.now(), isSystemGenerated: true };
         await nexusChain.addBlock([initTx]);
     }

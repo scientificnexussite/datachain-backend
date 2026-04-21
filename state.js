@@ -11,7 +11,21 @@ const pool = new Pool({
 });
 
 pool.query(`
-    CREATE TABLE IF NOT EXISTS state_meta (\n        id INT PRIMARY KEY,\n        last_index INT\n    );\n    CREATE TABLE IF NOT EXISTS state_usd_balances (\n        address VARCHAR(100) PRIMARY KEY,\n        balance DOUBLE PRECISION\n    );\n    CREATE TABLE IF NOT EXISTS state_balances (\n        address VARCHAR(100),\n        token_symbol VARCHAR(20),\n        balance DOUBLE PRECISION,\n        PRIMARY KEY (address, token_symbol)\n    );\n`).catch(err => console.error(chalk.red("[DB] Failed to initialize state tables"), err));
+    CREATE TABLE IF NOT EXISTS state_meta (
+        id INT PRIMARY KEY,
+        last_index INT
+    );
+    CREATE TABLE IF NOT EXISTS state_usd_balances (
+        address VARCHAR(100) PRIMARY KEY,
+        balance DOUBLE PRECISION
+    );
+    CREATE TABLE IF NOT EXISTS state_balances (
+        address VARCHAR(100),
+        token_symbol VARCHAR(20),
+        balance DOUBLE PRECISION,
+        PRIMARY KEY (address, token_symbol)
+    );
+`).catch(err => console.error(chalk.red("[DB] Failed to initialize state tables"), err));
 
 class State {
   constructor() {
@@ -176,14 +190,16 @@ class State {
           
           for (const address in this.usd_balances) {
               await client.query(
-                  'INSERT INTO state_usd_balances (address, balance) VALUES ($1, $2) ON CONFLICT (address) DO UPDATE SET balance = $2',\n                  [address, this.usd_balances[address]]
+                  'INSERT INTO state_usd_balances (address, balance) VALUES ($1, $2) ON CONFLICT (address) DO UPDATE SET balance = $2',
+                  [address, this.usd_balances[address]]
               );
           }
 
           for (const tokenSymbol in this.balances) {
               for (const address in this.balances[tokenSymbol]) {
                   await client.query(
-                      'INSERT INTO state_balances (address, token_symbol, balance) VALUES ($1, $2, $3) ON CONFLICT (address, token_symbol) DO UPDATE SET balance = $3',\n                      [address, tokenSymbol, this.balances[tokenSymbol][address]]
+                      'INSERT INTO state_balances (address, token_symbol, balance) VALUES ($1, $2, $3) ON CONFLICT (address, token_symbol) DO UPDATE SET balance = $3',
+                      [address, tokenSymbol, this.balances[tokenSymbol][address]]
                   );
               }
           }

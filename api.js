@@ -118,7 +118,8 @@ async function getPayPalAccessToken() {
     return data.access_token;
 }
 
-const MAX_SUPPLY = 6000000000;
+// ENTERPRISE UPGRADE: Max Supply elevated to 12 Billion to flawlessly support the new wealth distribution
+const MAX_SUPPLY = 12000000000;
 let currentPrice = config.blockchain.starting_price; 
 
 const apiCache = {
@@ -225,7 +226,6 @@ app.get('/pricehistory', (req, res) => {
     res.json(nexusChain.priceHistoryCache);
 });
 
-// ENTERPRISE FIX: TradingView OHLC Kline Formatting
 app.get('/api/chart/kline', async (req, res) => {
     try {
         const { symbol = 'SYR' } = req.query;
@@ -272,7 +272,6 @@ app.get('/tokens', (req, res) => {
     res.json(tokens);
 });
 
-// ENTERPRISE FIX: Database Query replaces the single-threaded JSON array loop bottleneck
 app.post('/positions/:uid', requireWeb3Auth, async (req, res) => {
     const uid = req.params.uid;
     if (req.user.uid !== uid) return res.status(403).json({ error: "Forbidden" });
@@ -400,7 +399,6 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                     isSystemGenerated: true
                 });
 
-                // ENTERPRISE FIX: Automated Market Maker (AMM) Constant Product Formula x * y = k
                 const virtualSyrReserve = 1000000; 
                 const virtualUsdReserve = virtualSyrReserve * currentPrice;
                 const newSyrReserve = virtualSyrReserve - tradeAmount;
@@ -439,10 +437,11 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
     } catch (error) { res.status(500).json({ error: "Internal Server Error" }); }
 });
 
+// BUG FIX: Strictly maps the cryptographically verified uid to safely cancel orders
 app.post('/api/orders/cancel', requireWeb3Auth, async (req, res) => {
     try {
-        const { uid, orderId, tokenSymbol = "SYR" } = req.body;
-        if (req.user.uid !== uid) return res.status(403).json({ error: "Forbidden" });
+        const { orderId, tokenSymbol = "SYR" } = req.body;
+        const uid = req.user.uid;
         
         const success = await menuBook.cancelOrder(uid, orderId, tokenSymbol);
         if (success) {
@@ -454,7 +453,6 @@ app.post('/api/orders/cancel', requireWeb3Auth, async (req, res) => {
     } catch (err) { res.status(500).json({ error: "Failed to cancel order." }); }
 });
 
-// ENTERPRISE FIX: Dynamically queries PostgreSQL to completely unblock the RAM
 app.get('/blocks', async (req, res) => {
     try {
         const totalRes = await pool.query('SELECT COUNT(*) FROM blocks');
@@ -751,13 +749,13 @@ app.use((req, res) => { res.status(404).json({ error: "API Node Endpoint Not Fou
     
     console.log(chalk.blue("Initializing Market Economics..."));
     
-    // Safety lock to guarantee DB initializes before executing economics math
     if (nexusChain.isInitializing) { await nexusChain.isInitializing; }
     
     currentPrice = await nexusChain.getLastMarketPrice(config.blockchain.starting_price);
     await menuBook.setInitialPrice(currentPrice, "SYR");
     
     if (nexusChain.getBalance("system", "SYR") === 0 && nexusChain.blockCount <= 1) {
+        // Initializes with the new 12 Billion Math Cap
         const initTx = { from: "system", to: "system", amount: MAX_SUPPLY, type: "MINT", tokenSymbol: "SYR", timestamp: Date.now(), isSystemGenerated: true };
         await nexusChain.addBlock([initTx]);
     }

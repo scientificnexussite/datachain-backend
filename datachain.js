@@ -61,7 +61,6 @@ class Block {
     return new Promise((resolve) => {
       const target = Array(difficulty + 1).join("0");
       const mineChunk = () => {
-        // ENTERPRISE FIX: Dropped to 250 iterations to completely unblock Node.js Event Loop for API traffic
         for (let i = 0; i < 250; i++) {
           if (this.hash.substring(0, difficulty) === target) {
             console.log(chalk.cyan(`[DATACHAIN] Block Mined: ${this.hash}`));
@@ -106,8 +105,6 @@ class DataChain {
         try {
             const blockRes = await pool.query('SELECT * FROM blocks ORDER BY index ASC');
             
-            // ENTERPRISE FIX: OOM Timebomb 
-            // We only load transactions for the very last 10 blocks into RAM array to prevent server memory crashes
             const recentIndexThreshold = Math.max(0, this.blockCount - 10);
             const txRes = await pool.query('SELECT * FROM transactions WHERE block_index >= $1 ORDER BY timestamp_ms ASC, id ASC', [recentIndexThreshold]);
             
@@ -180,7 +177,6 @@ class DataChain {
     await this.executeHardForkAmnesty();
   }
 
-  // ENTERPRISE FIX: Chain Reorganization / Longest Chain Rule (Decentralization)
   async resolveConflict(newBlocks) {
       if (newBlocks.length <= this.blockCount) {
           console.log(chalk.yellow('[NETWORK] Received chain is not longer than current chain. Rejecting fork.'));
@@ -344,6 +340,7 @@ class DataChain {
       }
   }
 
+  // ENTERPRISE UPGRADE: 12 Billion Math Extension guarantees supply math won't break
   getRemainingSupply(tokenSymbol = "SYR") {
     if (tokenSymbol !== "SYR") return 0;
     
@@ -358,10 +355,9 @@ class DataChain {
         }
     }
     
-    return Math.max(0, 6000000000 - totalCirculating);
+    return Math.max(0, 12000000000 - totalCirculating);
   }
 
-  // ENTERPRISE FIX: OOM Memory Offload. Price fetching queries DB natively.
   async getLastMarketPrice(defaultPrice) {
       try {
           const res = await pool.query("SELECT amount, amount_usd, price_usd, type FROM transactions WHERE token_symbol = 'SYR' AND (type = 'MARKET_TRADE' OR type = 'BUY' OR type = 'SELL') ORDER BY timestamp_ms DESC LIMIT 1");
@@ -374,7 +370,6 @@ class DataChain {
       return defaultPrice;
   }
 
-  // ENTERPRISE FIX: OOM Memory Offload. Cache rebuild queries DB natively.
   async rebuildPriceHistory() {
       const history = [];
       history.push({ timestamp: new Date(config.blockchain.genesis_date).getTime(), price: config.blockchain.starting_price });
@@ -433,7 +428,8 @@ class DataChain {
 
     if (!transactions || transactions.length === 0) return false;
 
-    if (transactions.length === 1 && transactions[0].type === "MINT" && transactions[0].amount === 6000000000) {
+    // Supports the 12B Upgrade Minting
+    if (transactions.length === 1 && transactions[0].type === "MINT" && transactions[0].amount === 12000000000) {
         if (this.blockCount > 0 && this.chain[0].index === 0) return true;
     }
 

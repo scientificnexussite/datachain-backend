@@ -308,7 +308,6 @@ app.post('/positions/:uid', requireWeb3Auth, async (req, res) => {
     res.json({ positions: positionsArr });
 });
 
-// BUG FIX: MOVED /cancel ENDPOINT ABOVE /:uid WILDCARD ENDPOINT TO PREVENT ROUTE SHADOWING
 app.post('/api/orders/cancel', requireWeb3Auth, async (req, res) => {
     try {
         const { orderId, tokenSymbol = "SYR" } = req.body;
@@ -622,27 +621,35 @@ app.post('/verify-website', txLimiter, requireWeb3Auth, async (req, res) => {
     }
 });
 
+// ENTERPRISE FIX: Deployment Fee converted to dynamic SilverCash Peg, Ticker Squatting Blacklist Enabled
 app.post('/mint-new-cash', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const { ticker, supply, platformType, description } = req.body;
         const uid = req.user.uid;
 
         const parsedSupply = parseFloat(supply);
-        if (isNaN(parsedSupply) || parsedSupply <= 0 || parsedSupply > 1000000000) return res.status(400).json({ error: "Invalid supply parameter. Maximum supply is 1,000,000,000." });
+        if (isNaN(parsedSupply) || parsedSupply <= 0 || parsedSupply > 100000000000) return res.status(400).json({ error: "Invalid supply parameter." });
 
         if (!ticker || typeof ticker !== 'string' || ticker.length > 10) return res.status(400).json({ error: "Invalid ticker string parameters." });
         const customTicker = ticker.toUpperCase();
 
-        const RESERVED = ['SYR', 'SYSTEM', 'USD', 'MINT', 'PAYPAL', 'GATEWAY', 'NEXUS', 'SILVERCASH'];
-        if (RESERVED.includes(customTicker)) return res.status(400).json({ error: "Ticker uses a reserved network identifier." });
+        const RESERVED = [
+            'SYR', 'SYSTEM', 'USD', 'MINT', 'PAYPAL', 'GATEWAY', 'NEXUS', 'SILVERCASH', 
+            'BTC', 'ETH', 'USDT', 'SOL', 'BNB', 'XRP', 'USDC', 'ADA', 'AVAX', 'DOGE', 
+            'APPLE', 'AAPL', 'TSLA', 'TESLA', 'GOOGL', 'AMZN', 'META', 'MSFT'
+        ];
+        if (RESERVED.includes(customTicker)) return res.status(400).json({ error: "Ticker uses a reserved network identifier or blacklisted global asset name." });
 
         if (nexusChain.state.balances[customTicker] && Object.keys(nexusChain.state.balances[customTicker]).length > 0) return res.status(400).json({ error: "This ticker already exists." });
         if (menuBook.hasMintLock(uid)) return res.status(400).json({ error: "You already have a minting transaction pending." });
 
-        const deployFee = 100;
-        if ((nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, "SYR") - mempool.getPendingUsdSpend(uid)) < deployFee) return res.status(400).json({ error: `Deploying costs $${deployFee} USD. Insufficient funds.` });
+        const deployFeeUsd = 1.00;
+        const deployFeeSyr = parseFloat((deployFeeUsd / currentPrice).toFixed(8));
 
-        await mempool.addTransaction({ from: uid, to: "system", amount: deployFee, type: 'USD_WITHDRAWAL', timestamp: Date.now(), isSystemGenerated: true });
+        const availableSyr = nexusChain.getBalance(uid, "SYR") - menuBook.getLockedToken(uid, "SYR") - mempool.getPendingTokenSpend(uid, "SYR");
+        if (availableSyr < deployFeeSyr) return res.status(400).json({ error: `Deploying custom assets natively costs $1.00 USD worth of SYR. Insufficient balance (${deployFeeSyr} SYR required).` });
+
+        await mempool.addTransaction({ from: uid, to: "system", amount: deployFeeSyr, type: 'TRANSFER', tokenSymbol: "SYR", timestamp: Date.now(), isSystemGenerated: true });
         
         await mempool.addTransaction({ 
             from: "system", 
@@ -652,12 +659,12 @@ app.post('/mint-new-cash', txLimiter, requireWeb3Auth, async (req, res) => {
             tokenSymbol: customTicker, 
             platformType: platformType || 'website',
             description: description || '',
-            timestamp: Date.now(), 
+            timestamp: Date.now() + 10, 
             isSystemGenerated: true 
         });
         
         menuBook.addMintLock(uid);
-        res.status(201).json({ message: `Successfully minted ${parsedSupply} ${customTicker} on the Syrpts Network!`, ticker: customTicker });
+        res.status(201).json({ message: `Successfully minted ${parsedSupply} ${customTicker} on the Syrpts Network! Gas fee paid: ${deployFeeSyr} SYR`, ticker: customTicker });
     } catch (err) { res.status(500).json({ error: "Internal Server Error" }); }
 });
 

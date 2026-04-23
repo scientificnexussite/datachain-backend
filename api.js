@@ -583,6 +583,22 @@ app.post('/register-website', txLimiter, requireWeb3Auth, (req, res) => {
 app.post('/verify-website', txLimiter, requireWeb3Auth, async (req, res) => {
     const { websiteUrl } = req.body;
     const uid = req.user.uid;
+    
+    try {
+        const parsedUrl = new URL(websiteUrl);
+        if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+            return res.status(400).json({ error: "Invalid protocol specified." });
+        }
+        
+        const hostname = parsedUrl.hostname;
+        const isLocal = /^(localhost|127\.0\.0\.1|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|0\.0\.0\.0|::1)/.test(hostname);
+        if (isLocal || hostname.includes('railway.internal')) {
+            return res.status(400).json({ error: "Internal IP addresses and local networks are strictly prohibited." });
+        }
+    } catch(e) {
+        return res.status(400).json({ error: "Malformed URL provided." });
+    }
+
     const record = pendingVerifications.get(uid + websiteUrl);
 
     try {
@@ -621,7 +637,7 @@ app.post('/verify-website', txLimiter, requireWeb3Auth, async (req, res) => {
     }
 });
 
-// ENTERPRISE FIX: Deployment Fee converted to dynamic SilverCash Peg, Ticker Squatting Blacklist Enabled
+// ENTERPRISE FIX: Deployment Fee converted to dynamic SilverCash Peg, Ticker Squatting Blacklist Secured
 app.post('/mint-new-cash', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const { ticker, supply, platformType, description } = req.body;
@@ -634,11 +650,9 @@ app.post('/mint-new-cash', txLimiter, requireWeb3Auth, async (req, res) => {
         const customTicker = ticker.toUpperCase();
 
         const RESERVED = [
-            'SYR', 'SYSTEM', 'USD', 'MINT', 'PAYPAL', 'GATEWAY', 'NEXUS', 'SILVERCASH', 
-            'BTC', 'ETH', 'USDT', 'SOL', 'BNB', 'XRP', 'USDC', 'ADA', 'AVAX', 'DOGE', 
-            'APPLE', 'AAPL', 'TSLA', 'TESLA', 'GOOGL', 'AMZN', 'META', 'MSFT'
+            'SYR', 'SYSTEM', 'USD', 'PAYPAL', 'GATEWAY', 'NEXUS'
         ];
-        if (RESERVED.includes(customTicker)) return res.status(400).json({ error: "Ticker uses a reserved network identifier or blacklisted global asset name." });
+        if (RESERVED.includes(customTicker)) return res.status(400).json({ error: "Ticker utilizes a reserved network identifier." });
 
         if (nexusChain.state.balances[customTicker] && Object.keys(nexusChain.state.balances[customTicker]).length > 0) return res.status(400).json({ error: "This ticker already exists." });
         if (menuBook.hasMintLock(uid)) return res.status(400).json({ error: "You already have a minting transaction pending." });

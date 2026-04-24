@@ -1,7 +1,6 @@
 import { createLibp2p } from 'libp2p';
 import chalk from 'chalk';
 
-// Professional Fix: Use wildcard imports to bypass ESM/CommonJS named export conflicts
 import * as tcpPkg from '@libp2p/tcp';
 const tcp = tcpPkg.tcp || tcpPkg.default || tcpPkg;
 
@@ -20,7 +19,6 @@ const createNode = async () => {
         transports: [tcp()],
         streamMuxers: [mplex()],
         connectionEncryption: [noise()]
-        // MDNS Peer Discovery removed to save CPU execution hours on Railway Hobby Plan
       });
 
       await node.start();
@@ -42,5 +40,4 @@ const createNode = async () => {
   }
 };
 
-// Start the node immediately on launch as required by api.js
 createNode();

@@ -1,15 +1,6 @@
 import chalk from 'chalk';
 import crypto from 'crypto';
-import pkg from 'pg';
-
-const { Pool } = pkg;
-// ENTERPRISE FIX: Pool configured for high traffic with 200 max connections
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    max: 200,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 10000
-});
+import pool from './db.js'; // Issue #3 Fixed
 
 pool.query(`
     CREATE TABLE IF NOT EXISTS mempool_store (
@@ -46,8 +37,6 @@ class Mempool {
       return false;
     }
 
-    // ENTERPRISE FIX: Replay Attack Prevention
-    // Ensure this exact signed transaction hasn't already been mined in a historical block
     if (tx.signature && tx.signature !== 'sys') {
         try {
             const dbCheck = await pool.query('SELECT 1 FROM transactions WHERE signature = $1 LIMIT 1', [tx.signature]);
@@ -69,7 +58,6 @@ class Mempool {
 
     this.pendingTransactions.push(tx);
     
-    // Write to postgres to prevent RAM loss during server restarts
     pool.query('INSERT INTO mempool_store (hash, tx_data) VALUES ($1, $2) ON CONFLICT DO NOTHING', [txHash, tx]).catch(()=>{});
 
     console.log(chalk.magenta(`[MEMPOOL] Transaction Added. Total Pending: ${this.pendingTransactions.length}`));

@@ -7,7 +7,7 @@ import rateLimit from 'express-rate-limit';
 import crypto from 'crypto'; 
 import fs from 'fs';
 import path from 'path';
-import pkg from 'pg';
+import pool from './db.js'; // Issue #3 Fixed
 import mempool from './mempool.js';
 import { DataChain } from './datachain.js';
 import validator from './validator.js';
@@ -18,14 +18,6 @@ import config from './config.json' with { type: "json" };
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
 const PAYPAL_API_BASE = "https://api-m.paypal.com";
-
-const { Pool } = pkg;
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    max: 200,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 10000
-});
 
 pool.query(`
     CREATE TABLE IF NOT EXISTS api_state (
@@ -48,12 +40,14 @@ const allowedOrigins = [
     'https://scientific-nexus-data-chain.vercel.app', 
     'https://syrpts-terminal.vercel.app'
 ];
+
+// Issue #1 Fixed: Strict CORS Enforcement
 app.use(cors({
     origin: function (origin, callback) {
         if (!origin || allowedOrigins.includes(origin)) {
             callback(null, true);
         } else {
-            callback(null, true); 
+            callback(new Error('Not allowed by CORS'));
         }
     },
     methods: ['GET', 'POST', 'OPTIONS'],
@@ -223,8 +217,12 @@ app.get('/network', (req, res) => {
     res.json(apiCache.network.data); 
 });
 
+// Issue #5 Fixed: Pagination for price history
 app.get('/pricehistory', (req, res) => {
-    res.json(nexusChain.priceHistoryCache);
+    const limit = parseInt(req.query.limit) || 500;
+    const offset = parseInt(req.query.offset) || 0;
+    const paginated = nexusChain.priceHistoryCache.slice(offset, offset + limit);
+    res.json(paginated);
 });
 
 app.get('/api/chart/kline', async (req, res) => {
@@ -637,7 +635,6 @@ app.post('/verify-website', txLimiter, requireWeb3Auth, async (req, res) => {
     }
 });
 
-// ENTERPRISE FIX: Deployment Fee converted to dynamic SilverCash Peg, Ticker Squatting Blacklist Secured
 app.post('/mint-new-cash', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const { ticker, supply, platformType, description } = req.body;
@@ -689,10 +686,11 @@ app.post('/usd/balance/:uid', requireWeb3Auth, (req, res) => {
     res.json({ address: req.params.uid, balance: totalUsd - lockedUsd, total: totalUsd, locked: lockedUsd });
 });
 
+// Issue #13 Fixed: Minimum deposit reduced from 10 to 1
 app.post('/create-paypal-order', requireWeb3Auth, async (req, res) => {
     try {
         const amount = parseFloat(req.body.amount);
-        if (isNaN(amount) || amount < 10 || amount > 10000) return res.status(400).json({ error: "Invalid amount" }); 
+        if (isNaN(amount) || amount < 1 || amount > 10000) return res.status(400).json({ error: "Invalid amount" }); 
         const accessToken = await getPayPalAccessToken();
         const response = await fetch(`${PAYPAL_API_BASE}/v2/checkout/orders`, {
             method: "POST",
@@ -732,6 +730,7 @@ app.post('/capture-paypal-order', requireWeb3Auth, async (req, res) => {
     } catch (error) { res.status(500).json({ error: "[Sys-err] Payment system offline. Capture failed." }); }
 });
 
+// Issue #2 Fixed: Withdraw silent failure fixed to return 503 and prevent mempool burn
 app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
     try {
         const { uid, amount, paypalEmail } = req.body;
@@ -753,13 +752,16 @@ app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
                 })
             });
             const payoutData = await payoutRes.json();
+            
             if (!payoutRes.ok) throw new Error(payoutData.message || "Payout rejected by PayPal");
-        } catch (paypalErr) {
-            console.log(chalk.yellow("[PAYPAL PAYOUT DEFERRED] Attempted to process real payout, but system lacks live Payout REST credentials. Proceeding to mempool insertion natively."));
-        }
 
-        await mempool.addTransaction({ from: uid, to: "paypal-gateway", amount: amount, type: 'USD_WITHDRAWAL', timestamp: Date.now() });
-        res.json({ success: true, message: "Withdrawal processed and dispatched." });
+            await mempool.addTransaction({ from: uid, to: "paypal-gateway", amount: amount, type: 'USD_WITHDRAWAL', timestamp: Date.now() });
+            res.json({ success: true, message: "Withdrawal processed and dispatched." });
+            
+        } catch (paypalErr) {
+            console.log(chalk.red("[PAYPAL PAYOUT FAILED] " + paypalErr.message));
+            return res.status(503).json({ error: "Payout service unavailable. Funds not deducted." });
+        }
     } catch (err) { res.status(500).json({ error: "Internal Server Error" }); }
 });
 

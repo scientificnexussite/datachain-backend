@@ -5,15 +5,8 @@ import chalk from 'chalk';
 import validator from './validator.js';
 import State from './state.js';
 import config from './config.json' with { type: "json" };
-import pkg from 'pg';
-
-const { Pool } = pkg;
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    max: 200,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 10000
-});
+import pool from './db.js'; // Issue #3 Fixed
+import { Worker } from 'worker_threads'; // Issue #14 Fixed
 
 pool.query(`
     CREATE TABLE IF NOT EXISTS blocks (
@@ -57,21 +50,30 @@ class Block {
     ).toString();
   }
 
+  // Issue #14 Fixed: Worker Thread implementation replaces synchronous blocking loop
   mineBlock(difficulty) {
-    return new Promise((resolve) => {
-      const target = Array(difficulty + 1).join("0");
-      const mineChunk = () => {
-        for (let i = 0; i < 250; i++) {
-          if (this.hash.substring(0, difficulty) === target) {
+    return new Promise((resolve, reject) => {
+        const worker = new Worker('./mine-worker.js', {
+            workerData: {
+                index: this.index,
+                previousHash: this.previousHash,
+                timestamp: this.timestamp,
+                data: this.data,
+                difficulty: difficulty
+            }
+        });
+        
+        worker.on('message', (result) => {
+            this.nonce = result.nonce;
+            this.hash = result.hash;
             console.log(chalk.cyan(`[DATACHAIN] Block Mined: ${this.hash}`));
-            return resolve(true);
-          }
-          this.nonce++;
-          this.hash = this.calculateHash();
-        }
-        setImmediate(mineChunk); 
-      };
-      mineChunk();
+            resolve(true);
+        });
+        
+        worker.on('error', reject);
+        worker.on('exit', (code) => {
+            if (code !== 0) reject(new Error(`Worker stopped with exit code ${code}`));
+        });
     });
   }
 }
@@ -177,14 +179,22 @@ class DataChain {
     await this.executeHardForkAmnesty();
   }
 
+  // Issue #6 Fixed: PoW Validation added during P2P chain resolution
   async resolveConflict(newBlocks) {
       if (newBlocks.length <= this.blockCount) {
           console.log(chalk.yellow('[NETWORK] Received chain is not longer than current chain. Rejecting fork.'));
           return false;
       }
+      
+      const target = Array(this.difficulty + 1).join("0");
       for(let i=1; i<newBlocks.length; i++) {
           if(newBlocks[i].previousHash !== newBlocks[i-1].hash) return false;
+          if(newBlocks[i].hash.substring(0, this.difficulty) !== target) {
+              console.log(chalk.red('[NETWORK] Rejecting fork: Received block fails PoW difficulty threshold.'));
+              return false;
+          }
       }
+      
       console.log(chalk.green.bold('[NETWORK] Chain Reorganization Triggered! Adopting longest P2P chain.'));
       this.chain = newBlocks;
       this.blockCount = newBlocks.length;
@@ -340,7 +350,6 @@ class DataChain {
       }
   }
 
-  // ENTERPRISE UPGRADE: 12 Billion Math Extension guarantees supply math won't break
   getRemainingSupply(tokenSymbol = "SYR") {
     if (tokenSymbol !== "SYR") return 0;
     
@@ -428,7 +437,6 @@ class DataChain {
 
     if (!transactions || transactions.length === 0) return false;
 
-    // Supports the 12B Upgrade Minting
     if (transactions.length === 1 && transactions[0].type === "MINT" && transactions[0].amount === 12000000000) {
         if (this.blockCount > 0 && this.chain[0].index === 0) return true;
     }

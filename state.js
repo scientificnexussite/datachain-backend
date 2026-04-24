@@ -1,17 +1,9 @@
-import pkg from 'pg';
 import chalk from 'chalk';
 import fs from 'fs';
 import path from 'path';
+import pool from './db.js'; // Issue #3 Fixed
 
-const { Pool } = pkg;
 const fixDust = (num) => Number(Number(num).toFixed(8));
-
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    max: 200,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 10000
-});
 
 pool.query(`
     CREATE TABLE IF NOT EXISTS state_meta (
@@ -153,8 +145,6 @@ class State {
         }
         console.log(chalk.green(`[STATE] PostgreSQL Snapshot loaded successfully.`));
     } catch (e) {
-        // ENTERPRISE FIX: OOM Memory Protection
-        // Pull transactions dynamically from Postgres instead of loading 5,000,000 blocks into RAM
         console.log(chalk.yellow("[STATE] Database state empty or missing. Rebuilding ledger mathematically from DB Transactions..."));
         this.balances = { "SYR": {} };
         this.usd_balances = {};
@@ -182,6 +172,7 @@ class State {
     }
   }
 
+  // Issue #4 Fixed: High Performance Bulk Upsert prevents DB locks
   async saveSnapshot(lastIndex) {
       if (this.isSaving) {
           this.saveQueue = true;
@@ -205,26 +196,43 @@ class State {
           
           await client.query('INSERT INTO state_meta (id, last_index) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET last_index = $1', [lastIndex]);
           
-          for (const address in this.usd_balances) {
+          const usdAddresses = Object.keys(this.usd_balances);
+          const usdBalances = Object.values(this.usd_balances);
+          
+          if (usdAddresses.length > 0) {
               await client.query(
-                  'INSERT INTO state_usd_balances (address, balance) VALUES ($1, $2) ON CONFLICT (address) DO UPDATE SET balance = $2',
-                  [address, this.usd_balances[address]]
+                  `INSERT INTO state_usd_balances (address, balance)
+                   SELECT * FROM UNNEST($1::varchar[], $2::float8[])
+                   ON CONFLICT (address) DO UPDATE SET balance = EXCLUDED.balance`,
+                  [usdAddresses, usdBalances]
               );
           }
 
+          const balAddresses = [];
+          const balTokens = [];
+          const balAmounts = [];
+          
           for (const tokenSymbol in this.balances) {
               for (const address in this.balances[tokenSymbol]) {
-                  await client.query(
-                      'INSERT INTO state_balances (address, token_symbol, balance) VALUES ($1, $2, $3) ON CONFLICT (address, token_symbol) DO UPDATE SET balance = $3',
-                      [address, tokenSymbol, this.balances[tokenSymbol][address]]
-                  );
+                  balAddresses.push(address);
+                  balTokens.push(tokenSymbol);
+                  balAmounts.push(this.balances[tokenSymbol][address]);
               }
+          }
+
+          if (balAddresses.length > 0) {
+              await client.query(
+                  `INSERT INTO state_balances (address, token_symbol, balance)
+                   SELECT * FROM UNNEST($1::varchar[], $2::varchar[], $3::float8[])
+                   ON CONFLICT (address, token_symbol) DO UPDATE SET balance = EXCLUDED.balance`,
+                  [balAddresses, balTokens, balAmounts]
+              );
           }
           
           await client.query('COMMIT');
       } catch (e) {
           await client.query('ROLLBACK');
-          console.error(chalk.red("[STATE] PostgreSQL Snapshot save failed:"), e);
+          console.error(chalk.red("[STATE] PostgreSQL Snapshot bulk upsert failed:"), e);
       } finally {
           client.release();
           this.isSaving = false;

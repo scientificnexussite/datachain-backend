@@ -1,16 +1,9 @@
 import chalk from 'chalk';
 import fs from 'fs';
 import path from 'path';
-import pkg from 'pg';
+import pool from './db.js'; // Issue #3 Fixed
 
-const { Pool } = pkg;
-// ENTERPRISE FIX: Pool scaled for 200 Max Connections
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    max: 200,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 10000
-});
+const fixDust = (num) => Number(num.toFixed(8));
 
 pool.query(`
     CREATE TABLE IF NOT EXISTS menubook_store (
@@ -18,8 +11,6 @@ pool.query(`
         data JSONB
     );
 `).catch(err => console.error(chalk.red("[DB] Menubook init failed"), err));
-
-const fixDust = (num) => Number(num.toFixed(8));
 
 class MenuBook {
   constructor() {

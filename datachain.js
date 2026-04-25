@@ -1,12 +1,24 @@
 import fs from 'fs';
-import path from 'path';
+import path, { dirname, join } from 'path';
+import { fileURLToPath } from 'url';
 import CryptoJS from 'crypto-js';
 import chalk from 'chalk';
 import validator from './validator.js';
 import State from './state.js';
 import config from './config.json' with { type: "json" };
-import pool from './db.js'; // Issue #3 Fixed
-import { Worker } from 'worker_threads'; // Issue #14 Fixed
+import pkg from 'pg';
+import { Worker } from 'worker_threads'; 
+
+// FIX 5: Determine correct absolute path for Worker thread resolution
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+const { Pool } = pkg;
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    max: 200,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000
+});
 
 pool.query(`
     CREATE TABLE IF NOT EXISTS blocks (
@@ -50,10 +62,10 @@ class Block {
     ).toString();
   }
 
-  // Issue #14 Fixed: Worker Thread implementation replaces synchronous blocking loop
   mineBlock(difficulty) {
     return new Promise((resolve, reject) => {
-        const worker = new Worker('./mine-worker.js', {
+        // FIX 5: Uses exact absolute path to prevent dynamic Worker crash
+        const worker = new Worker(join(__dirname, 'mine-worker.js'), {
             workerData: {
                 index: this.index,
                 previousHash: this.previousHash,
@@ -179,7 +191,6 @@ class DataChain {
     await this.executeHardForkAmnesty();
   }
 
-  // Issue #6 Fixed: PoW Validation added during P2P chain resolution
   async resolveConflict(newBlocks) {
       if (newBlocks.length <= this.blockCount) {
           console.log(chalk.yellow('[NETWORK] Received chain is not longer than current chain. Rejecting fork.'));

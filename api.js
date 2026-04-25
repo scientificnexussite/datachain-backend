@@ -7,7 +7,7 @@ import rateLimit from 'express-rate-limit';
 import crypto from 'crypto'; 
 import fs from 'fs';
 import path from 'path';
-import pool from './db.js'; // Issue #3 Fixed
+import pkg from 'pg';
 import mempool from './mempool.js';
 import { DataChain } from './datachain.js';
 import validator from './validator.js';
@@ -18,6 +18,14 @@ import config from './config.json' with { type: "json" };
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
 const PAYPAL_API_BASE = "https://api-m.paypal.com";
+
+const { Pool } = pkg;
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    max: 20, 
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 10000
+});
 
 pool.query(`
     CREATE TABLE IF NOT EXISTS api_state (
@@ -41,7 +49,6 @@ const allowedOrigins = [
     'https://syrpts-terminal.vercel.app'
 ];
 
-// Issue #1 Fixed: Strict CORS Enforcement
 app.use(cors({
     origin: function (origin, callback) {
         if (!origin || allowedOrigins.includes(origin)) {
@@ -217,7 +224,6 @@ app.get('/network', (req, res) => {
     res.json(apiCache.network.data); 
 });
 
-// Issue #5 Fixed: Pagination for price history
 app.get('/pricehistory', (req, res) => {
     const limit = parseInt(req.query.limit) || 500;
     const offset = parseInt(req.query.offset) || 0;
@@ -686,7 +692,6 @@ app.post('/usd/balance/:uid', requireWeb3Auth, (req, res) => {
     res.json({ address: req.params.uid, balance: totalUsd - lockedUsd, total: totalUsd, locked: lockedUsd });
 });
 
-// Issue #13 Fixed: Minimum deposit reduced from 10 to 1
 app.post('/create-paypal-order', requireWeb3Auth, async (req, res) => {
     try {
         const amount = parseFloat(req.body.amount);
@@ -730,12 +735,14 @@ app.post('/capture-paypal-order', requireWeb3Auth, async (req, res) => {
     } catch (error) { res.status(500).json({ error: "[Sys-err] Payment system offline. Capture failed." }); }
 });
 
-// Issue #2 Fixed: Withdraw silent failure fixed to return 503 and prevent mempool burn
 app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
     try {
         const { uid, amount, paypalEmail } = req.body;
         if (uid !== req.user.uid) return res.status(403).json({ error: "Forbidden" });
-        if (typeof amount !== 'number' || amount < 10) return res.status(400).json({ error: "Invalid withdrawal amount." });
+        
+        // FIX 6: Ensure minimum withdrawal is $1 and cap at $5000
+        if (typeof amount !== 'number' || amount < 1) return res.status(400).json({ error: "Invalid withdrawal amount. Minimum is $1." });
+        if (amount > 5000) return res.status(400).json({ error: "Max single withdrawal is $5000." });
         
         if (!paypalEmail || !paypalEmail.includes('@')) return res.status(400).json({ error: "Valid PayPal email is required to process withdrawals." });
         
@@ -767,6 +774,7 @@ app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
 
 app.use((req, res) => { res.status(404).json({ error: "API Node Endpoint Not Found" }); });
 
+// FIX 1: Startup Keep-Alive and SIGTERM logic
 (async () => {
     console.log(chalk.blue("Initializing PostgreSQL API States..."));
     await loadApiState();
@@ -787,5 +795,20 @@ app.use((req, res) => { res.status(404).json({ error: "API Node Endpoint Not Fou
     
     app.listen(port, "0.0.0.0", () => { 
         console.log(chalk.blue.bold(`--- SCIENTIFIC NEXUS API RUNNING ON PORT ${port} ---`)); 
+        
+        // Railway Keep-Alive Fix: Ping server to prevent idle spin-down
+        setInterval(() => {
+            fetch(`http://localhost:${port}/health`).catch(() => {});
+        }, 14 * 60 * 1000);
+    });
+
+    // Railway SIGTERM Fix: Ensure clean shutdown
+    process.on('SIGTERM', () => {
+        console.log(chalk.yellow.bold("[SYSTEM] SIGTERM received. Shutting down gracefully..."));
+        isMining = false; // Halt mining thread creation
+        setTimeout(() => {
+            console.log(chalk.yellow("[SYSTEM] Process exited cleanly."));
+            process.exit(0);
+        }, 2000);
     });
 })();

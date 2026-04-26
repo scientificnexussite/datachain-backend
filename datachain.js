@@ -6,19 +6,10 @@ import chalk from 'chalk';
 import validator from './validator.js';
 import State from './state.js';
 import config from './config.json' with { type: "json" };
-import pkg from 'pg';
+import pool from './db.js'; // BUG 1 FIXED: Shared connection pool
 import { Worker } from 'worker_threads'; 
 
-// FIX 5: Determine correct absolute path for Worker thread resolution
 const __dirname = dirname(fileURLToPath(import.meta.url));
-
-const { Pool } = pkg;
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    max: 200,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 10000
-});
 
 pool.query(`
     CREATE TABLE IF NOT EXISTS blocks (
@@ -64,7 +55,6 @@ class Block {
 
   mineBlock(difficulty) {
     return new Promise((resolve, reject) => {
-        // FIX 5: Uses exact absolute path to prevent dynamic Worker crash
         const worker = new Worker(join(__dirname, 'mine-worker.js'), {
             workerData: {
                 index: this.index,

@@ -7,7 +7,7 @@ import rateLimit from 'express-rate-limit';
 import crypto from 'crypto'; 
 import fs from 'fs';
 import path from 'path';
-import pkg from 'pg';
+import pool from './db.js'; // BUG 1 FIXED: Shared connection pool
 import mempool from './mempool.js';
 import { DataChain } from './datachain.js';
 import validator from './validator.js';
@@ -18,14 +18,6 @@ import config from './config.json' with { type: "json" };
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
 const PAYPAL_API_BASE = "https://api-m.paypal.com";
-
-const { Pool } = pkg;
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    max: 20, 
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 10000
-});
 
 pool.query(`
     CREATE TABLE IF NOT EXISTS api_state (
@@ -63,10 +55,11 @@ app.use(cors({
 
 app.use(bodyParser.json({ limit: '100kb' })); 
 
+// BUG 5 FIXED: Rate limiter now strictly relies on untamperable IP addresses
 const txLimiter = rateLimit({
     windowMs: 60 * 1000, 
     max: 50, 
-    keyGenerator: (req) => req.body?.uid || req.ip,
+    keyGenerator: (req) => req.ip,
     message: { error: "Too many transactions submitted. Please try again later." }
 });
 
@@ -127,7 +120,7 @@ let currentPrice = config.blockchain.starting_price;
 const apiCache = {
     stats: { data: null, time: 0 },
     network: { data: null, time: 0 },
-    menubook: { data: null, time: 0 }
+    menubook: new Map() // BUG 2 FIXED: Token-specific caching
 };
 const CACHE_TTL = 2000;
 
@@ -175,7 +168,7 @@ async function updateMarketEconomics() {
 
         apiCache.stats.time = 0;
         apiCache.network.time = 0;
-        apiCache.menubook.time = 0;
+        apiCache.menubook.clear();
     } catch (e) {
         console.error(chalk.red("[ECONOMICS ERROR]"), e);
     }
@@ -209,12 +202,28 @@ setInterval(async () => {
 app.get('/health', (req, res) => { res.json({ status: 'alive', chainLength: nexusChain.blockCount, timestamp: Date.now() }); });
 app.get('/config', (req, res) => { res.json({ paypalClientId: PAYPAL_CLIENT_ID }); });
 
+// BUG 2 FIXED: Dynamic parameter reading for /menubook
 app.get('/menubook', async (req, res) => { 
+    const token = req.query.token || "SYR";
     await menuBook.ensureLoaded();
-    if (Date.now() - apiCache.menubook.time < CACHE_TTL && apiCache.menubook.data) return res.json(apiCache.menubook.data);
-    apiCache.menubook.data = { bids: menuBook.books["SYR"]?.bids || [], asks: menuBook.books["SYR"]?.asks || [], marketData: menuBook.getSpread("SYR") };
-    apiCache.menubook.time = Date.now();
-    res.json(apiCache.menubook.data); 
+    const now = Date.now();
+    const cached = apiCache.menubook.get(token);
+    
+    if (cached && (now - cached.time < CACHE_TTL)) {
+        return res.json(cached.data);
+    }
+    
+    const book = menuBook.books[token];
+    const data = book ? {
+        bids: book.bids || [],
+        asks: book.asks || [],
+        marketData: menuBook.getSpread(token)
+    } : {
+        bids: [], asks: [], marketData: { highestBid: 0, lowestAsk: 0, spread: 0, lastTradePrice: 0 }
+    };
+    
+    apiCache.menubook.set(token, { data, time: now });
+    res.json(data); 
 });
 
 app.get('/network', (req, res) => { 
@@ -224,11 +233,34 @@ app.get('/network', (req, res) => {
     res.json(apiCache.network.data); 
 });
 
-app.get('/pricehistory', (req, res) => {
+// BUG 3 FIXED: Dynamic price history for custom deployed tokens
+app.get('/pricehistory', async (req, res) => {
     const limit = parseInt(req.query.limit) || 500;
     const offset = parseInt(req.query.offset) || 0;
-    const paginated = nexusChain.priceHistoryCache.slice(offset, offset + limit);
-    res.json(paginated);
+    const token = req.query.token || "SYR";
+
+    if (token === "SYR") {
+        const paginated = nexusChain.priceHistoryCache.slice(offset, offset + limit);
+        return res.json(paginated);
+    } else {
+        try {
+            const query = `
+                SELECT timestamp_ms as time, (amount_usd / amount) as price
+                FROM transactions
+                WHERE token_symbol = $1 AND type = 'MARKET_TRADE' AND amount > 0 AND amount_usd > 0
+                ORDER BY timestamp_ms ASC
+                LIMIT $2 OFFSET $3
+            `;
+            const dbRes = await pool.query(query, [token, limit, offset]);
+            const formatted = dbRes.rows.map(r => ({
+                time: parseInt(r.time),
+                price: parseFloat(r.price)
+            }));
+            return res.json(formatted);
+        } catch(e) {
+            return res.json([]);
+        }
+    }
 });
 
 app.get('/api/chart/kline', async (req, res) => {
@@ -263,18 +295,43 @@ app.get('/api/chart/kline', async (req, res) => {
     }
 });
 
-app.get('/tokens', (req, res) => {
-    const tokens = Object.keys(nexusChain.state.balances).map(ticker => {
-        let totalCirculating = 0;
-        for (const address in nexusChain.state.balances[ticker]) {
-            if (address !== 'system') {
-                totalCirculating += nexusChain.state.balances[ticker][address];
+// BUG 6 FIXED: Extended metadata mapped dynamically to tokens
+app.get('/tokens', async (req, res) => {
+    try {
+        const tokensObj = Object.keys(nexusChain.state.balances);
+        const tokenPromises = tokensObj.map(async (ticker) => {
+            let totalCirculating = 0;
+            for (const address in nexusChain.state.balances[ticker]) {
+                if (address !== 'system') {
+                    totalCirculating += nexusChain.state.balances[ticker][address];
+                }
             }
-        }
-        const supply = ticker === 'SYR' ? (MAX_SUPPLY - nexusChain.getRemainingSupply('SYR')) : totalCirculating;
-        return { ticker, supply };
-    });
-    res.json(tokens);
+            const supply = ticker === 'SYR' ? (MAX_SUPPLY - nexusChain.getRemainingSupply('SYR')) : totalCirculating;
+            const lastPrice = menuBook.books[ticker]?.lastTradePrice || 0;
+
+            let description = "";
+            let platformType = "";
+            let owner = "";
+
+            if (ticker !== 'SYR') {
+                try {
+                    const dbRes = await pool.query(`SELECT description, platform_type, to_address FROM transactions WHERE token_symbol = $1 AND type = 'MINT' LIMIT 1`, [ticker]);
+                    if (dbRes.rows.length > 0) {
+                        description = dbRes.rows[0].description || "";
+                        platformType = dbRes.rows[0].platform_type || "";
+                        owner = dbRes.rows[0].to_address || "";
+                    }
+                } catch(e) {}
+            }
+
+            return { ticker, supply, lastPrice, description, platformType, owner };
+        });
+
+        const tokens = await Promise.all(tokenPromises);
+        res.json(tokens);
+    } catch(e) {
+        res.status(500).json({error: "Failed to fetch tokens"});
+    }
 });
 
 app.post('/positions/:uid', requireWeb3Auth, async (req, res) => {
@@ -329,9 +386,11 @@ app.post('/api/orders/cancel', requireWeb3Auth, async (req, res) => {
     } catch (err) { res.status(500).json({ error: "Failed to cancel order." }); }
 });
 
+// BUG 4 FIXED: Resolving dynamic token bounds for limit order history
 app.post('/api/orders/:uid', requireWeb3Auth, (req, res) => {
     if (req.user.uid !== req.params.uid) return res.status(403).json({ error: "Forbidden" });
-    res.json(menuBook.getUserOrders(req.params.uid, "SYR"));
+    const { tokenSymbol = "SYR" } = req.body;
+    res.json(menuBook.getUserOrders(req.params.uid, tokenSymbol));
 });
 
 app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
@@ -495,6 +554,42 @@ app.get('/blocks', async (req, res) => {
     }
 });
 
+// NEW FEATURE 1: Per-Address Public Ledger History Endpoint
+app.get('/txhistory/:address', async (req, res) => {
+    try {
+        const address = req.params.address;
+        const token = req.query.token || 'SYR';
+        const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+        const offset = parseInt(req.query.offset) || 0;
+
+        const countRes = await pool.query(`SELECT COUNT(*) FROM transactions WHERE (from_address = $1 OR to_address = $1) AND token_symbol = $2`, [address, token]);
+        const total = parseInt(countRes.rows[0].count);
+
+        const txRes = await pool.query(`
+            SELECT from_address, to_address, amount, amount_usd, type, token_symbol, timestamp_ms, block_index
+            FROM transactions
+            WHERE (from_address = $1 OR to_address = $1) AND token_symbol = $2
+            ORDER BY timestamp_ms DESC
+            LIMIT $3 OFFSET $4
+        `, [address, token, limit, offset]);
+
+        const transactions = txRes.rows.map(tx => ({
+            from: tx.from_address,
+            to: tx.to_address,
+            amount: parseFloat(tx.amount),
+            amountUsd: parseFloat(tx.amount_usd),
+            type: tx.type,
+            tokenSymbol: tx.token_symbol,
+            timestamp: parseInt(tx.timestamp_ms),
+            blockIndex: tx.block_index
+        }));
+
+        res.json({ transactions, total, address, token });
+    } catch(e) {
+        res.status(500).json({ error: "Failed to fetch transaction history." });
+    }
+});
+
 app.get('/balance/:address', (req, res) => { 
     const token = req.query.token || "SYR";
     const totalSyr = nexusChain.getBalance(req.params.address, token);
@@ -651,6 +746,11 @@ app.post('/mint-new-cash', txLimiter, requireWeb3Auth, async (req, res) => {
 
         if (!ticker || typeof ticker !== 'string' || ticker.length > 10) return res.status(400).json({ error: "Invalid ticker string parameters." });
         const customTicker = ticker.toUpperCase();
+        
+        // BUG 7 FIXED: Strict Alphanumeric validation to prevent injection exploits
+        if (!/^[A-Z0-9]{1,10}$/.test(customTicker)) {
+            return res.status(400).json({ error: "Ticker must be 1-10 uppercase alphanumeric characters only." });
+        }
 
         const RESERVED = [
             'SYR', 'SYSTEM', 'USD', 'PAYPAL', 'GATEWAY', 'NEXUS'
@@ -740,7 +840,6 @@ app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
         const { uid, amount, paypalEmail } = req.body;
         if (uid !== req.user.uid) return res.status(403).json({ error: "Forbidden" });
         
-        // FIX 6: Ensure minimum withdrawal is $1 and cap at $5000
         if (typeof amount !== 'number' || amount < 1) return res.status(400).json({ error: "Invalid withdrawal amount. Minimum is $1." });
         if (amount > 5000) return res.status(400).json({ error: "Max single withdrawal is $5000." });
         
@@ -774,7 +873,6 @@ app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
 
 app.use((req, res) => { res.status(404).json({ error: "API Node Endpoint Not Found" }); });
 
-// FIX 1: Startup Keep-Alive and SIGTERM logic
 (async () => {
     console.log(chalk.blue("Initializing PostgreSQL API States..."));
     await loadApiState();
@@ -783,7 +881,13 @@ app.use((req, res) => { res.status(404).json({ error: "API Node Endpoint Not Fou
     
     if (nexusChain.isInitializing) { await nexusChain.isInitializing; }
     
-    currentPrice = await nexusChain.getLastMarketPrice(config.blockchain.starting_price);
+    await menuBook.ensureLoaded();
+
+    // CORE PRICE RESET FIX: Ensures the exact price is preserved securely through reboots
+    let savedMenuPrice = menuBook.books["SYR"]?.lastTradePrice;
+    let chainPrice = await nexusChain.getLastMarketPrice(config.blockchain.starting_price);
+    currentPrice = (savedMenuPrice && savedMenuPrice !== 0.01) ? savedMenuPrice : chainPrice;
+    
     await menuBook.setInitialPrice(currentPrice, "SYR");
     
     if (nexusChain.getBalance("system", "SYR") === 0 && nexusChain.blockCount <= 1) {
@@ -796,16 +900,14 @@ app.use((req, res) => { res.status(404).json({ error: "API Node Endpoint Not Fou
     app.listen(port, "0.0.0.0", () => { 
         console.log(chalk.blue.bold(`--- SCIENTIFIC NEXUS API RUNNING ON PORT ${port} ---`)); 
         
-        // Railway Keep-Alive Fix: Ping server to prevent idle spin-down
         setInterval(() => {
             fetch(`http://localhost:${port}/health`).catch(() => {});
         }, 14 * 60 * 1000);
     });
 
-    // Railway SIGTERM Fix: Ensure clean shutdown
     process.on('SIGTERM', () => {
         console.log(chalk.yellow.bold("[SYSTEM] SIGTERM received. Shutting down gracefully..."));
-        isMining = false; // Halt mining thread creation
+        isMining = false; 
         setTimeout(() => {
             console.log(chalk.yellow("[SYSTEM] Process exited cleanly."));
             process.exit(0);

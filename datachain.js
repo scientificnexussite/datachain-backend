@@ -6,7 +6,7 @@ import chalk from 'chalk';
 import validator from './validator.js';
 import State from './state.js';
 import config from './config.json' with { type: "json" };
-import pool from './db.js'; // BUG 1 FIXED: Shared connection pool
+import pool from './db.js'; 
 import { Worker } from 'worker_threads'; 
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -104,7 +104,6 @@ class DataChain {
         this.blockCount = parseInt(countRes.rows[0].count);
     } catch(e) {}
 
-    // MAIN POSTGRESQL LOAD
     if (this.blockCount > 0) {
         try {
             const blockRes = await pool.query('SELECT * FROM blocks ORDER BY index ASC');
@@ -148,7 +147,6 @@ class DataChain {
         }
     }
 
-    // JSON FALLBACK LOAD
     if (fs.existsSync(this.chainFile)) {
         try {
             const data = JSON.parse(fs.readFileSync(this.chainFile, 'utf8'));
@@ -170,7 +168,6 @@ class DataChain {
         } catch(e) {}
     }
 
-    // GENESIS LOAD
     console.warn(chalk.yellow("[DATACHAIN] Starting fresh chain from genesis."));
     this.chain = [this.createGenesisBlock()];
     this.blockCount = 1;

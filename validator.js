@@ -21,6 +21,10 @@ const rawToDer = (rawSigHex) => {
 };
 
 class Validator {
+  constructor() {
+    this.difficulty = 2;
+  }
+
   validateBlock(newBlock, previousBlock) {
     if (newBlock.previousHash !== previousBlock.hash) {
       console.log(chalk.red('[VALIDATOR] Error: Hash Link Broken.'));
@@ -32,6 +36,13 @@ class Validator {
       console.log(chalk.red('[VALIDATOR] Error: Data Tampering Detected.'));
       return false;
     }
+
+    const target = Array(this.difficulty + 1).join("0");
+    if (!newBlock.hash.startsWith(target)) {
+        console.log(chalk.red('[VALIDATOR] Error: Block hash does not meet difficulty target.'));
+        return false;
+    }
+
     return true;
   }
 

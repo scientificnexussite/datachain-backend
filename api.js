@@ -296,7 +296,6 @@ app.get('/tokens', async (req, res) => {
     try {
         const tokensObj = Object.keys(nexusChain.state.balances);
         
-        // BUG 3 FIXED: Optimized batched querying to prevent connection exhaustion
         let mintDataMap = new Map();
         try {
             const dbRes = await pool.query(`SELECT token_symbol, description, platform_type, to_address FROM transactions WHERE type = 'MINT' AND token_symbol = ANY($1)`, [tokensObj]);
@@ -582,7 +581,6 @@ app.get('/blocks', async (req, res) => {
     }
 });
 
-// NEW FEATURE 1: Placed specifically ABOVE /txhistory/:address to avoid parameter conflicts
 app.get('/txhistory/token/:ticker', async (req, res) => {
     try {
         const ticker = req.params.ticker;

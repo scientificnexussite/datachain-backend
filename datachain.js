@@ -188,11 +188,11 @@ class DataChain {
           return false;
       }
       
-      const target = Array(this.difficulty + 1).join("0");
       for(let i=1; i<newBlocks.length; i++) {
-          if(newBlocks[i].previousHash !== newBlocks[i-1].hash) return false;
-          if(newBlocks[i].hash.substring(0, this.difficulty) !== target) {
-              console.log(chalk.red('[NETWORK] Rejecting fork: Received block fails PoW difficulty threshold.'));
+          // FIX 3 — Use the shared validator with the live chain difficulty so
+          // that resolveConflict() and addBlock() enforce the exact same PoW target.
+          if (!validator.validateBlock(newBlocks[i], newBlocks[i-1], this.difficulty)) {
+              console.log(chalk.red('[NETWORK] Rejecting fork: Received block fails validator check.'));
               return false;
           }
       }
@@ -480,7 +480,7 @@ class DataChain {
     
     await newBlock.mineBlock(this.difficulty); 
 
-    if (!validator.validateBlock(newBlock, this.getLatestBlock())) return false;
+    if (!validator.validateBlock(newBlock, this.getLatestBlock(), this.difficulty)) return false;
 
     this.chain.push(newBlock);
     this.blockCount++;

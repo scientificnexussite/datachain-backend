@@ -11,6 +11,7 @@ import { Worker } from 'worker_threads';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// LIMITATION 2 FIX & General Upgrade: Added price_usd schema
 pool.query(`
     CREATE TABLE IF NOT EXISTS blocks (
         index INT PRIMARY KEY,
@@ -26,6 +27,7 @@ pool.query(`
         to_address VARCHAR(100),
         amount DOUBLE PRECISION,
         amount_usd DOUBLE PRECISION,
+        price_usd DOUBLE PRECISION,
         type VARCHAR(50),
         token_symbol VARCHAR(20),
         timestamp_ms BIGINT,
@@ -53,6 +55,7 @@ class Block {
     ).toString();
   }
 
+  // LIMITATION 6 FIX: This leverages node worker_threads natively to offload PoW hash logic 
   mineBlock(difficulty) {
     return new Promise((resolve, reject) => {
         const worker = new Worker(join(__dirname, 'mine-worker.js'), {
@@ -119,6 +122,7 @@ class DataChain {
                     type: tx.type, tokenSymbol: tx.token_symbol, timestamp: parseInt(tx.timestamp_ms)
                 };
                 if (tx.amount_usd) parsedTx.amountUsd = parseFloat(tx.amount_usd);
+                if (tx.price_usd) parsedTx.priceUsd = parseFloat(tx.price_usd);
                 if (tx.is_system_generated) parsedTx.isSystemGenerated = true;
                 if (tx.signature) parsedTx.signature = tx.signature;
                 if (tx.public_key) parsedTx.publicKey = tx.public_key;
@@ -217,8 +221,8 @@ class DataChain {
               if (typeof block.data !== 'string') {
                   for (const tx of block.data) {
                       await client.query(
-                          `INSERT INTO transactions (block_index, from_address, to_address, amount, amount_usd, type, token_symbol, timestamp_ms, is_system_generated, signature, public_key, platform_type, description) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-                          [block.index, tx.from, tx.to, tx.amount, tx.amountUsd || 0, tx.type, tx.tokenSymbol || 'SYR', tx.timestamp, !!tx.isSystemGenerated, tx.signature || '', tx.publicKey || '', tx.platformType || '', tx.description || '']
+                          `INSERT INTO transactions (block_index, from_address, to_address, amount, amount_usd, price_usd, type, token_symbol, timestamp_ms, is_system_generated, signature, public_key, platform_type, description) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+                          [block.index, tx.from, tx.to, tx.amount, tx.amountUsd || 0, tx.priceUsd || 0, tx.type, tx.tokenSymbol || 'SYR', tx.timestamp, !!tx.isSystemGenerated, tx.signature || '', tx.publicKey || '', tx.platformType || '', tx.description || '']
                       );
                   }
               }
@@ -267,8 +271,8 @@ class DataChain {
               if (parseInt(txCheck.rows[0].count) === 0) {
                   for (const tx of latestBlock.data) {
                       await client.query(
-                          `INSERT INTO transactions (block_index, from_address, to_address, amount, amount_usd, type, token_symbol, timestamp_ms, is_system_generated, signature, public_key, platform_type, description) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-                          [latestBlock.index, tx.from, tx.to, tx.amount, tx.amountUsd || 0, tx.type, tx.tokenSymbol || 'SYR', tx.timestamp, !!tx.isSystemGenerated, tx.signature || '', tx.publicKey || '', tx.platformType || '', tx.description || '']
+                          `INSERT INTO transactions (block_index, from_address, to_address, amount, amount_usd, price_usd, type, token_symbol, timestamp_ms, is_system_generated, signature, public_key, platform_type, description) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+                          [latestBlock.index, tx.from, tx.to, tx.amount, tx.amountUsd || 0, tx.priceUsd || 0, tx.type, tx.tokenSymbol || 'SYR', tx.timestamp, !!tx.isSystemGenerated, tx.signature || '', tx.publicKey || '', tx.platformType || '', tx.description || '']
                       );
                   }
               }
@@ -487,6 +491,11 @@ class DataChain {
     await this.saveChain(); 
     await this.state.saveSnapshot(this.blockCount - 1); 
     
+    // LIMITATION 5 FIX: Emit WebSocket events directly post-mint
+    if (global.broadcastWS) {
+        global.broadcastWS("NEW_BLOCK", { index: newBlock.index, hash: newBlock.hash, timestamp: newBlock.timestamp, txCount: newBlock.data.length });
+    }
+
     return true;
   }
 

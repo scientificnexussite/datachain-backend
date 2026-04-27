@@ -7,6 +7,9 @@ import rateLimit from 'express-rate-limit';
 import crypto from 'crypto'; 
 import fs from 'fs';
 import path from 'path';
+import { createServer } from 'http';
+import { WebSocketServer } from 'ws';
+import nodemailer from 'nodemailer';
 import pool from './db.js';
 import mempool from './mempool.js';
 import { DataChain } from './datachain.js';
@@ -17,14 +20,34 @@ import config from './config.json' with { type: "json" };
 
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
-const PAYPAL_API_BASE = "https://api-m.paypal.com";
+// LIMITATION 13 FIX: Dynamic PayPal Sandbox/Live mode
+const PAYPAL_API_BASE = process.env.PAYPAL_MODE === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
 
 pool.query(`
     CREATE TABLE IF NOT EXISTS api_state (
         id VARCHAR(50) PRIMARY KEY,
         data JSONB
     );
-`).catch(err => console.error(chalk.red("[DB] API State init failed"), err));
+    CREATE TABLE IF NOT EXISTS public_keys (
+        uid VARCHAR(100) PRIMARY KEY,
+        public_key TEXT
+    );
+    CREATE TABLE IF NOT EXISTS token_verifications (
+        ticker VARCHAR(20) PRIMARY KEY,
+        verification_code VARCHAR(100),
+        is_verified BOOLEAN DEFAULT FALSE
+    );
+    CREATE TABLE IF NOT EXISTS referrals (
+        referred_uid VARCHAR(100) PRIMARY KEY,
+        referrer_uid VARCHAR(100),
+        created_at BIGINT
+    );
+    CREATE TABLE IF NOT EXISTS referral_earnings (
+        referrer_uid VARCHAR(100),
+        amount_syr DOUBLE PRECISION,
+        earned_at BIGINT
+    );
+`).catch(err => console.error(chalk.red("[DB] API State & Feature tables init failed"), err));
 
 const app = express();
 app.set('trust proxy', 1);
@@ -55,6 +78,16 @@ app.use(cors({
 
 app.use(bodyParser.json({ limit: '100kb' })); 
 
+// LIMITATION 5 FIX: WebSocket Server Initialization
+const server = createServer(app);
+const wss = new WebSocketServer({ server });
+
+global.broadcastWS = (event, data) => {
+    wss.clients.forEach(client => {
+        if (client.readyState === 1) client.send(JSON.stringify({ event, data }));
+    });
+};
+
 const txLimiter = rateLimit({
     windowMs: 60 * 1000, 
     max: 50, 
@@ -77,11 +110,19 @@ const rawToDer = (rawSigHex) => {
     return '30' + seqLen + seq;
 };
 
-const requireWeb3Auth = (req, res, next) => {
+// LIMITATION 7 FIX: Enforce ECDSA Key Storage & Verification
+const requireWeb3Auth = async (req, res, next) => {
     const { signature, publicKey, uid, ...payloadData } = req.body;
     if (!signature || !publicKey || !uid) return res.status(401).json({ error: "Unauthorized: Missing Web3 ECDSA Signature." });
     
     try {
+        const pkRes = await pool.query('SELECT public_key FROM public_keys WHERE uid = $1', [uid]);
+        if (pkRes.rows.length > 0 && pkRes.rows[0].public_key !== publicKey) {
+            return res.status(401).json({ error: "Unauthorized: Public Key mismatch for this identity." });
+        } else if (pkRes.rows.length === 0) {
+            await pool.query('INSERT INTO public_keys (uid, public_key) VALUES ($1, $2)', [uid, publicKey]);
+        }
+        
         const verify = crypto.createVerify('SHA256');
         verify.update(JSON.stringify(payloadData));
         
@@ -168,11 +209,16 @@ async function updateMarketEconomics() {
         apiCache.stats.time = 0;
         apiCache.network.time = 0;
         apiCache.menubook.clear();
+        
+        if (global.broadcastWS) {
+            global.broadcastWS("PRICE_UPDATE", { token: "SYR", price: currentPrice, timestamp: Date.now() });
+        }
     } catch (e) {
         console.error(chalk.red("[ECONOMICS ERROR]"), e);
     }
 }
 
+// Auto-miner logic (Limits 6 worker thread is implemented in datachain.js)
 let isMining = false;
 setInterval(async () => {
     if (isMining) return;
@@ -189,6 +235,10 @@ setInterval(async () => {
                 if (tx.type === 'USD_WITHDRAWAL' && tx.to === 'system' && tx.isSystemGenerated) {
                     menuBook.removeMintLock(tx.from); 
                 }
+                // LIMITATION 9 FIX: Release deploy fee lock when mined
+                if (tx.type === 'TRANSFER' && tx.to === 'system' && tx.isSystemGenerated && tx.description === 'Deploy Fee') {
+                    menuBook.removeDeployFeeLock(tx.from, tx.amount);
+                }
             });
         } else {
             console.log(chalk.red(`[AUTO-MINER] Block validation failed.`));
@@ -198,8 +248,35 @@ setInterval(async () => {
     }
 }, 5000); 
 
+// LIMITATION 12 FIX: Keep-alive ping
+const BACKEND_URL = process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : `http://localhost:${port}`;
+setInterval(async () => {
+    try { await fetch(`${BACKEND_URL}/health`); } catch (e) {}
+}, 4 * 60 * 1000);
+
 app.get('/health', (req, res) => { res.json({ status: 'alive', chainLength: nexusChain.blockCount, timestamp: Date.now() }); });
-app.get('/config', (req, res) => { res.json({ paypalClientId: PAYPAL_CLIENT_ID }); });
+
+// LIMITATION 13 FIX: Expose sandbox flag
+app.get('/config', (req, res) => { res.json({ paypalClientId: PAYPAL_CLIENT_ID, sandboxMode: process.env.PAYPAL_MODE !== 'live' }); });
+
+// LIMITATION 1 FIX: Nodemailer Alert Endpoint
+app.post('/alert/email', async (req, res) => {
+    const { uid, email, token, condition, targetValue, currentPrice } = req.body;
+    const recipient = email || process.env.GMAIL_USER;
+    if (!process.env.GMAIL_USER || !process.env.GMAIL_PASS) return res.status(500).json({error: "Email not configured"});
+    
+    try {
+        const transporter = nodemailer.createTransport({ service: 'gmail', auth: { user: process.env.GMAIL_USER, pass: process.env.GMAIL_PASS } });
+        const mailOptions = {
+            from: process.env.GMAIL_USER,
+            to: recipient,
+            subject: `[Syrpts Alert] ${token} price alert triggered`,
+            text: `Token: ${token}\nCondition: ${condition}\nTarget: ${targetValue}\nCurrent Price: ${currentPrice}\nLink: https://syrpts-terminal.vercel.app`
+        };
+        await transporter.sendMail(mailOptions);
+        res.json({success: true});
+    } catch(err) { res.status(500).json({error: err.toString()}); }
+});
 
 app.get('/menubook', async (req, res) => { 
     const token = req.query.token || "SYR";
@@ -260,6 +337,7 @@ app.get('/pricehistory', async (req, res) => {
     }
 });
 
+// LIMITATION 2 FIX: /api/chart/kline Fallback
 app.get('/api/chart/kline', async (req, res) => {
     try {
         const { symbol = 'SYR' } = req.query;
@@ -278,7 +356,7 @@ app.get('/api/chart/kline', async (req, res) => {
             LIMIT 500;
         `;
         const dbRes = await pool.query(query, [symbol]);
-        const formatted = dbRes.rows.map(r => ({
+        let formatted = dbRes.rows.map(r => ({
             time: new Date(r.time).getTime(),
             open: parseFloat(r.open),
             high: parseFloat(r.high),
@@ -286,24 +364,68 @@ app.get('/api/chart/kline', async (req, res) => {
             close: parseFloat(r.close),
             volume: parseFloat(r.volume)
         }));
+        
+        if (formatted.length === 0) {
+            const mintRes = await pool.query(`SELECT price_usd, timestamp_ms FROM transactions WHERE type = 'MINT' AND token_symbol = $1 LIMIT 1`, [symbol]);
+            if (mintRes.rows.length > 0 && mintRes.rows[0].price_usd) {
+                const initPrice = parseFloat(mintRes.rows[0].price_usd);
+                formatted.push({
+                    time: new Date(parseInt(mintRes.rows[0].timestamp_ms)).getTime(),
+                    open: initPrice, high: initPrice, low: initPrice, close: initPrice, volume: 0
+                });
+            }
+        }
         res.json(formatted);
     } catch(e) {
         res.status(500).json({error: "Chart data unavailable"});
     }
 });
 
+// FEATURE B: Trending
+app.get('/trending', async (req, res) => {
+    try {
+        const oneDayAgo = Date.now() - (24 * 60 * 60 * 1000);
+        const q = `
+            SELECT token_symbol, SUM(amount_usd) as volume_24h
+            FROM transactions
+            WHERE type = 'MARKET_TRADE' AND timestamp_ms > $1
+            GROUP BY token_symbol
+            ORDER BY volume_24h DESC
+            LIMIT 5
+        `;
+        const dbRes = await pool.query(q, [oneDayAgo]);
+        res.json(dbRes.rows);
+    } catch(e) { res.status(500).json({error: "Trending fetch failed"}); }
+});
+
+// FEATURE D: Referrals
+app.post('/referral/signup', async (req, res) => {
+    const { uid, referrer } = req.body;
+    if (!uid || !referrer || uid === referrer) return res.status(400).json({error:"Invalid request"});
+    try {
+        await pool.query('INSERT INTO referrals (referred_uid, referrer_uid, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING', [uid, referrer, Date.now()]);
+        res.json({success: true});
+    } catch(e) { res.status(500).json({error: "Failed"}); }
+});
+
 app.get('/tokens', async (req, res) => {
     try {
         const tokensObj = Object.keys(nexusChain.state.balances);
-        
         let mintDataMap = new Map();
+        
         try {
-            const dbRes = await pool.query(`SELECT token_symbol, description, platform_type, to_address FROM transactions WHERE type = 'MINT' AND token_symbol = ANY($1)`, [tokensObj]);
+            const dbRes = await pool.query(`SELECT token_symbol, description, platform_type, to_address, price_usd FROM transactions WHERE type = 'MINT' AND token_symbol = ANY($1)`, [tokensObj]);
+            const verRes = await pool.query(`SELECT ticker, is_verified FROM token_verifications WHERE ticker = ANY($1)`, [tokensObj]);
+            
+            const verMap = new Map(verRes.rows.map(r => [r.ticker, r.is_verified]));
+            
             dbRes.rows.forEach(row => {
                 mintDataMap.set(row.token_symbol, {
                     description: row.description || "",
                     platformType: row.platform_type || "",
-                    owner: row.to_address || ""
+                    owner: row.to_address || "",
+                    initialPrice: parseFloat(row.price_usd) || 0,
+                    isVerified: verMap.get(row.token_symbol) || false
                 });
             });
         } catch(e) {
@@ -313,13 +435,11 @@ app.get('/tokens', async (req, res) => {
         const tokens = tokensObj.map(ticker => {
             let totalCirculating = 0;
             for (const address in nexusChain.state.balances[ticker]) {
-                if (address !== 'system') {
-                    totalCirculating += nexusChain.state.balances[ticker][address];
-                }
+                if (address !== 'system') totalCirculating += nexusChain.state.balances[ticker][address];
             }
             const supply = ticker === 'SYR' ? (MAX_SUPPLY - nexusChain.getRemainingSupply('SYR')) : totalCirculating;
             const lastPrice = menuBook.books[ticker]?.lastTradePrice || 0;
-            const meta = mintDataMap.get(ticker) || { description: "", platformType: "", owner: "" };
+            const meta = mintDataMap.get(ticker) || { description: "", platformType: "", owner: "", initialPrice: 0, isVerified: false };
 
             return { 
                 ticker, 
@@ -327,7 +447,9 @@ app.get('/tokens', async (req, res) => {
                 lastPrice, 
                 description: meta.description, 
                 platformType: meta.platformType, 
-                owner: meta.owner 
+                owner: meta.owner,
+                initialPrice: meta.initialPrice,
+                isVerified: meta.isVerified
             };
         });
 
@@ -342,24 +464,17 @@ app.get('/holders/:ticker', async (req, res) => {
         const ticker = req.params.ticker;
         const tokenBalances = nexusChain.state.balances[ticker];
         
-        if (!tokenBalances) {
-            return res.status(404).json({ error: "Token not found on ledger." });
-        }
+        if (!tokenBalances) return res.status(404).json({ error: "Token not found on ledger." });
 
         let holders = [];
         for (const [address, balance] of Object.entries(tokenBalances)) {
-            if (address !== 'system' && balance > 0) {
-                holders.push({ address, balance: fixDust(balance) });
-            }
+            if (address !== 'system' && balance > 0) holders.push({ address, balance: fixDust(balance) });
         }
         
         holders.sort((a, b) => b.balance - a.balance);
-        
         const limit = Math.min(parseInt(req.query.limit) || 100, 1000);
         res.json({ ticker, totalHolders: holders.length, topHolders: holders.slice(0, limit) });
-    } catch(e) {
-        res.status(500).json({ error: "Failed to query holders." });
-    }
+    } catch(e) { res.status(500).json({ error: "Failed to query holders." }); }
 });
 
 app.post('/positions/:uid', requireWeb3Auth, async (req, res) => {
@@ -403,7 +518,6 @@ app.post('/api/orders/cancel', requireWeb3Auth, async (req, res) => {
         const uid = req.user.uid;
         
         const parsedOrderId = parseInt(orderId);
-        
         const success = await menuBook.cancelOrder(uid, parsedOrderId, tokenSymbol);
         if (success) {
             await updateMarketEconomics();
@@ -471,13 +585,8 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
         const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, tokenSymbol) - mempool.getPendingUsdSpend(uid);
         const availableToken = nexusChain.getBalance(uid, tokenSymbol) - menuBook.getLockedToken(uid, tokenSymbol) - mempool.getPendingTokenSpend(uid, tokenSymbol);
 
-        if (side === 'SELL' && parsedAmount > availableToken) {
-            return res.status(400).json({ error: `Insufficient ${tokenSymbol} balance to execute trade.` });
-        }
-        
-        if (side === 'BUY' && availableUsd <= 0) {
-            return res.status(400).json({ error: `Insufficient USD balance. Deposit funds to execute trade.` });
-        }
+        if (side === 'SELL' && parsedAmount > availableToken) return res.status(400).json({ error: `Insufficient ${tokenSymbol} balance to execute trade.` });
+        if (side === 'BUY' && availableUsd <= 0) return res.status(400).json({ error: `Insufficient USD balance. Deposit funds to execute trade.` });
 
         const fundsToCheck = side === 'BUY' ? availableUsd : availableToken;
         const matchResult = await menuBook.matchMarketOrder(uid, side, parsedAmount, fundsToCheck, null, tokenSymbol);
@@ -486,7 +595,6 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
             const systemBalance = nexusChain.getBalance('system', tokenSymbol) - mempool.getPendingTokenSpend('system', tokenSymbol);
             if (systemBalance > 0) {
                 let tradeAmount = Math.min(matchResult.remaining, systemBalance);
-                
                 const virtualSyrReserve = 5000000; 
                 const virtualUsdReserve = virtualSyrReserve * currentPrice;
                 
@@ -500,14 +608,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
 
                 if (tradeAmount > 1e-8) {
                     await mempool.addTransaction({ 
-                        from: 'system', 
-                        to: uid, 
-                        amount: tradeAmount, 
-                        amountUsd: stepTradeUsd, 
-                        type: 'MARKET_TRADE', 
-                        tokenSymbol: tokenSymbol, 
-                        timestamp: Date.now(),
-                        isSystemGenerated: true
+                        from: 'system', to: uid, amount: tradeAmount, amountUsd: stepTradeUsd, type: 'MARKET_TRADE', tokenSymbol: tokenSymbol, timestamp: Date.now(), isSystemGenerated: true
                     });
 
                     const newSyrReserve = virtualSyrReserve - tradeAmount;
@@ -525,9 +626,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
             }
         }
 
-        if (matchResult.trades.length === 0) {
-            return res.status(400).json({ error: "No liquidity available in Menu Book to match order." });
-        }
+        if (matchResult.trades.length === 0) return res.status(400).json({ error: "No liquidity available in Menu Book to match order." });
 
         for (const trade of matchResult.trades) {
             if (trade.seller !== 'system') {
@@ -576,9 +675,7 @@ app.get('/blocks', async (req, res) => {
         }));
         
         res.json({ blocks: page, total, offset, limit });
-    } catch(e) {
-        res.status(500).json({error: "Failed to fetch blocks dynamically from database."});
-    }
+    } catch(e) { res.status(500).json({error: "Failed to fetch blocks dynamically from database."}); }
 });
 
 app.get('/txhistory/token/:ticker', async (req, res) => {
@@ -592,27 +689,16 @@ app.get('/txhistory/token/:ticker', async (req, res) => {
 
         const txRes = await pool.query(`
             SELECT from_address, to_address, amount, amount_usd, type, token_symbol, timestamp_ms, block_index
-            FROM transactions
-            WHERE token_symbol = $1
-            ORDER BY timestamp_ms DESC
-            LIMIT $2 OFFSET $3
+            FROM transactions WHERE token_symbol = $1 ORDER BY timestamp_ms DESC LIMIT $2 OFFSET $3
         `, [ticker, limit, offset]);
 
         const transactions = txRes.rows.map(tx => ({
-            from: tx.from_address,
-            to: tx.to_address,
-            amount: parseFloat(tx.amount),
-            amountUsd: parseFloat(tx.amount_usd),
-            type: tx.type,
-            tokenSymbol: tx.token_symbol,
-            timestamp: parseInt(tx.timestamp_ms),
-            blockIndex: tx.block_index
+            from: tx.from_address, to: tx.to_address, amount: parseFloat(tx.amount), amountUsd: parseFloat(tx.amount_usd),
+            type: tx.type, tokenSymbol: tx.token_symbol, timestamp: parseInt(tx.timestamp_ms), blockIndex: tx.block_index
         }));
 
         res.json({ transactions, total, ticker });
-    } catch(e) {
-        res.status(500).json({ error: "Failed to fetch global token transaction history." });
-    }
+    } catch(e) { res.status(500).json({ error: "Failed to fetch global token transaction history." }); }
 });
 
 app.get('/txhistory/:address', async (req, res) => {
@@ -627,27 +713,16 @@ app.get('/txhistory/:address', async (req, res) => {
 
         const txRes = await pool.query(`
             SELECT from_address, to_address, amount, amount_usd, type, token_symbol, timestamp_ms, block_index
-            FROM transactions
-            WHERE (from_address = $1 OR to_address = $1) AND token_symbol = $2
-            ORDER BY timestamp_ms DESC
-            LIMIT $3 OFFSET $4
+            FROM transactions WHERE (from_address = $1 OR to_address = $1) AND token_symbol = $2 ORDER BY timestamp_ms DESC LIMIT $3 OFFSET $4
         `, [address, token, limit, offset]);
 
         const transactions = txRes.rows.map(tx => ({
-            from: tx.from_address,
-            to: tx.to_address,
-            amount: parseFloat(tx.amount),
-            amountUsd: parseFloat(tx.amount_usd),
-            type: tx.type,
-            tokenSymbol: tx.token_symbol,
-            timestamp: parseInt(tx.timestamp_ms),
-            blockIndex: tx.block_index
+            from: tx.from_address, to: tx.to_address, amount: parseFloat(tx.amount), amountUsd: parseFloat(tx.amount_usd),
+            type: tx.type, tokenSymbol: tx.token_symbol, timestamp: parseInt(tx.timestamp_ms), blockIndex: tx.block_index
         }));
 
         res.json({ transactions, total, address, token });
-    } catch(e) {
-        res.status(500).json({ error: "Failed to fetch transaction history." });
-    }
+    } catch(e) { res.status(500).json({ error: "Failed to fetch transaction history." }); }
 });
 
 app.get('/balance/:address', (req, res) => { 
@@ -675,10 +750,7 @@ app.post('/tx/new', txLimiter, requireWeb3Auth, async (req, res) => {
   try {
       const { signature, publicKey, uid, ...payloadData } = req.body;
       const tx = { ...payloadData, amount: parseFloat(payloadData.amount) };
-      
-      if (signature && publicKey) {
-          tx.signature = signature; tx.publicKey = publicKey; tx.uid = uid;
-      }
+      if (signature && publicKey) { tx.signature = signature; tx.publicKey = publicKey; tx.uid = uid; }
 
       const { from, type, tokenSymbol = "SYR" } = tx;
 
@@ -708,21 +780,12 @@ app.post('/tx/new', txLimiter, requireWeb3Auth, async (req, res) => {
 setInterval(() => {
     const now = Date.now();
     let updated = false;
-    
     for (const [key, record] of pendingVerifications.entries()) {
-        if (now - record.timestamp > 30 * 60 * 1000) {
-            pendingVerifications.delete(key);
-            updated = true;
-        }
+        if (now - record.timestamp > 30 * 60 * 1000) { pendingVerifications.delete(key); updated = true; }
     }
-    
     for (const [orderId, orderData] of pendingPayPalOrders.entries()) {
-        if (now - orderData.timestamp > 24 * 60 * 60 * 1000) {
-            pendingPayPalOrders.delete(orderId);
-            updated = true;
-        }
+        if (now - orderData.timestamp > 24 * 60 * 60 * 1000) { pendingPayPalOrders.delete(orderId); updated = true; }
     }
-    
     if (updated) saveApiState();
 }, 15 * 60 * 1000);
 
@@ -745,35 +808,22 @@ app.post('/verify-website', txLimiter, requireWeb3Auth, async (req, res) => {
     
     try {
         const parsedUrl = new URL(websiteUrl);
-        if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
-            return res.status(400).json({ error: "Invalid protocol specified." });
-        }
-        
+        if (!['http:', 'https:'].includes(parsedUrl.protocol)) return res.status(400).json({ error: "Invalid protocol specified." });
         const hostname = parsedUrl.hostname;
         const isLocal = /^(localhost|127\.0\.0\.1|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.|0\.0\.0\.0|::1)/.test(hostname);
-        if (isLocal || hostname.includes('railway.internal')) {
-            return res.status(400).json({ error: "Internal IP addresses and local networks are strictly prohibited." });
-        }
-    } catch(e) {
-        return res.status(400).json({ error: "Malformed URL provided." });
-    }
+        if (isLocal || hostname.includes('railway.internal')) return res.status(400).json({ error: "Internal IP addresses and local networks are strictly prohibited." });
+    } catch(e) { return res.status(400).json({ error: "Malformed URL provided." }); }
 
     const record = pendingVerifications.get(uid + websiteUrl);
 
     try {
-        const htmlRes = await fetch(websiteUrl, { 
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36' } 
-        }).catch(() => null);
-        
+        const htmlRes = await fetch(websiteUrl, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36' } }).catch(() => null);
         if (htmlRes && htmlRes.ok) {
             const html = await htmlRes.text();
             if (record && html.includes(record.key)) {
-                pendingVerifications.delete(uid + websiteUrl);
-                saveApiState();
-                return res.json({ verified: true });
+                pendingVerifications.delete(uid + websiteUrl); saveApiState(); return res.json({ verified: true });
             }
         }
-
         if (record) {
             try {
                 const parsedUrl = new URL(websiteUrl);
@@ -782,18 +832,45 @@ app.post('/verify-website', txLimiter, requireWeb3Auth, async (req, res) => {
                 if (txtRes && txtRes.ok) {
                     const text = await txtRes.text();
                     if (text.includes(record.key)) {
-                        pendingVerifications.delete(uid + websiteUrl);
-                        saveApiState();
-                        return res.json({ verified: true });
+                        pendingVerifications.delete(uid + websiteUrl); saveApiState(); return res.json({ verified: true });
                     }
                 }
             } catch (e) {}
         }
-
         res.json({ verified: false, error: "Token missing. Please ensure your key is embedded directly or utilize the fallback syrpts-verify.txt protocol for Android/Steam non-web platforms." });
-    } catch (error) {
-        res.status(500).json({ error: "Server node encountered an error scanning the specified platform." });
-    }
+    } catch (error) { res.status(500).json({ error: "Server node encountered an error scanning the specified platform." }); }
+});
+
+// FEATURE A: TXT Record Verification via Cloudflare DoH
+app.get('/verify/:ticker', async (req, res) => {
+    const ticker = req.params.ticker.toUpperCase();
+    try {
+        const tRes = await pool.query("SELECT platform_type, description FROM transactions WHERE type = 'MINT' AND token_symbol = $1", [ticker]);
+        if (tRes.rows.length === 0) return res.status(404).json({error: "Token not found"});
+        let meta = {url: ''};
+        try { meta = JSON.parse(tRes.rows[0].description); } catch(e){}
+        if (!meta.url) return res.status(400).json({error: "No platform URL configured for this asset."});
+        const domain = new URL(meta.url).hostname;
+        
+        const vRes = await pool.query("SELECT verification_code FROM token_verifications WHERE ticker = $1", [ticker]);
+        if (vRes.rows.length === 0) return res.status(404).json({error: "Verification code not found for this asset."});
+        const code = vRes.rows[0].verification_code;
+
+        const dnsRes = await fetch(`https://cloudflare-dns.com/dns-json?name=_syrpts-verify.${domain}&type=TXT`, { headers: { 'Accept': 'application/dns-json' }});
+        const dnsData = await dnsRes.json();
+        let verified = false;
+        if (dnsData.Answer) {
+            for (const record of dnsData.Answer) {
+                if (record.data.includes(code)) verified = true;
+            }
+        }
+        if (verified) {
+            await pool.query("UPDATE token_verifications SET is_verified = TRUE WHERE ticker = $1", [ticker]);
+            res.json({verified: true});
+        } else {
+            res.json({verified: false, error: "TXT record mismatch. Ensure your DNS text record is properly propagated."});
+        }
+    } catch(e) { res.status(500).json({error: "Verification service failed"}); }
 });
 
 app.post('/mint-new-cash', txLimiter, requireWeb3Auth, async (req, res) => {
@@ -811,9 +888,7 @@ app.post('/mint-new-cash', txLimiter, requireWeb3Auth, async (req, res) => {
             return res.status(400).json({ error: "Ticker must be 1-10 uppercase alphanumeric characters only." });
         }
 
-        const RESERVED = [
-            'SYR', 'SYSTEM', 'USD', 'PAYPAL', 'GATEWAY', 'NEXUS'
-        ];
+        const RESERVED = ['SYR', 'SYSTEM', 'USD', 'PAYPAL', 'GATEWAY', 'NEXUS'];
         if (RESERVED.includes(customTicker)) return res.status(400).json({ error: "Ticker utilizes a reserved network identifier." });
 
         if (nexusChain.state.balances[customTicker] && Object.keys(nexusChain.state.balances[customTicker]).length > 0) return res.status(400).json({ error: "This ticker already exists." });
@@ -825,18 +900,19 @@ app.post('/mint-new-cash', txLimiter, requireWeb3Auth, async (req, res) => {
         const availableSyr = nexusChain.getBalance(uid, "SYR") - menuBook.getLockedToken(uid, "SYR") - mempool.getPendingTokenSpend(uid, "SYR");
         if (availableSyr < deployFeeSyr) return res.status(400).json({ error: `Deploying custom assets natively costs $1.00 USD worth of SYR. Insufficient balance (${deployFeeSyr} SYR required).` });
 
-        await mempool.addTransaction({ from: uid, to: "system", amount: deployFeeSyr, type: 'TRANSFER', tokenSymbol: "SYR", timestamp: Date.now(), isSystemGenerated: true });
+        // FEATURE A & LIMITATION 2/9 FIX: Immediate Lock & Verified Storage
+        menuBook.addDeployFeeLock(uid, deployFeeSyr);
+        
+        const verificationCode = `syrpts_${crypto.randomBytes(8).toString('hex')}`;
+        await pool.query('INSERT INTO token_verifications (ticker, verification_code) VALUES ($1, $2) ON CONFLICT DO NOTHING', [customTicker, verificationCode]);
+
+        await mempool.addTransaction({ from: uid, to: "system", amount: deployFeeSyr, type: 'TRANSFER', tokenSymbol: "SYR", timestamp: Date.now(), isSystemGenerated: true, description: 'Deploy Fee' });
         
         await mempool.addTransaction({ 
-            from: "system", 
-            to: uid, 
-            amount: parsedSupply, 
-            type: 'MINT', 
-            tokenSymbol: customTicker, 
-            platformType: platformType || 'website',
-            description: description || '',
-            timestamp: Date.now() + 10, 
-            isSystemGenerated: true 
+            from: "system", to: uid, amount: parsedSupply, type: 'MINT', tokenSymbol: customTicker, 
+            platformType: platformType || 'website', description: description || '',
+            priceUsd: currentPrice, // Store initial price
+            timestamp: Date.now() + 10, isSystemGenerated: true 
         });
         
         menuBook.addMintLock(uid);
@@ -901,9 +977,7 @@ app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
         
         if (typeof amount !== 'number' || amount < 1) return res.status(400).json({ error: "Invalid withdrawal amount. Minimum is $1." });
         if (amount > 5000) return res.status(400).json({ error: "Max single withdrawal is $5000." });
-        
         if (!paypalEmail || !paypalEmail.includes('@')) return res.status(400).json({ error: "Valid PayPal email is required to process withdrawals." });
-        
         if ((nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, "SYR") - mempool.getPendingUsdSpend(uid)) < amount) return res.status(400).json({ error: "Insufficient available USD." });
 
         try {
@@ -917,7 +991,6 @@ app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
                 })
             });
             const payoutData = await payoutRes.json();
-            
             if (!payoutRes.ok) throw new Error(payoutData.message || "Payout rejected by PayPal");
 
             await mempool.addTransaction({ from: uid, to: "paypal-gateway", amount: amount, type: 'USD_WITHDRAWAL', timestamp: Date.now() });
@@ -939,7 +1012,6 @@ app.use((req, res) => { res.status(404).json({ error: "API Node Endpoint Not Fou
     console.log(chalk.blue("Initializing Market Economics..."));
     
     if (nexusChain.isInitializing) { await nexusChain.isInitializing; }
-    
     await menuBook.ensureLoaded();
 
     let savedMenuPrice = menuBook.books["SYR"]?.lastTradePrice;
@@ -955,12 +1027,9 @@ app.use((req, res) => { res.status(404).json({ error: "API Node Endpoint Not Fou
     
     await updateMarketEconomics();
     
-    app.listen(port, "0.0.0.0", () => { 
+    // LIMITATION 5 FIX: Changed app.listen to server.listen to mount WebSockets
+    server.listen(port, "0.0.0.0", () => { 
         console.log(chalk.blue.bold(`--- SCIENTIFIC NEXUS API RUNNING ON PORT ${port} ---`)); 
-        
-        setInterval(() => {
-            fetch(`http://localhost:${port}/health`).catch(() => {});
-        }, 14 * 60 * 1000);
     });
 
     process.on('SIGTERM', () => {

@@ -17,6 +17,8 @@ class MenuBook {
     this.books = { "SYR": { bids: [], asks: [], lastTradePrice: 0.01 } };
     this.orderCounter = 0;
     this.activeMintLocks = {};
+    // LIMITATION 9 FIX: Proper balance lock tracker for Deploy fees
+    this.deployFeeLocks = {};
     
     const volumePath = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
     this.ordersFile = path.join(volumePath, 'orders.json');
@@ -52,6 +54,7 @@ class MenuBook {
               this.books = data.books || { "SYR": { bids: [], asks: [], lastTradePrice: 0.01 } };
               this.orderCounter = data.orderCounter || 0;
               this.activeMintLocks = data.activeMintLocks || {};
+              this.deployFeeLocks = data.deployFeeLocks || {};
               console.log(chalk.green("[MENU BOOK] Orders successfully loaded from PostgreSQL."));
               return;
           }
@@ -65,12 +68,14 @@ class MenuBook {
               this.books = data.books || { "SYR": { bids: [], asks: [], lastTradePrice: 0.01 } };
               this.orderCounter = data.orderCounter || 0;
               this.activeMintLocks = data.activeMintLocks || {};
+              this.deployFeeLocks = data.deployFeeLocks || {};
               console.log(chalk.green("[MENU BOOK] Orders loaded from disk. Migrating to DB..."));
               await this.saveOrders(); 
           }
       } catch (e) {
           console.warn(chalk.yellow("[MENU BOOK] No persistent orders found, starting fresh."));
           this.activeMintLocks = {};
+          this.deployFeeLocks = {};
       }
   }
 
@@ -85,7 +90,8 @@ class MenuBook {
       const data = { 
           books: this.books, 
           orderCounter: this.orderCounter,
-          activeMintLocks: this.activeMintLocks
+          activeMintLocks: this.activeMintLocks,
+          deployFeeLocks: this.deployFeeLocks
       };
 
       try {
@@ -105,6 +111,12 @@ class MenuBook {
           console.error(chalk.red("[MENU BOOK] PostgreSQL Sync Failed:"), e);
       } finally {
           this.isSaving = false;
+          // LIMITATION 5 FIX: Fire event locally whenever order book mutates state
+          if (global.broadcastWS) {
+              for (const token in this.books) {
+                  global.broadcastWS("MENUBOOK_UPDATE", { token, ...this.books[token], marketData: this.getSpread(token) });
+              }
+          }
           if (this.saveQueue) this.saveOrders();
       }
   }
@@ -133,6 +145,21 @@ class MenuBook {
       } 
   }
 
+  addDeployFeeLock(uid, amount) {
+      if(!this.deployFeeLocks) this.deployFeeLocks = {};
+      if(!this.deployFeeLocks[uid]) this.deployFeeLocks[uid] = 0;
+      this.deployFeeLocks[uid] += amount;
+      this.saveOrders();
+  }
+
+  removeDeployFeeLock(uid, amount) {
+      if(this.deployFeeLocks && this.deployFeeLocks[uid]) {
+          this.deployFeeLocks[uid] -= amount;
+          if (this.deployFeeLocks[uid] <= 0) delete this.deployFeeLocks[uid];
+          this.saveOrders();
+      }
+  }
+
   async setInitialPrice(price, token = "SYR") {
       await this.ensureLoaded();
       this._initTokenBook(token);
@@ -147,7 +174,12 @@ class MenuBook {
 
   getLockedToken(uid, token = "SYR") {
     this._initTokenBook(token);
-    return fixDust(this.books[token].asks.filter(a => a.uid === uid).reduce((sum, a) => sum + a.amountSyr, 0));
+    let locked = fixDust(this.books[token].asks.filter(a => a.uid === uid).reduce((sum, a) => sum + a.amountSyr, 0));
+    // Enforce custom deploy fee locks mapped specifically to the network asset
+    if (token === "SYR" && this.deployFeeLocks && this.deployFeeLocks[uid]) {
+        locked += this.deployFeeLocks[uid];
+    }
+    return fixDust(locked);
   }
 
   getSpread(token = "SYR") {
@@ -242,6 +274,28 @@ class MenuBook {
     let slippage = 0;
     if (initialPrice > 0 && trades.length > 0) {
         slippage = fixDust(Math.abs(finalPrice - initialPrice) / initialPrice);
+    }
+
+    // FEATURE D: Process Referrals post-trade to circumvent math precision loss
+    for (const trade of trades) {
+        try {
+            const refRes = await pool.query('SELECT referrer_uid, created_at FROM referrals WHERE referred_uid = $1', [uid]);
+            if (refRes.rows.length > 0) {
+                const { referrer_uid, created_at } = refRes.rows[0];
+                if (Date.now() - parseInt(created_at) < 30 * 24 * 60 * 60 * 1000) {
+                    const bonusSyr = fixDust(trade.amountSyr * 0.001);
+                    if (bonusSyr > 1e-8) {
+                        import('./mempool.js').then(({default: mempool}) => {
+                            mempool.addTransaction({
+                                from: "system", to: referrer_uid, amount: bonusSyr, type: "MINT", tokenSymbol: token,
+                                timestamp: Date.now(), isSystemGenerated: true, description: "Referral Bonus"
+                            });
+                        });
+                        pool.query('INSERT INTO referral_earnings (referrer_uid, amount_syr, earned_at) VALUES ($1, $2, $3)', [referrer_uid, bonusSyr, Date.now()]).catch(()=>{});
+                    }
+                }
+            }
+        } catch(e) {}
     }
 
     await this.saveOrders();

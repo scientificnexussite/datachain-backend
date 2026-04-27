@@ -361,6 +361,45 @@ setInterval(async () => {
                     menuBook.removeDeployFeeLock(tx.from, tx.amount);
                 }
             });
+
+            // FIX 3 — Seed initial liquidity for newly minted custom tokens.
+            // Without this, custom tokens have no ask orders in the book so
+            // nobody can buy them, no MARKET_TRADE records are ever created,
+            // and both charts stay blank forever.
+            // We place a seed SELL limit order (10% of supply, max 1 M tokens)
+            // at $0.01 on behalf of the deployer. They can cancel and re-price it.
+            for (const tx of pendingTxs) {
+                if (
+                    tx.type === 'MINT' &&
+                    tx.tokenSymbol !== 'SYR' &&
+                    tx.isSystemGenerated &&
+                    tx.to && tx.to !== 'system'
+                ) {
+                    const seedTicker   = tx.tokenSymbol;
+                    const deployerUid  = tx.to;
+                    const totalSupply  = tx.amount;
+                    // Only seed if this token book has no orders yet
+                    await menuBook.ensureLoaded();
+                    menuBook._initTokenBook(seedTicker);
+                    const book = menuBook.books[seedTicker];
+                    if (book.asks.length === 0 && book.bids.length === 0) {
+                        const seedAmount = Math.min(
+                            parseFloat((totalSupply * 0.10).toFixed(8)),
+                            1_000_000
+                        );
+                        const seedPrice = 0.01; // default starting price
+                        if (seedAmount > 0) {
+                            await menuBook.addLimitOrder(
+                                deployerUid, 'SELL', seedAmount, seedPrice, seedTicker
+                            );
+                            console.log(chalk.cyan(
+                                `[LIQUIDITY] Seeded initial ask for ${seedTicker}: `+
+                                `${seedAmount} @ $${seedPrice} (deployer: ${deployerUid.substring(0,12)}...)`
+                            ));
+                        }
+                    }
+                }
+            }
         } else {
             // FIX 2 — Block validation failed; put the transactions back
             console.log(chalk.red('[AUTO-MINER] Block validation failed. Restoring transactions to mempool.'));
@@ -525,7 +564,10 @@ app.get('/pricehistory', readLimiter, async (req, res) => {
              LIMIT $2 OFFSET $3`,
             [token, limit, offset]
         );
-        res.json(dbRes.rows.map(r => ({ time: parseInt(r.time), price: parseFloat(r.price) })));
+        // FIX 1: was returning { time } but syrpts-app.js reads { timestamp }.
+        // Now returns { timestamp } to match SYR's priceHistoryCache format.
+        // This was the primary cause of all custom token charts being blank.
+        res.json(dbRes.rows.map(r => ({ timestamp: parseInt(r.time), price: parseFloat(r.price) })));
     } catch (e) {
         res.json([]);
     }
@@ -1285,7 +1327,7 @@ app.post('/mint-new-cash', txLimiter, requireWeb3Auth, async (req, res) => {
             type: 'MINT', tokenSymbol: customTicker,
             platformType: platformType || 'website',
             description: description || '',
-            priceUsd: currentPrice,
+            priceUsd: 0,  // FIX 2: Custom tokens have no USD price at mint time.
             timestamp: Date.now() + 10, isSystemGenerated: true
         });
 

@@ -420,6 +420,10 @@ app.post('/alerts/set', requireWeb3Auth, async (req, res) => {
             return res.status(400).json({ error: 'Missing required alert fields.' });
         if (!['above', 'below'].includes(condition))
             return res.status(400).json({ error: "Condition must be 'above' or 'below'." });
+        // Limitation 7 FIX — validate email format before persisting
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+        if (!emailRegex.test(email) || email.length > 200)
+            return res.status(400).json({ error: 'Invalid email address format.' });
 
         await pool.query(
             `INSERT INTO price_alerts (uid, token, condition, target_value, email, is_active, created_at)
@@ -701,33 +705,55 @@ app.post('/positions/:uid', requireWeb3Auth, async (req, res) => {
     const uid = req.params.uid;
     if (req.user.uid !== uid) return res.status(403).json({ error: 'Forbidden' });
 
-    if (positionsCache.has(uid)) return res.json({ positions: positionsCache.get(uid) });
+    // Limitation 9 FIX — time-based TTL (30 s) so stale entries don't live forever
+    const POSITIONS_TTL = 30000;
+    const cachedPos = positionsCache.get(uid);
+    if (cachedPos && (Date.now() - cachedPos.time) < POSITIONS_TTL)
+        return res.json({ positions: cachedPos.data });
 
+    // Limitation 1 FIX — Single batch query replaces the N+1 loop-per-token pattern.
+    // Previously fired one DB round-trip per token the user holds; now one query
+    // for all cost-basis data across every token simultaneously.
     let positionsArr = [];
-    for (const token in nexusChain.state.balances) {
-        const currentBal = nexusChain.state.getBalance(uid, token);
-        if (currentBal > 0) {
-            let totalSpent = 0, totalAcquired = 0;
-            try {
-                const txRes = await pool.query(
-                    `SELECT amount, amount_usd FROM transactions
-                     WHERE to_address = $1 AND token_symbol = $2 AND (type = 'MARKET_TRADE' OR type = 'BUY')`,
-                    [uid, token]
-                );
-                for (const row of txRes.rows) {
-                    totalSpent    += parseFloat(row.amount_usd) || 0;
-                    totalAcquired += parseFloat(row.amount);
-                }
-            } catch (e) {
-                console.error(chalk.red('[API] Positions DB query failed'), e);
-            }
-            const avgPrice = totalAcquired > 0
-                ? (totalSpent / totalAcquired)
-                : (token === 'SYR' ? currentPrice : 0);
-            positionsArr.push({ asset: token, qty: currentBal, avgPrice });
+    try {
+        // Collect tokens with positive balance first (in-memory, no DB needed)
+        const heldTokens = [];
+        for (const token in nexusChain.state.balances) {
+            const bal = nexusChain.state.getBalance(uid, token);
+            if (bal > 0) heldTokens.push({ token, balance: bal });
         }
+
+        if (heldTokens.length > 0) {
+            // One DB call for all cost-basis data across all held tokens
+            const batchRes = await pool.query(
+                `SELECT token_symbol,
+                        SUM(amount)     AS total_acquired,
+                        SUM(amount_usd) AS total_spent
+                 FROM transactions
+                 WHERE to_address = $1 AND type IN ('MARKET_TRADE', 'BUY')
+                 GROUP BY token_symbol`,
+                [uid]
+            );
+            const costBasis = new Map(
+                batchRes.rows.map(r => [r.token_symbol, {
+                    acquired: parseFloat(r.total_acquired) || 0,
+                    spent:    parseFloat(r.total_spent)    || 0
+                }])
+            );
+
+            for (const { token, balance } of heldTokens) {
+                const cb = costBasis.get(token);
+                const avgPrice = cb && cb.acquired > 0
+                    ? (cb.spent / cb.acquired)
+                    : (token === 'SYR' ? currentPrice : 0);
+                positionsArr.push({ asset: token, qty: balance, avgPrice });
+            }
+        }
+    } catch (e) {
+        console.error(chalk.red('[API] Positions batch query failed'), e);
     }
-    positionsCache.set(uid, positionsArr);
+    // Limitation 9 FIX — add a timestamp so stale per-user entries can be TTL-expired
+    positionsCache.set(uid, { data: positionsArr, time: Date.now() });
     res.json({ positions: positionsArr });
 });
 
@@ -1122,8 +1148,11 @@ app.post('/verify-website', txLimiter, requireWeb3Auth, async (req, res) => {
     const record = pendingVerifications.get(uid + websiteUrl);
 
     try {
+        // Bug 5 FIX — 10-second timeout on external fetch to prevent indefinite hangs
+        // that would block Express workers and exhaust the Railway connection pool.
         const htmlRes = await fetch(websiteUrl, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36' }
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36' },
+            signal: AbortSignal.timeout(10000)
         }).catch(() => null);
 
         if (htmlRes && htmlRes.ok) {
@@ -1140,7 +1169,7 @@ app.post('/verify-website', txLimiter, requireWeb3Auth, async (req, res) => {
             try {
                 const parsedUrl = new URL(websiteUrl);
                 const txtUrl = `${parsedUrl.protocol}//${parsedUrl.host}/syrpts-verify.txt`;
-                const txtRes = await fetch(txtUrl).catch(() => null);
+                const txtRes = await fetch(txtUrl, { signal: AbortSignal.timeout(10000) }).catch(() => null);
                 if (txtRes && txtRes.ok) {
                     const text = await txtRes.text();
                     if (text.includes(record.key)) {
@@ -1369,6 +1398,38 @@ app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
         }
     } catch (err) {
         res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+// ─── Referral Earnings (Feature 2) ──────────────────────────────────────────
+// GET /api/referrals/:uid — returns this user's referral summary and earnings history
+app.get('/api/referrals/:uid', async (req, res) => {
+    const uid = req.params.uid;
+    if (!uid || uid.length > 200) return res.status(400).json({ error: 'Invalid uid.' });
+    try {
+        const [earningsRes, countRes] = await Promise.all([
+            pool.query(
+                'SELECT referrer_uid, amount_syr, earned_at FROM referral_earnings WHERE referrer_uid = $1 ORDER BY earned_at DESC LIMIT 100',
+                [uid]
+            ),
+            pool.query(
+                'SELECT COUNT(*) FROM referrals WHERE referrer_uid = $1',
+                [uid]
+            )
+        ]);
+        const totalReferrals  = parseInt(countRes.rows[0].count);
+        const totalEarned     = earningsRes.rows.reduce((s, r) => s + parseFloat(r.amount_syr), 0);
+        res.json({
+            uid,
+            totalReferrals,
+            totalEarned: Number(totalEarned.toFixed(8)),
+            earnings: earningsRes.rows.map(r => ({
+                amount: parseFloat(r.amount_syr),
+                earnedAt: parseInt(r.earned_at)
+            }))
+        });
+    } catch (e) {
+        res.status(500).json({ error: 'Failed to fetch referral data.' });
     }
 });
 

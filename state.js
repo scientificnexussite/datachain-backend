@@ -173,6 +173,10 @@ class State {
   }
 
   // Issue #4 Fixed: High Performance Bulk Upsert prevents DB locks
+  // Limitation 5 FIX: Added zero-balance row pruning after every successful save.
+  // This prevents the state_balances and state_usd_balances tables from accumulating
+  // stale rows for accounts that have spent all their tokens, which degrades performance
+  // as the chain grows.
   async saveSnapshot(lastIndex) {
       if (this.isSaving) {
           this.saveQueue = true;
@@ -230,6 +234,12 @@ class State {
           }
           
           await client.query('COMMIT');
+
+          // Limitation 5 FIX — Prune stale zero-balance rows from state tables.
+          // Runs asynchronously after the commit so it doesn't block the mining pipeline.
+          pool.query('DELETE FROM state_balances WHERE balance <= 0').catch(() => {});
+          pool.query('DELETE FROM state_usd_balances WHERE balance <= 0').catch(() => {});
+
       } catch (e) {
           await client.query('ROLLBACK');
           console.error(chalk.red("[STATE] PostgreSQL Snapshot bulk upsert failed:"), e);

@@ -30,7 +30,13 @@ class MenuBook {
     this.ordersFile = path.join(volumePath, 'orders.json');
 
     this.isSaving = false;
-    this.saveQueue = false;
+
+    // Bug 6 FIX — Replace the single saveQueue string/boolean with a Set of
+    // pending tokens.  This way if token A is saving and tokens B AND C both
+    // queue up concurrently, both B and C are remembered and both get their
+    // MENUBOOK_UPDATE broadcast when the save drains, rather than C silently
+    // overwriting B and causing a stale order book in the UI.
+    this.saveQueueTokens = new Set();
 
     this.isInitializing = this.loadOrders();
   }
@@ -89,17 +95,24 @@ class MenuBook {
   }
 
   // ── Persist orders to disk + DB ────────────────────────────────────────────
-  // IMPROVEMENT 2 — saveOrders() now accepts an optional changedToken parameter.
-  // When provided, only that token's MENUBOOK_UPDATE event is broadcast over
-  // WebSocket instead of blasting every token on every single save.  This
-  // prevents O(n) WebSocket messages per trade when 50+ custom tokens exist.
+  // IMPROVEMENT 2 — saveOrders() accepts an optional changedToken parameter.
+  // Only that token's MENUBOOK_UPDATE event is broadcast instead of blasting
+  // every token on every save.  This prevents O(n) WebSocket messages per trade.
+  //
+  // Bug 6 FIX — saveQueueTokens is now a Set so multiple concurrent callers
+  // with different tokens all get their broadcasts when the save drains.
   async saveOrders(changedToken = null) {
     if (this.isSaving) {
-      this.saveQueue = changedToken || true;
+      // Queue this token (or null = "all tokens") for a follow-up save
+      if (changedToken) {
+        this.saveQueueTokens.add(changedToken);
+      } else {
+        // null means "broadcast all" — signal with a special sentinel
+        this.saveQueueTokens.add('__ALL__');
+      }
       return;
     }
     this.isSaving = true;
-    this.saveQueue = false;
 
     const data = {
       books: this.books,
@@ -128,10 +141,7 @@ class MenuBook {
     } finally {
       this.isSaving = false;
 
-      // IMPROVEMENT 2 — Targeted broadcast: only emit events for the token
-      // that actually changed.  If changedToken is null (e.g. during a full
-      // reload / initialisation), fall back to broadcasting every token so
-      // nothing is missed.
+      // IMPROVEMENT 2 — Targeted broadcast
       if (global.broadcastWS) {
         const tokensToEmit = changedToken ? [changedToken] : Object.keys(this.books);
         for (const token of tokensToEmit) {
@@ -145,11 +155,24 @@ class MenuBook {
         }
       }
 
-      // Drain the save queue — preserve which token needs broadcasting next
-      if (this.saveQueue) {
-        const nextToken = typeof this.saveQueue === 'string' ? this.saveQueue : null;
-        this.saveQueue = false;
-        this.saveOrders(nextToken);
+      // Bug 6 FIX — Drain the Set: collect all queued tokens, clear the set,
+      // then do a single follow-up save covering all of them.
+      if (this.saveQueueTokens.size > 0) {
+        const broadcastAll = this.saveQueueTokens.has('__ALL__');
+        const pendingTokens = new Set(this.saveQueueTokens);
+        this.saveQueueTokens.clear();
+
+        // One save call; pass null if any of the queued tokens was __ALL__
+        this.saveOrders(broadcastAll ? null : [...pendingTokens][0]);
+
+        // If more than one real token queued up, broadcast each individually
+        // on the next iteration by re-queuing the rest
+        if (!broadcastAll && pendingTokens.size > 1) {
+          const allTokens = [...pendingTokens];
+          for (let i = 1; i < allTokens.length; i++) {
+            this.saveQueueTokens.add(allTokens[i]);
+          }
+        }
       }
     }
   }

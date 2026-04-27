@@ -655,8 +655,13 @@ app.get('/tokens', readLimiter, async (req, res) => {
 
         const tokens = tokensObj.map(ticker => {
             let totalCirculating = 0;
+            let totalHolders     = 0;   // FIX — count holders in the same loop, no extra DB query
             for (const address in nexusChain.state.balances[ticker]) {
-                if (address !== 'system') totalCirculating += nexusChain.state.balances[ticker][address];
+                const bal = nexusChain.state.balances[ticker][address];
+                if (address !== 'system') {
+                    totalCirculating += bal;
+                    if (bal > 0) totalHolders++;
+                }
             }
             const supply    = ticker === 'SYR' ? (MAX_SUPPLY - nexusChain.getRemainingSupply('SYR')) : totalCirculating;
             const lastPrice = menuBook.books[ticker]?.lastTradePrice || 0;
@@ -665,6 +670,7 @@ app.get('/tokens', readLimiter, async (req, res) => {
             return {
                 ticker,
                 supply,
+                totalHolders,   // FIX — now included so Global Chains can display holder count
                 lastPrice,
                 description:  meta.description,
                 platformType: meta.platformType,

@@ -60,6 +60,20 @@ pool.query(`
         is_active BOOLEAN DEFAULT TRUE,
         created_at BIGINT
     );
+    -- Task 1: Persistent domain ownership verification records.
+    -- Each row represents one verification attempt (pending → verified → used).
+    -- A 'verified' row is required before /mint-new-cash will proceed.
+    -- After a successful deploy the row is marked 'used' so it cannot be reused
+    -- for a second ticker (preventing domain squatting abuse).
+    CREATE TABLE IF NOT EXISTS domain_verifications (
+        id SERIAL PRIMARY KEY,
+        uid VARCHAR(100) NOT NULL,
+        website_url TEXT NOT NULL,
+        verification_key VARCHAR(100) NOT NULL,
+        status VARCHAR(20) DEFAULT 'pending',
+        created_at BIGINT,
+        verified_at BIGINT
+    );
 `).catch(err => console.error(chalk.red('[DB] API State & Feature tables init failed'), err));
 
 // ─── Express App ──────────────────────────────────────────────────────────────
@@ -599,6 +613,13 @@ app.get('/api/chart/kline', async (req, res) => {
                 truncExpr = `date_trunc('week', to_timestamp(timestamp_ms / 1000))`;
                 sinceMs = null; // all time
                 break;
+            case 'ALL':
+                // Show all available daily candles regardless of age.
+                // Used by DelChain's token dashboard so custom tokens always show
+                // their full history even if their first trade was months ago.
+                truncExpr = `date_trunc('day', to_timestamp(timestamp_ms / 1000))`;
+                sinceMs = null; // absolutely no time filter
+                break;
             default: // '1H'
                 truncExpr = `date_trunc('hour', to_timestamp(timestamp_ms / 1000))`;
                 sinceMs = Date.now() - 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -670,6 +691,36 @@ app.get('/api/chart/kline', async (req, res) => {
                     time: new Date(parseInt(mintRes.rows[0].timestamp_ms)).getTime(),
                     open: initPrice, high: initPrice, low: initPrice, close: initPrice, volume: 0
                 });
+            }
+        }
+
+        // ── Ultra-fallback: menubook lastTradePrice / lowest ask ──────────────
+        // If no MARKET_TRADE records exist in the DB at all for this token, but the
+        // menubook has a live price (e.g. the seed SELL order was partially filled or
+        // the deployer set an initial ask), synthesise a single candle from that price.
+        // This eliminates the "Awaiting First Trade" overlay for tokens that have a
+        // known price in the order book even before the first DB-confirmed trade.
+        if (formatted.length === 0) {
+            try {
+                await menuBook.ensureLoaded();
+                menuBook._initTokenBook(symbol);
+                const book = menuBook.books[symbol];
+                let fallbackPrice = (book && book.lastTradePrice > 0) ? book.lastTradePrice : null;
+                if (!fallbackPrice && book && book.asks && book.asks.length > 0) {
+                    fallbackPrice = book.asks[0].priceUsd;  // lowest ask as seed price
+                }
+                if (fallbackPrice && fallbackPrice > 0) {
+                    formatted.push({
+                        time:   Date.now(),
+                        open:   fallbackPrice,
+                        high:   fallbackPrice,
+                        low:    fallbackPrice,
+                        close:  fallbackPrice,
+                        volume: 0
+                    });
+                }
+            } catch (mbErr) {
+                // Non-fatal: leave chart empty if menubook lookup fails
             }
         }
 
@@ -1219,7 +1270,7 @@ app.post('/tx/new', txLimiter, requireWeb3Auth, async (req, res) => {
 });
 
 // ─── Domain Verification ──────────────────────────────────────────────────────
-app.post('/register-website', txLimiter, requireWeb3Auth, (req, res) => {
+app.post('/register-website', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const { websiteUrl } = req.body;
         const uid = req.user.uid;
@@ -1227,8 +1278,23 @@ app.post('/register-website', txLimiter, requireWeb3Auth, (req, res) => {
             return res.status(400).json({ error: 'Invalid platform URL format.' });
 
         const key = 'nx_' + crypto.randomBytes(16).toString('hex');
+        // Keep existing in-memory map for the immediate handshake session
         pendingVerifications.set(uid + websiteUrl, { key, timestamp: Date.now() });
         saveApiState();
+
+        // Task 1 — Also persist to domain_verifications so the verified status
+        // survives a server restart and can be checked by /mint-new-cash.
+        try {
+            await pool.query(
+                `INSERT INTO domain_verifications (uid, website_url, verification_key, status, created_at)
+                 VALUES ($1, $2, $3, 'pending', $4)`,
+                [uid, websiteUrl, key, Date.now()]
+            );
+        } catch (dbErr) {
+            // Non-fatal: the in-memory flow still works; log and continue.
+            console.warn(chalk.yellow('[API] domain_verifications persist failed:'), dbErr.message);
+        }
+
         res.json({ key });
     } catch (err) {
         res.status(500).json({ error: 'Internal Server Error' });
@@ -1266,6 +1332,12 @@ app.post('/verify-website', txLimiter, requireWeb3Auth, async (req, res) => {
             if (record && html.includes(record.key)) {
                 pendingVerifications.delete(uid + websiteUrl);
                 saveApiState();
+                // Task 1 — Update the DB record so /mint-new-cash can verify ownership.
+                await pool.query(
+                    `UPDATE domain_verifications SET status = 'verified', verified_at = $3
+                     WHERE uid = $1 AND verification_key = $2 AND status = 'pending'`,
+                    [uid, record.key, Date.now()]
+                ).catch(() => {});
                 return res.json({ verified: true });
             }
         }
@@ -1281,6 +1353,12 @@ app.post('/verify-website', txLimiter, requireWeb3Auth, async (req, res) => {
                     if (text.includes(record.key)) {
                         pendingVerifications.delete(uid + websiteUrl);
                         saveApiState();
+                        // Task 1 — Update the DB record so /mint-new-cash can verify ownership.
+                        await pool.query(
+                            `UPDATE domain_verifications SET status = 'verified', verified_at = $3
+                             WHERE uid = $1 AND verification_key = $2 AND status = 'pending'`,
+                            [uid, record.key, Date.now()]
+                        ).catch(() => {});
                         return res.json({ verified: true });
                     }
                 }
@@ -1359,6 +1437,32 @@ app.post('/mint-new-cash', txLimiter, requireWeb3Auth, async (req, res) => {
         if (menuBook.hasMintLock(uid))
             return res.status(400).json({ error: 'You already have a minting transaction pending.' });
 
+        // ── Task 1: Domain Ownership Enforcement ──────────────────────────────
+        // Parse the platform URL that the deployer specified; this is embedded in
+        // the description JSON payload that the deploy wizard sends.  We then look
+        // up a 'verified' row in domain_verifications for this uid + URL.
+        // If none exists, the deploy is rejected — this closes the bypass where a
+        // user could call /mint-new-cash directly without completing the handshake.
+        let platformUrl = '';
+        try { platformUrl = (JSON.parse(description || '{}').url || '').trim(); } catch(e) {}
+
+        if (!platformUrl || !platformUrl.startsWith('http')) {
+            return res.status(400).json({ error: 'Platform URL is required. Please ensure Step 1 of the deploy wizard is complete.' });
+        }
+
+        const domainVerRes = await pool.query(
+            `SELECT id FROM domain_verifications
+             WHERE uid = $1 AND website_url = $2 AND status = 'verified'
+             ORDER BY verified_at DESC LIMIT 1`,
+            [uid, platformUrl]
+        );
+        if (domainVerRes.rows.length === 0) {
+            return res.status(403).json({
+                error: 'Domain ownership not verified. Please complete the verification handshake in the deploy wizard (Step 2) before minting.'
+            });
+        }
+        const verificationDbId = domainVerRes.rows[0].id;
+
         const deployFeeUsd = 1.00;
         const deployFeeSyr = parseFloat((deployFeeUsd / currentPrice).toFixed(8));
 
@@ -1390,6 +1494,14 @@ app.post('/mint-new-cash', txLimiter, requireWeb3Auth, async (req, res) => {
         });
 
         menuBook.addMintLock(uid);
+
+        // Task 1 — Mark the domain verification record as 'used' so it cannot be
+        // reused to deploy a second ticker under the same URL without re-verifying.
+        await pool.query(
+            `UPDATE domain_verifications SET status = 'used' WHERE id = $1`,
+            [verificationDbId]
+        ).catch(e => console.warn(chalk.yellow('[API] Could not mark domain verification as used:'), e.message));
+
         res.status(201).json({
             message: `Successfully minted ${parsedSupply} ${customTicker} on the Syrpts Network! Gas fee paid: ${deployFeeSyr} SYR`,
             ticker: customTicker

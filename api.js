@@ -573,13 +573,43 @@ app.get('/pricehistory', readLimiter, async (req, res) => {
     }
 });
 
-// ─── Candlestick / OHLCV ─────────────────────────────────────────────────────
+// ─── Candlestick / OHLCV with timeframe support ──────────────────────────────
+// Supported timeframes: 1H (default), 4H, 1D, 1W
+// Returns OHLCV candles for any token from the DB.
+// Falls back to pricehistory line data as {timestamp,price} when no MARKET_TRADE
+// rows exist yet, so the chart always shows something even before first trade.
 app.get('/api/chart/kline', async (req, res) => {
     try {
-        const { symbol = 'SYR' } = req.query;
+        const { symbol = 'SYR', timeframe = '1H' } = req.query;
+
+        // Build the time-bucket expression based on timeframe
+        let truncExpr;
+        let sinceMs = null;  // optional look-back window for recent timeframes
+        switch (timeframe) {
+            case '4H':
+                // Group into 4-hour buckets
+                truncExpr = `date_trunc('hour', to_timestamp(timestamp_ms / 1000)) - (extract(hour from to_timestamp(timestamp_ms/1000))::int % 4) * interval '1 hour'`;
+                sinceMs = Date.now() - 30 * 24 * 60 * 60 * 1000; // 30 days
+                break;
+            case '1D':
+                truncExpr = `date_trunc('day', to_timestamp(timestamp_ms / 1000))`;
+                sinceMs = Date.now() - 365 * 24 * 60 * 60 * 1000; // 1 year
+                break;
+            case '1W':
+                truncExpr = `date_trunc('week', to_timestamp(timestamp_ms / 1000))`;
+                sinceMs = null; // all time
+                break;
+            default: // '1H'
+                truncExpr = `date_trunc('hour', to_timestamp(timestamp_ms / 1000))`;
+                sinceMs = Date.now() - 7 * 24 * 60 * 60 * 1000; // 7 days
+                break;
+        }
+
+        const sinceFilter = sinceMs ? `AND timestamp_ms >= ${sinceMs}` : '';
+
         const dbRes = await pool.query(
             `SELECT
-                date_trunc('hour', to_timestamp(timestamp_ms / 1000)) as time,
+                ${truncExpr} as time,
                 (array_agg(amount_usd / amount ORDER BY timestamp_ms ASC))[1]  as open,
                 MAX(amount_usd / amount) as high,
                 MIN(amount_usd / amount) as low,
@@ -587,11 +617,13 @@ app.get('/api/chart/kline', async (req, res) => {
                 SUM(amount) as volume
              FROM transactions
              WHERE token_symbol = $1 AND type = 'MARKET_TRADE' AND amount > 0 AND amount_usd > 0
+             ${sinceFilter}
              GROUP BY time
              ORDER BY time ASC
              LIMIT 500`,
             [symbol]
         );
+
         let formatted = dbRes.rows.map(r => ({
             time:   new Date(r.time).getTime(),
             open:   parseFloat(r.open),
@@ -601,13 +633,38 @@ app.get('/api/chart/kline', async (req, res) => {
             volume: parseFloat(r.volume)
         }));
 
-        // Fallback: seed the chart with the mint price if no trades exist yet
+        // If no OHLCV rows yet, fall back to pricehistory line data so the chart
+        // is never completely blank — "Awaiting First Trade" only shows when there
+        // is truly zero price data in the entire DB for this token.
         if (formatted.length === 0) {
-            const mintRes = await pool.query(
-                `SELECT price_usd, timestamp_ms FROM transactions WHERE type = 'MINT' AND token_symbol = $1 LIMIT 1`,
+            const lineRes = await pool.query(
+                `SELECT timestamp_ms as ts, (amount_usd / amount) as price
+                 FROM transactions
+                 WHERE token_symbol = $1 AND type = 'MARKET_TRADE' AND amount > 0 AND amount_usd > 0
+                 ORDER BY timestamp_ms ASC LIMIT 500`,
                 [symbol]
             );
-            if (mintRes.rows.length > 0 && mintRes.rows[0].price_usd) {
+            if (lineRes.rows.length > 0) {
+                // Convert raw trade rows into single-point pseudo-candles for line rendering
+                formatted = lineRes.rows.map(r => {
+                    const p = parseFloat(r.price);
+                    return {
+                        time: parseInt(r.ts),
+                        open: p, high: p, low: p, close: p, volume: 0
+                    };
+                });
+            }
+        }
+
+        // Final fallback: if still empty, seed from the MINT transaction.
+        // priceUsd on MINT is now stored as 0 for custom tokens (FIX 2 from previous update)
+        // so we only use this if price_usd > 0 (i.e. it was stored before that fix).
+        if (formatted.length === 0) {
+            const mintRes = await pool.query(
+                `SELECT price_usd, timestamp_ms FROM transactions WHERE type = 'MINT' AND token_symbol = $1 AND price_usd > 0 LIMIT 1`,
+                [symbol]
+            );
+            if (mintRes.rows.length > 0) {
                 const initPrice = parseFloat(mintRes.rows[0].price_usd);
                 formatted.push({
                     time: new Date(parseInt(mintRes.rows[0].timestamp_ms)).getTime(),
@@ -615,6 +672,7 @@ app.get('/api/chart/kline', async (req, res) => {
                 });
             }
         }
+
         res.json(formatted);
     } catch (e) {
         res.status(500).json({ error: 'Chart data unavailable' });

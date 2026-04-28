@@ -383,16 +383,15 @@ class DataChain {
 
   async rebuildPriceHistory() {
       const history = [];
-      history.push({ timestamp: new Date(config.blockchain.genesis_date).getTime(), price: config.blockchain.starting_price });
-      
+
       try {
           const res = await pool.query("SELECT timestamp_ms, amount, amount_usd, price_usd, type FROM transactions WHERE token_symbol = 'SYR' AND (type = 'MARKET_TRADE' OR type = 'BUY' OR type = 'SELL') ORDER BY timestamp_ms ASC");
           for (const tx of res.rows) {
-              const amount = parseFloat(tx.amount);
+              const amount    = parseFloat(tx.amount);
               const amountUsd = parseFloat(tx.amount_usd);
-              const priceUsd = parseFloat(tx.price_usd);
-              const type = tx.type;
-              
+              const priceUsd  = parseFloat(tx.price_usd);
+              const type      = tx.type;
+
               if (type === 'MARKET_TRADE' && amountUsd && amount) {
                   history.push({ timestamp: parseInt(tx.timestamp_ms), price: amountUsd / amount });
               } else if ((type === 'BUY' || type === 'SELL') && priceUsd) {
@@ -400,7 +399,15 @@ class DataChain {
               }
           }
       } catch(e) {}
-      
+
+      // CHART RESET FIX — Only add the genesis anchor ($0.50) when there are
+      // absolutely no trade records in the DB.  Previously this was always
+      // prepended, which made fitContent() zoom the chart all the way back to
+      // the launch date on every server restart, hiding yesterday's trades.
+      if (history.length === 0) {
+          history.push({ timestamp: new Date(config.blockchain.genesis_date).getTime(), price: config.blockchain.starting_price });
+      }
+
       const unique = new Map();
       history.forEach(d => unique.set(Math.floor(d.timestamp / 1000), d.price));
       this.priceHistoryCache = Array.from(unique.entries())

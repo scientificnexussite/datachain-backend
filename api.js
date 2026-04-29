@@ -337,6 +337,43 @@ async function checkServerAlerts(token, newPrice) {
 }
 
 // ─── AUTO-MINER ───────────────────────────────────────────────────────────────
+// ─── Task B: System Liquidity Pool ──────────────────────────────────────────
+// refreshAllPoolOrders() runs after every successful block and maintains one
+// bid and one ask per custom token with an active pool.  The 'system' address
+// always has virtual balance to fill these orders (credited by LIQUIDITY_INIT).
+async function refreshAllPoolOrders() {
+    if (!nexusChain || !nexusChain.state) return;
+    await menuBook.ensureLoaded();
+
+    for (const ticker in nexusChain.state.liquidityPools) {
+        if (ticker === 'SYR') continue; // SYR has its own market-making logic
+        const poolPrice = nexusChain.state.getPoolPrice(ticker);
+        if (poolPrice <= 0) continue;
+
+        menuBook._initTokenBook(ticker);
+
+        // Remove previous system orders for this token to avoid accumulation
+        ['bids', 'asks'].forEach(side => {
+            menuBook.books[ticker][side] = menuBook.books[ticker][side].filter(
+                o => o.uid !== 'system'
+            );
+        });
+
+        // Place a system BUY and SELL order at ±0.5% of pool price.
+        // The spread is tight (1%) so the token appears well-priced on both sides.
+        const lp = nexusChain.state.liquidityPools[ticker];
+        // Order size: 1% of pool token reserve, capped at 10,000 tokens per side
+        const orderSize = Math.min(parseFloat((lp.tokenReserve * 0.01).toFixed(8)), 10_000);
+        if (orderSize < 1e-6) continue;
+
+        const bidPrice  = parseFloat((poolPrice * 0.995).toFixed(8));
+        const askPrice  = parseFloat((poolPrice * 1.005).toFixed(8));
+
+        await menuBook.addLimitOrder('system', 'BUY',  orderSize, bidPrice,  ticker);
+        await menuBook.addLimitOrder('system', 'SELL', orderSize, askPrice,  ticker);
+    }
+}
+
 // FIX 1 — The entire auto-miner body is now wrapped in try/catch/finally.
 //          The finally block unconditionally resets isMining = false so that a
 //          crash inside addBlock() (DB timeout, Worker Thread exit, etc.) can
@@ -365,6 +402,17 @@ setInterval(async () => {
 
             // Run server-side price alert check after every successful block
             await checkServerAlerts('SYR', currentPrice);
+
+            // Task B — Refresh system market-making orders for every custom token
+            // that has an active liquidity pool.  After each block, we clear the old
+            // system bid/ask and re-place them at the current pool price so the spread
+            // always reflects the true pool ratio. This runs silently after the block
+            // commit — errors here never affect block validity.
+            try {
+                await refreshAllPoolOrders();
+            } catch (poolErr) {
+                console.warn(chalk.yellow('[POOL] Market-making refresh failed:'), poolErr.message);
+            }
 
             // Post-mining cleanup: release locks that were waiting on these txs
             pendingTxs.forEach(tx => {
@@ -411,6 +459,31 @@ setInterval(async () => {
                                 `${seedAmount} @ $${seedPrice} (deployer: ${deployerUid.substring(0,12)}...)`
                             ));
                         }
+                    }
+
+                    // Task B — Initialise the system liquidity pool for this token.
+                    // Pool starts with 5% of total supply (capped at 1M) and a matching
+                    // virtual USD reserve at the seed price. These are system-virtual reserves
+                    // (no tokens taken from deployer), enabling the system to market-make
+                    // immediately so buyers always see a live price in both charts.
+                    const poolTokens = Math.min(parseFloat((totalSupply * 0.05).toFixed(8)), 1_000_000);
+                    const poolUsd    = parseFloat((poolTokens * 0.01).toFixed(8)); // seedPrice = $0.01
+                    if (poolTokens > 0) {
+                        await mempool.addTransaction({
+                            from: 'system',
+                            to:   'system',
+                            amount: poolTokens,
+                            amountUsd: poolUsd,
+                            type: 'LIQUIDITY_INIT',
+                            tokenSymbol: seedTicker,
+                            timestamp: Date.now(),
+                            isSystemGenerated: true,
+                            description: 'System Liquidity Pool Init'
+                        });
+                        console.log(chalk.magenta(
+                            `[POOL] Initialised liquidity pool for ${seedTicker}: `+
+                            `${poolTokens} tokens / $${poolUsd} USD`
+                        ));
                     }
                 }
             }
@@ -1649,6 +1722,106 @@ app.get('/api/referrals/:uid', async (req, res) => {
     } catch (e) {
         res.status(500).json({ error: 'Failed to fetch referral data.' });
     }
+});
+
+// ─── Task B: Liquidity Pool Endpoints ────────────────────────────────────────
+
+// POST /liquidity/deposit
+// Authenticated — deployer deposits custom tokens into the system pool.
+// Tokens are locked in the pool; tokenReserve increases; price drops slightly.
+// This is voluntary and free — the deployer gets deeper market liquidity in return.
+app.post('/liquidity/deposit', txLimiter, requireWeb3Auth, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        let { tokenSymbol, amount } = req.body;
+        tokenSymbol = String(tokenSymbol || '').toUpperCase().trim();
+        amount = parseFloat(amount);
+
+        if (!tokenSymbol || tokenSymbol === 'SYR')
+            return res.status(400).json({ error: 'Token symbol required (non-SYR).' });
+        if (isNaN(amount) || amount <= 0)
+            return res.status(400).json({ error: 'Amount must be a positive number.' });
+
+        const balance = nexusChain.state.getBalance(uid, tokenSymbol);
+        if (balance < amount)
+            return res.status(400).json({ error: `Insufficient ${tokenSymbol} balance. Have: ${balance.toFixed(4)}` });
+
+        await mempool.addTransaction({
+            from: uid,
+            to:   'liquidity-pool',
+            amount,
+            type: 'LIQUIDITY_DEPOSIT',
+            tokenSymbol,
+            timestamp: Date.now(),
+            description: `Deposit ${amount} ${tokenSymbol} to system pool`
+        });
+
+        console.log(chalk.magenta(`[POOL] ${uid.substring(0,12)}... deposited ${amount} ${tokenSymbol}`));
+        res.json({ message: `Depositing ${amount} ${tokenSymbol} into the system pool. Your contribution will appear after the next block is mined.` });
+    } catch (e) {
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+// POST /liquidity/withdraw
+// Authenticated — user pays USD at the current pool price to retrieve tokens.
+// usdReserve increases; tokenReserve decreases; pool price is preserved.
+app.post('/liquidity/withdraw', txLimiter, requireWeb3Auth, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        let { tokenSymbol, amount } = req.body;
+        tokenSymbol = String(tokenSymbol || '').toUpperCase().trim();
+        amount = parseFloat(amount);
+
+        if (!tokenSymbol || tokenSymbol === 'SYR')
+            return res.status(400).json({ error: 'Token symbol required (non-SYR).' });
+        if (isNaN(amount) || amount <= 0)
+            return res.status(400).json({ error: 'Amount must be a positive number.' });
+
+        const poolPrice = nexusChain.state.getPoolPrice(tokenSymbol);
+        if (poolPrice <= 0)
+            return res.status(400).json({ error: 'No active liquidity pool for this token.' });
+
+        const lp = nexusChain.state.initPool(tokenSymbol);
+        if (lp.tokenReserve < amount)
+            return res.status(400).json({ error: `Pool only has ${lp.tokenReserve.toFixed(4)} ${tokenSymbol} available.` });
+
+        const usdCost = parseFloat((amount * poolPrice).toFixed(8));
+        const usdBalance = nexusChain.state.getUsd(uid);
+        if (usdBalance < usdCost)
+            return res.status(400).json({ error: `Insufficient USD. Need $${usdCost.toFixed(4)}, have $${usdBalance.toFixed(4)}.` });
+
+        await mempool.addTransaction({
+            from: uid,
+            to:   'liquidity-pool',
+            amount,
+            amountUsd: usdCost,
+            priceUsd:  poolPrice,
+            type: 'LIQUIDITY_WITHDRAW',
+            tokenSymbol,
+            timestamp: Date.now(),
+            description: `Withdraw ${amount} ${tokenSymbol} from pool @ $${poolPrice}`
+        });
+
+        console.log(chalk.magenta(`[POOL] ${uid.substring(0,12)}... withdrew ${amount} ${tokenSymbol} @ $${poolPrice}`));
+        res.json({
+            message: `Withdrawing ${amount} ${tokenSymbol} for $${usdCost.toFixed(4)} USD. Tokens will arrive after the next block is mined.`,
+            poolPrice,
+            usdCost
+        });
+    } catch (e) {
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+// GET /liquidity/:ticker — public pool info for a token
+app.get('/liquidity/:ticker', readLimiter, (req, res) => {
+    const ticker = String(req.params.ticker || '').toUpperCase().trim();
+    if (!ticker || ticker === 'SYR') return res.status(400).json({ error: 'Invalid ticker.' });
+    const lp = nexusChain.state.liquidityPools[ticker];
+    if (!lp) return res.json({ ticker, active: false, tokenReserve: 0, usdReserve: 0, poolPrice: 0 });
+    const poolPrice = nexusChain.state.getPoolPrice(ticker);
+    res.json({ ticker, active: lp.tokenReserve > 0 && lp.usdReserve > 0, tokenReserve: lp.tokenReserve, usdReserve: lp.usdReserve, poolPrice });
 });
 
 // ─── 404 Catch-all ────────────────────────────────────────────────────────────

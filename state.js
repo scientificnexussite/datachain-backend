@@ -20,12 +20,22 @@ pool.query(`
         balance DOUBLE PRECISION,
         PRIMARY KEY (address, token_symbol)
     );
+    CREATE TABLE IF NOT EXISTS state_liquidity_pools (
+        token_symbol  VARCHAR(20) PRIMARY KEY,
+        token_reserve DOUBLE PRECISION DEFAULT 0,
+        usd_reserve   DOUBLE PRECISION DEFAULT 0
+    );
 `).catch(err => console.error(chalk.red("[DB] Failed to initialize state tables"), err));
 
 class State {
   constructor() {
     this.balances = { "SYR": {} };     
-    this.usd_balances = {}; 
+    this.usd_balances = {};
+
+    // Task B — Liquidity pool reserves for each non-SYR custom token.
+    // Keyed by ticker (UPPERCASE); value: { tokenReserve, usdReserve }.
+    // poolPrice = usdReserve / tokenReserve when both > 0.
+    this.liquidityPools = {};
     
     const volumeDir = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
     this.snapshotFile = path.join(volumeDir, 'state_snapshot.json');
@@ -54,6 +64,23 @@ class State {
     return true;
   }
 
+  // ── Liquidity Pool Helpers ─────────────────────────────────────────────────
+  // Task B — Initialise or retrieve a token's liquidity pool entry.
+  initPool(tokenSymbol) {
+    const t = tokenSymbol.toUpperCase();
+    if (!this.liquidityPools[t]) {
+      this.liquidityPools[t] = { tokenReserve: 0, usdReserve: 0 };
+    }
+    return this.liquidityPools[t];
+  }
+
+  // Task B — Current pool spot price for a token (0 if pool inactive).
+  getPoolPrice(tokenSymbol) {
+    const p = this.liquidityPools[tokenSymbol];
+    if (!p || p.tokenReserve <= 0 || p.usdReserve <= 0) return 0;
+    return fixDust(p.usdReserve / p.tokenReserve);
+  }
+
   applyTransaction(tx, currentPrice = 0, isReplay = false) {
     let { from, to, type } = tx;
     
@@ -78,6 +105,55 @@ class State {
 
     if (type === 'USD_WITHDRAWAL') {
       return this.deductUsd(from, amount);
+    }
+
+    // Task B — LIQUIDITY_INIT: system-generated tx that bootstraps the pool
+    // with virtual reserves so the system has inventory to market-make from.
+    // amount = token reserve seeded; tx.amountUsd = virtual USD counterpart.
+    // No tokens are taken from the deployer — these are virtual system reserves.
+    if (type === 'LIQUIDITY_INIT') {
+      const lp = this.initPool(tokenSymbol);
+      lp.tokenReserve = fixDust(amount);
+      lp.usdReserve   = fixDust(parseFloat(tx.amountUsd) || 0);
+      // Credit the system address so it has tokens to fill market-make orders
+      this.balances[tokenSymbol]['system'] = fixDust(
+        (this.balances[tokenSymbol]['system'] || 0) + amount
+      );
+      return true;
+    }
+
+    // Task B — LIQUIDITY_DEPOSIT: deployer voluntarily sends tokens to pool.
+    // tokenReserve increases; usdReserve unchanged (price drops, more depth).
+    // User's balance decreases; 'liquidity-pool' address is the accounting sink.
+    if (type === 'LIQUIDITY_DEPOSIT') {
+      const userBal = this.balances[tokenSymbol][from] || 0;
+      if (!isReplay && userBal < amount) return false;
+      this.balances[tokenSymbol][from] = fixDust(userBal - amount);
+      this.balances[tokenSymbol]['liquidity-pool'] = fixDust(
+        (this.balances[tokenSymbol]['liquidity-pool'] || 0) + amount
+      );
+      const lp = this.initPool(tokenSymbol);
+      lp.tokenReserve = fixDust(lp.tokenReserve + amount);
+      return true;
+    }
+
+    // Task B — LIQUIDITY_WITHDRAW: user pays USD to retrieve tokens from pool.
+    // tx.priceUsd = current pool price used for this withdrawal.
+    // usdReserve increases; tokenReserve decreases; user's USD is deducted.
+    if (type === 'LIQUIDITY_WITHDRAW') {
+      const withdrawPrice = parseFloat(tx.priceUsd) || 0;
+      const usdCost = fixDust(amount * withdrawPrice);
+      const lp = this.initPool(tokenSymbol);
+      if (!isReplay) {
+        if (lp.tokenReserve < amount) return false;
+        if (!this.deductUsd(from, usdCost)) return false;
+      }
+      lp.tokenReserve = fixDust(lp.tokenReserve - amount);
+      lp.usdReserve   = fixDust(lp.usdReserve + usdCost);
+      const poolBal = this.balances[tokenSymbol]['liquidity-pool'] || 0;
+      this.balances[tokenSymbol]['liquidity-pool'] = fixDust(poolBal - amount);
+      this.balances[tokenSymbol][from] = fixDust((this.balances[tokenSymbol][from] || 0) + amount);
+      return true;
     }
 
     let sender = from;
@@ -139,6 +215,22 @@ class State {
             if (!this.balances[row.token_symbol]) this.balances[row.token_symbol] = {};
             this.balances[row.token_symbol][row.address] = parseFloat(row.balance);
         }
+
+        // Task B — Load persisted liquidity pool reserves from DB.
+        try {
+            const lpRes = await pool.query('SELECT token_symbol, token_reserve, usd_reserve FROM state_liquidity_pools');
+            for (const row of lpRes.rows) {
+                this.liquidityPools[row.token_symbol] = {
+                    tokenReserve: parseFloat(row.token_reserve) || 0,
+                    usdReserve:   parseFloat(row.usd_reserve)   || 0
+                };
+            }
+            if (Object.keys(this.liquidityPools).length > 0) {
+                console.log(chalk.cyan(`[STATE] Loaded ${Object.keys(this.liquidityPools).length} liquidity pool(s).`));
+            }
+        } catch (lpErr) {
+            console.warn(chalk.yellow('[STATE] Could not load liquidity pools (table may not exist yet):'), lpErr.message);
+        }
         
         if (Object.keys(this.usd_balances).length === 0 && Object.keys(this.balances["SYR"] || {}).length === 0) {
             throw new Error("Empty Postgres State");
@@ -148,6 +240,7 @@ class State {
         console.log(chalk.yellow("[STATE] Database state empty or missing. Rebuilding ledger mathematically from DB Transactions..."));
         this.balances = { "SYR": {} };
         this.usd_balances = {};
+        this.liquidityPools = {};
 
         try {
             const allTxs = await pool.query("SELECT * FROM transactions ORDER BY block_index ASC, timestamp_ms ASC, id ASC");
@@ -188,7 +281,12 @@ class State {
       try {
           const volumeDir = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
           if (!fs.existsSync(volumeDir)) fs.mkdirSync(volumeDir, { recursive: true });
-          const snapshot = { balances: this.balances, usd_balances: this.usd_balances, lastIndex };
+          const snapshot = {
+              balances: this.balances,
+              usd_balances: this.usd_balances,
+              liquidityPools: this.liquidityPools,
+              lastIndex
+          };
           const tempFile = this.snapshotFile + '.tmp';
           await fs.promises.writeFile(tempFile, JSON.stringify(snapshot));
           await fs.promises.rename(tempFile, this.snapshotFile);
@@ -230,6 +328,22 @@ class State {
                    SELECT * FROM UNNEST($1::varchar[], $2::varchar[], $3::float8[])
                    ON CONFLICT (address, token_symbol) DO UPDATE SET balance = EXCLUDED.balance`,
                   [balAddresses, balTokens, balAmounts]
+              );
+          }
+
+          // Task B — Persist liquidity pool reserves alongside balances.
+          const lpTickers       = Object.keys(this.liquidityPools);
+          const lpTokenReserves = lpTickers.map(t => this.liquidityPools[t].tokenReserve);
+          const lpUsdReserves   = lpTickers.map(t => this.liquidityPools[t].usdReserve);
+
+          if (lpTickers.length > 0) {
+              await client.query(
+                  `INSERT INTO state_liquidity_pools (token_symbol, token_reserve, usd_reserve)
+                   SELECT * FROM UNNEST($1::varchar[], $2::float8[], $3::float8[])
+                   ON CONFLICT (token_symbol) DO UPDATE
+                       SET token_reserve = EXCLUDED.token_reserve,
+                           usd_reserve   = EXCLUDED.usd_reserve`,
+                  [lpTickers, lpTokenReserves, lpUsdReserves]
               );
           }
           

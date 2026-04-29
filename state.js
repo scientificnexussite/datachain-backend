@@ -170,13 +170,21 @@ class State {
 
     let senderBalance = this.balances[tokenSymbol][sender] || 0;
 
-    if (sender === 'system' && senderBalance < amount) {
+    // Task 3 FIX — Only allow the system to auto-mint tokens for SYR (its own
+    // supply). For custom tokens, the system must use only its real balance
+    // (credited by LIQUIDITY_INIT or LIQUIDITY_DEPOSIT). Auto-minting custom
+    // tokens out of thin air would bypass the economic model and allow unlimited
+    // token creation, undermining the liquidity pool design.
+    if (sender === 'system' && senderBalance < amount && tokenSymbol === 'SYR') {
+        // SYR: system is the mint authority and can create new supply as needed
         this.balances[tokenSymbol][sender] = fixDust(senderBalance + amount);
         senderBalance = this.balances[tokenSymbol][sender];
     }
 
     if (type === 'TRANSFER' || type === 'MARKET_TRADE' || type === 'BUY' || type === 'SELL') {
-        if (!isReplay && sender !== 'system' && senderBalance < amount) return false; 
+        // For custom tokens: system is bound by its actual balance just like any user.
+        // For SYR: system already had its balance topped up above if needed.
+        if (!isReplay && senderBalance < amount && (sender !== 'system' || tokenSymbol !== 'SYR')) return false; 
         
         let tradeUsdValue = parseFloat(tx.amountUsd) || 0;
         if (!tradeUsdValue && tx.priceUsd) tradeUsdValue = fixDust(amount * parseFloat(tx.priceUsd));

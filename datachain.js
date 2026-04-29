@@ -39,6 +39,16 @@ pool.query(`
     );
 `).catch(err => console.error(chalk.red("[DB] Blocks init failed"), err));
 
+// Database Migration Fix (29 April 2026) — Ensure price_usd column exists.
+// CREATE TABLE IF NOT EXISTS does NOT modify existing tables, so older Railway
+// deployments that were created before this column was added to the schema
+// would crash with "column price_usd does not exist" when saving blocks.
+// This ALTER TABLE … ADD COLUMN IF NOT EXISTS is idempotent and safe to run
+// on every startup — Postgres silently ignores it if the column already exists.
+pool.query(`
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS price_usd DOUBLE PRECISION;
+`).catch(err => console.warn('[DB] price_usd migration warning (safe to ignore if column exists):', err.message));
+
 class Block {
   constructor(index, timestamp, data, previousHash = '') {
     this.index = index;

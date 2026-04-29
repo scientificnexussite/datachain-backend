@@ -363,14 +363,28 @@ async function refreshAllPoolOrders() {
         // The spread is tight (1%) so the token appears well-priced on both sides.
         const lp = nexusChain.state.liquidityPools[ticker];
         // Order size: 1% of pool token reserve, capped at 10,000 tokens per side
-        const orderSize = Math.min(parseFloat((lp.tokenReserve * 0.01).toFixed(8)), 10_000);
-        if (orderSize < 1e-6) continue;
+        const rawOrderSize = Math.min(parseFloat((lp.tokenReserve * 0.01).toFixed(8)), 10_000);
+        if (rawOrderSize < 1e-6) continue;
 
         const bidPrice  = parseFloat((poolPrice * 0.995).toFixed(8));
         const askPrice  = parseFloat((poolPrice * 1.005).toFixed(8));
 
-        await menuBook.addLimitOrder('system', 'BUY',  orderSize, bidPrice,  ticker);
-        await menuBook.addLimitOrder('system', 'SELL', orderSize, askPrice,  ticker);
+        // Task 3 — Cap order sizes to the system's ACTUAL available balance
+        // so that no order is placed that the system cannot fill without
+        // auto-minting tokens (which was removed from state.js as a fix).
+        const systemTokenBal = nexusChain.state.getBalance('system', ticker);
+        const systemUsdBal   = nexusChain.state.getUsd('system');
+        // SELL order: limited by system token balance
+        const sellOrderSize  = Math.min(rawOrderSize, systemTokenBal);
+        // BUY order: limited by how many tokens the system's USD can purchase at bidPrice
+        const buyOrderSize   = Math.min(rawOrderSize, bidPrice > 0 ? systemUsdBal / bidPrice : 0);
+
+        if (sellOrderSize >= 1e-6) {
+            await menuBook.addLimitOrder('system', 'SELL', parseFloat(sellOrderSize.toFixed(8)), askPrice, ticker);
+        }
+        if (buyOrderSize >= 1e-6) {
+            await menuBook.addLimitOrder('system', 'BUY', parseFloat(buyOrderSize.toFixed(8)), bidPrice, ticker);
+        }
     }
 }
 
@@ -822,19 +836,30 @@ app.get('/trending', readLimiter, async (req, res) => {
     }
 });
 
-// ─── Referral Sign-up ─────────────────────────────────────────────────────────
-app.post('/referral/signup', async (req, res) => {
-    const { uid, referrer } = req.body;
-    if (!uid || !referrer || uid === referrer)
-        return res.status(400).json({ error: 'Invalid request' });
+// ─── Referral Sign-up (TASK 1: Now requireWeb3Auth-secured) ──────────────────
+// uid is taken from req.user.uid (the authenticated wallet) — NOT the request body —
+// so a user cannot falsely assign a referrer to someone else's wallet.
+app.post('/referral/signup', txLimiter, requireWeb3Auth, async (req, res) => {
+    const uid      = req.user.uid;          // authenticated wallet address
+    const { referrer } = req.body;
+    if (!referrer || uid === referrer)
+        return res.status(400).json({ error: 'Invalid referral code.' });
     try {
+        // Prevent double-signing: if a referral already exists for this uid, reject
+        const existing = await pool.query(
+            'SELECT 1 FROM referrals WHERE referred_uid = $1 LIMIT 1',
+            [uid]
+        );
+        if (existing.rows.length > 0)
+            return res.status(409).json({ error: 'A referrer is already registered for this wallet.' });
+
         await pool.query(
             'INSERT INTO referrals (referred_uid, referrer_uid, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
             [uid, referrer, Date.now()]
         );
         res.json({ success: true });
     } catch (e) {
-        res.status(500).json({ error: 'Failed' });
+        res.status(500).json({ error: 'Failed to register referral.' });
     }
 });
 

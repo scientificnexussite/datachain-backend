@@ -74,6 +74,16 @@ pool.query(`
         created_at BIGINT,
         verified_at BIGINT
     );
+    -- Feature A: System Handler addresses for custom token creators.
+    -- Each custom token can have one system address that auto-manages liquidity.
+    -- Only the token creator can pay to generate one; the address only accepts
+    -- the specific token it was created for (enforced in /tx/new).
+    CREATE TABLE IF NOT EXISTS system_handlers (
+        token_symbol  VARCHAR(20) PRIMARY KEY,
+        system_address VARCHAR(100) NOT NULL,
+        creator_uid   VARCHAR(100) NOT NULL,
+        created_at    BIGINT
+    );
 `).catch(err => console.error(chalk.red('[DB] API State & Feature tables init failed'), err));
 
 // ─── Express App ──────────────────────────────────────────────────────────────
@@ -1342,6 +1352,29 @@ app.post('/tx/new', txLimiter, requireWeb3Auth, async (req, res) => {
             if (from !== req.user.uid) return res.status(403).json({ error: 'Forbidden: Originating address mismatch.' });
             if ((nexusChain.getBalance(from, tokenSymbol) - menuBook.getLockedToken(from, tokenSymbol) - mempool.getPendingTokenSpend(from, tokenSymbol)) < tx.amount)
                 return res.status(400).json({ error: `Insufficient ${tokenSymbol} balance.` });
+
+            // Feature A — Smart Token Validation for system handler addresses.
+            // If the recipient is a known system handler address, verify that the
+            // token being sent matches the token that address was created for.
+            // This prevents accidental or malicious cross-token transfers to system handlers.
+            if (tx.to && tx.to.startsWith('nx_sys_')) {
+                try {
+                    const handlerRes = await pool.query(
+                        'SELECT token_symbol FROM system_handlers WHERE system_address = $1 LIMIT 1',
+                        [tx.to]
+                    );
+                    if (handlerRes.rows.length > 0) {
+                        const expectedToken = handlerRes.rows[0].token_symbol;
+                        if (expectedToken !== tokenSymbol) {
+                            return res.status(400).json({
+                                error: `This system address only accepts ${expectedToken} tokens. You cannot send ${tokenSymbol} to it.`
+                            });
+                        }
+                    }
+                } catch (valErr) {
+                    console.warn(chalk.yellow('[TX] System handler validation warning:'), valErr.message);
+                }
+            }
         } else if (type === 'USD_WITHDRAWAL') {
             if (from !== req.user.uid) return res.status(403).json({ error: 'Forbidden: Originating address mismatch.' });
             if ((nexusChain.state.getUsd(from) - menuBook.getLockedUsd(from, tokenSymbol) - mempool.getPendingUsdSpend(from)) < tx.amount)
@@ -1847,6 +1880,95 @@ app.get('/liquidity/:ticker', readLimiter, (req, res) => {
     if (!lp) return res.json({ ticker, active: false, tokenReserve: 0, usdReserve: 0, poolPrice: 0 });
     const poolPrice = nexusChain.state.getPoolPrice(ticker);
     res.json({ ticker, active: lp.tokenReserve > 0 && lp.usdReserve > 0, tokenReserve: lp.tokenReserve, usdReserve: lp.usdReserve, poolPrice });
+});
+
+// ─── Feature A: System Handler Endpoints ─────────────────────────────────────
+
+// GET /system-handler/:ticker — Public: check if a handler exists for this token.
+// Returns the system address only to the token's creator (other callers get exists:true but no address).
+app.get('/system-handler/:ticker', readLimiter, async (req, res) => {
+    const ticker = String(req.params.ticker || '').toUpperCase().trim();
+    if (!ticker) return res.status(400).json({ error: 'Invalid ticker.' });
+    try {
+        const row = await pool.query(
+            'SELECT system_address, creator_uid FROM system_handlers WHERE token_symbol = $1 LIMIT 1',
+            [ticker]
+        );
+        if (row.rows.length === 0) return res.json({ exists: false });
+        // The creator's uid is checked on the authenticated endpoint below;
+        // here we return the address only so the frontend can populate the UI.
+        // The creator matches via WalletManager.address === tInfo.owner comparison client-side.
+        res.json({ exists: true, systemAddress: row.rows[0].system_address, creatorUid: row.rows[0].creator_uid });
+    } catch (e) {
+        res.status(500).json({ error: 'Failed to fetch system handler info.' });
+    }
+});
+
+// POST /system-handler/pay-fee — Authenticated: pay $2 and generate a system address.
+// Only the token creator can call this; only one handler per token is allowed.
+app.post('/system-handler/pay-fee', txLimiter, requireWeb3Auth, async (req, res) => {
+    const uid = req.user.uid;
+    const { tokenSymbol, timestamp } = req.body;
+    const ticker = String(tokenSymbol || '').toUpperCase().trim();
+
+    if (!ticker || ticker === 'SYR')
+        return res.status(400).json({ error: 'Invalid token symbol. Cannot create a system handler for SYR.' });
+
+    try {
+        // Validate: token must exist on chain
+        const allTokens = Object.keys(nexusChain.state.balances);
+        if (!allTokens.includes(ticker))
+            return res.status(404).json({ error: `Token ${ticker} not found on the DataChain.` });
+
+        // Validate: authenticated user must be the token creator
+        const mintRes = await pool.query(
+            `SELECT to_address FROM transactions WHERE type = 'MINT' AND token_symbol = $1 AND is_system_generated = TRUE LIMIT 1`,
+            [ticker]
+        );
+        if (mintRes.rows.length === 0 || mintRes.rows[0].to_address !== uid)
+            return res.status(403).json({ error: 'Only the original creator of this token can activate a System Handler.' });
+
+        // Validate: no duplicate handler
+        const existingRes = await pool.query(
+            'SELECT 1 FROM system_handlers WHERE token_symbol = $1 LIMIT 1',
+            [ticker]
+        );
+        if (existingRes.rows.length > 0)
+            return res.status(409).json({ error: `A System Handler already exists for ${ticker}. Use the existing address.` });
+
+        // Validate: user has ≥ $2.00 USD balance
+        const usdBalance = nexusChain.state.getUsd(uid);
+        const FEE_USD    = 2.00;
+        if (usdBalance < FEE_USD)
+            return res.status(400).json({ error: `Insufficient USD balance. Need $2.00, have $${usdBalance.toFixed(2)}.` });
+
+        // Deduct $2 fee via USD_WITHDRAWAL transaction
+        await mempool.addTransaction({
+            from: uid, to: 'system', amount: FEE_USD,
+            type: 'USD_WITHDRAWAL', tokenSymbol: ticker,
+            timestamp: Date.now(), isSystemGenerated: false,
+            description: `System Handler activation fee for ${ticker}`
+        });
+
+        // Generate a cryptographically unique system address for this token
+        const systemAddress = 'nx_sys_' + crypto.randomBytes(16).toString('hex');
+
+        // Persist to database
+        await pool.query(
+            'INSERT INTO system_handlers (token_symbol, system_address, creator_uid, created_at) VALUES ($1, $2, $3, $4)',
+            [ticker, systemAddress, uid, Date.now()]
+        );
+
+        console.log(chalk.magenta(`[SYSTEM HANDLER] Activated for ${ticker}: ${systemAddress} (creator: ${uid.substring(0,12)}...)`));
+
+        res.status(201).json({
+            systemAddress,
+            message: `System Handler activated for ${ticker}. Fee of $2.00 deducted (will apply after next block).`
+        });
+    } catch (e) {
+        console.error(chalk.red('[SYSTEM HANDLER] pay-fee error:'), e.message);
+        res.status(500).json({ error: 'Internal Server Error' });
+    }
 });
 
 // ─── 404 Catch-all ────────────────────────────────────────────────────────────

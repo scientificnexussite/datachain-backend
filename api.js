@@ -1381,20 +1381,28 @@ app.get('/stats', (req, res) => {
         return res.json(apiCache.stats.data);
     }
 
-    // FIX: For custom tokens, return token-specific stats so the UI can update
-    // the "remaining supply" display when the user switches to a custom asset.
+    // FIX: For custom tokens, return token-specific stats including:
+    //   - circulatingSupply: tokens held by real users (not system/handler addresses)
+    //   - handlerSupply: tokens sent to the system handler address (this is what
+    //     the UI shows as "Remaining Supply" for custom tokens — it's the amount
+    //     the creator has deposited for automated market-making)
     const tokenBals = nexusChain.state.balances[token] || {};
     let circulating = 0;
+    let handlerSupply = 0;
     for (const addr in tokenBals) {
-        if (addr !== 'system' && !addr.startsWith('nx_sys_') && addr !== 'liquidity-pool') {
-            circulating += tokenBals[addr] || 0;
+        const bal = tokenBals[addr] || 0;
+        if (addr.startsWith('nx_sys_')) {
+            handlerSupply += bal;   // tokens in the system handler = "remaining" pool
+        } else if (addr !== 'system' && addr !== 'liquidity-pool') {
+            circulating += bal;     // tokens held by real users
         }
     }
     const tokenPrice = menuBook.books[token]?.lastTradePrice || menuBook.books[token]?.asks?.[0]?.priceUsd || 0;
     res.json({
         token,
         circulatingSupply: circulating,
-        remainingSupply: 0, // custom tokens don't have a "remaining" concept
+        handlerSupply,               // amount the creator sent to the system handler
+        remainingSupply: handlerSupply, // shown as "Remaining Supply" in the UI ticker
         currentPrice: tokenPrice,
         marketCap: circulating * tokenPrice
     });

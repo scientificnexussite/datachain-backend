@@ -355,46 +355,90 @@ async function refreshAllPoolOrders() {
     if (!nexusChain || !nexusChain.state) return;
     await menuBook.ensureLoaded();
 
-    for (const ticker in nexusChain.state.liquidityPools) {
+    // FIX — Also run market-making for tokens with system handler addresses,
+    // even if they don't have a formal liquidityPool entry yet.
+    // When the creator sends tokens to nx_sys_... those tokens are held there,
+    // but refreshAllPoolOrders previously only iterated liquidityPools tickers.
+    // Now we also check all nx_sys_ addresses and add their tickers.
+    const tickersToProcess = new Set(Object.keys(nexusChain.state.liquidityPools));
+    try {
+        const handlerRows = await pool.query('SELECT token_symbol, system_address FROM system_handlers');
+        for (const row of handlerRows.rows) {
+            tickersToProcess.add(row.token_symbol);
+        }
+    } catch(e) { /* table may not exist on first boot */ }
+
+    for (const ticker of tickersToProcess) {
         if (ticker === 'SYR') continue; // SYR has its own market-making logic
-        const poolPrice = nexusChain.state.getPoolPrice(ticker);
-        if (poolPrice <= 0) continue;
 
         menuBook._initTokenBook(ticker);
+        const book = menuBook.books[ticker];
 
         // Remove previous system orders for this token to avoid accumulation
         ['bids', 'asks'].forEach(side => {
-            menuBook.books[ticker][side] = menuBook.books[ticker][side].filter(
-                o => o.uid !== 'system'
-            );
+            book[side] = book[side].filter(o => o.uid !== 'system');
         });
 
-        // Place a system BUY and SELL order at ±0.5% of pool price.
-        // The spread is tight (1%) so the token appears well-priced on both sides.
-        const lp = nexusChain.state.liquidityPools[ticker];
-        // Order size: 1% of pool token reserve, capped at 10,000 tokens per side
-        const rawOrderSize = Math.min(parseFloat((lp.tokenReserve * 0.01).toFixed(8)), 10_000);
+        // FIX: aggregate tokens from BOTH 'system' address AND any nx_sys_ handler for this ticker.
+        // The creator sends tokens to nx_sys_... but the system needs to use them for market-making.
+        let combinedTokenBal = nexusChain.state.getBalance('system', ticker);
+        let handlerAddress   = null;
+        try {
+            const hRow = await pool.query(
+                'SELECT system_address FROM system_handlers WHERE token_symbol = $1 LIMIT 1',
+                [ticker]
+            );
+            if (hRow.rows.length > 0) {
+                handlerAddress = hRow.rows[0].system_address;
+                combinedTokenBal += nexusChain.state.getBalance(handlerAddress, ticker);
+            }
+        } catch(e) {}
+
+        // Determine pool price: use liquidityPool if available, else derive from menubook last price
+        let poolPrice = nexusChain.state.getPoolPrice(ticker);
+        if (poolPrice <= 0 && book.lastTradePrice > 0) {
+            poolPrice = book.lastTradePrice;
+        }
+        if (poolPrice <= 0 && book.asks && book.asks.length > 0) {
+            poolPrice = book.asks[0].priceUsd;
+        }
+        if (poolPrice <= 0 || combinedTokenBal <= 0) continue;
+
+        // Update the liquidity pool state to reflect the handler's balance
+        if (handlerAddress && combinedTokenBal > 0) {
+            nexusChain.state.initPool(ticker);
+            const lp = nexusChain.state.liquidityPools[ticker];
+            // Sync pool reserves to reflect actual combined token balance
+            if (lp.tokenReserve < combinedTokenBal) {
+                lp.tokenReserve = combinedTokenBal;
+                if (lp.usdReserve <= 0) lp.usdReserve = parseFloat((combinedTokenBal * poolPrice).toFixed(8));
+            }
+        }
+
+        // Order size: 1% of combined available tokens, capped at 10,000 per side
+        const rawOrderSize = Math.min(parseFloat((combinedTokenBal * 0.01).toFixed(8)), 10_000);
         if (rawOrderSize < 1e-6) continue;
 
-        const bidPrice  = parseFloat((poolPrice * 0.995).toFixed(8));
-        const askPrice  = parseFloat((poolPrice * 1.005).toFixed(8));
+        const bidPrice   = parseFloat((poolPrice * 0.995).toFixed(8));
+        const askPrice   = parseFloat((poolPrice * 1.005).toFixed(8));
+        const systemUsdBal = nexusChain.state.getUsd('system');
 
-        // Task 3 — Cap order sizes to the system's ACTUAL available balance
-        // so that no order is placed that the system cannot fill without
-        // auto-minting tokens (which was removed from state.js as a fix).
-        const systemTokenBal = nexusChain.state.getBalance('system', ticker);
-        const systemUsdBal   = nexusChain.state.getUsd('system');
-        // SELL order: limited by system token balance
-        const sellOrderSize  = Math.min(rawOrderSize, systemTokenBal);
-        // BUY order: limited by how many tokens the system's USD can purchase at bidPrice
-        const buyOrderSize   = Math.min(rawOrderSize, bidPrice > 0 ? systemUsdBal / bidPrice : 0);
+        // SELL: limited by combined token balance
+        const sellOrderSize = Math.min(rawOrderSize, combinedTokenBal);
+        // BUY: limited by system USD balance
+        const buyOrderSize  = Math.min(rawOrderSize, bidPrice > 0 ? systemUsdBal / bidPrice : 0);
 
         if (sellOrderSize >= 1e-6) {
-            await menuBook.addLimitOrder('system', 'SELL', parseFloat(sellOrderSize.toFixed(8)), askPrice, ticker);
+            // Place SELL order from the handler address if it has balance, else from 'system'
+            const sellUid = (handlerAddress && nexusChain.state.getBalance(handlerAddress, ticker) >= sellOrderSize)
+                ? handlerAddress : 'system';
+            await menuBook.addLimitOrder(sellUid, 'SELL', parseFloat(sellOrderSize.toFixed(8)), askPrice, ticker);
         }
         if (buyOrderSize >= 1e-6) {
             await menuBook.addLimitOrder('system', 'BUY', parseFloat(buyOrderSize.toFixed(8)), bidPrice, ticker);
         }
+
+        console.log(chalk.cyan(`[POOL] ${ticker}: price=$${poolPrice.toFixed(4)} tokens=${combinedTokenBal.toFixed(0)} sell=${sellOrderSize.toFixed(2)} buy=${buyOrderSize.toFixed(2)}`));
     }
 }
 
@@ -1320,17 +1364,40 @@ app.get('/balance/:address', (req, res) => {
 });
 
 app.get('/stats', (req, res) => {
-    if (Date.now() - apiCache.stats.time < CACHE_TTL && apiCache.stats.data) return res.json(apiCache.stats.data);
-    const remaining = nexusChain.getRemainingSupply('SYR');
-    apiCache.stats.data = {
-        maxSupply: MAX_SUPPLY,
-        remainingSupply: remaining,
-        circulatingSupply: MAX_SUPPLY - remaining,
-        currentPrice,
-        marketCap: (MAX_SUPPLY - remaining) * currentPrice
-    };
-    apiCache.stats.time = Date.now();
-    res.json(apiCache.stats.data);
+    const token = (req.query.token || 'SYR').toUpperCase();
+
+    // For SYR, use cached stats
+    if (token === 'SYR') {
+        if (Date.now() - apiCache.stats.time < CACHE_TTL && apiCache.stats.data) return res.json(apiCache.stats.data);
+        const remaining = nexusChain.getRemainingSupply('SYR');
+        apiCache.stats.data = {
+            maxSupply: MAX_SUPPLY,
+            remainingSupply: remaining,
+            circulatingSupply: MAX_SUPPLY - remaining,
+            currentPrice,
+            marketCap: (MAX_SUPPLY - remaining) * currentPrice
+        };
+        apiCache.stats.time = Date.now();
+        return res.json(apiCache.stats.data);
+    }
+
+    // FIX: For custom tokens, return token-specific stats so the UI can update
+    // the "remaining supply" display when the user switches to a custom asset.
+    const tokenBals = nexusChain.state.balances[token] || {};
+    let circulating = 0;
+    for (const addr in tokenBals) {
+        if (addr !== 'system' && !addr.startsWith('nx_sys_') && addr !== 'liquidity-pool') {
+            circulating += tokenBals[addr] || 0;
+        }
+    }
+    const tokenPrice = menuBook.books[token]?.lastTradePrice || menuBook.books[token]?.asks?.[0]?.priceUsd || 0;
+    res.json({
+        token,
+        circulatingSupply: circulating,
+        remainingSupply: 0, // custom tokens don't have a "remaining" concept
+        currentPrice: tokenPrice,
+        marketCap: circulating * tokenPrice
+    });
 });
 
 app.get('/supply',        (req, res) => res.json({ remainingSupply: nexusChain.getRemainingSupply('SYR') }));

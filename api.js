@@ -1121,10 +1121,33 @@ app.post('/api/orders/cancel', requireWeb3Auth, async (req, res) => {
     }
 });
 
+// FIX Issue 2: Return ALL open orders across ALL tokens for this user.
+// Previously tokenSymbol defaulted to 'SYR', so custom token orders were never returned.
+// The frontend can then filter client-side by selectedToken or search ticker.
 app.post('/api/orders/:uid', requireWeb3Auth, (req, res) => {
     if (req.user.uid !== req.params.uid) return res.status(403).json({ error: 'Forbidden' });
-    const { tokenSymbol = 'SYR' } = req.body;
-    res.json(menuBook.getUserOrders(req.params.uid, tokenSymbol));
+    const uid = req.params.uid;
+
+    // If tokenSymbol is explicitly provided, return only that token (backward compat)
+    const { tokenSymbol } = req.body;
+    if (tokenSymbol) {
+        return res.json(menuBook.getUserOrders(uid, tokenSymbol));
+    }
+
+    // No tokenSymbol: aggregate across ALL known token books
+    const allTokens = Object.keys(menuBook.books);
+    let allOrders = [];
+    for (const t of allTokens) {
+        const orders = menuBook.getUserOrders(uid, t);
+        allOrders = allOrders.concat(orders);
+    }
+    // Also check SYR if not in books yet
+    if (!allTokens.includes('SYR')) {
+        allOrders = allOrders.concat(menuBook.getUserOrders(uid, 'SYR'));
+    }
+    // Sort by timestamp descending
+    allOrders.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+    res.json(allOrders);
 });
 
 // ─── Limit Orders ─────────────────────────────────────────────────────────────
@@ -1208,11 +1231,74 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
         const fundsToCheck = side === 'BUY' ? availableUsd : availableToken;
         const matchResult  = await menuBook.matchMarketOrder(uid, side, parsedAmount, fundsToCheck, null, tokenSymbol);
 
+        // ── FIX Issue 4: AMM fallback for custom tokens ────────────────────────────
+        // For custom tokens with a system handler (nx_sys_ address), if the orderbook
+        // has no matching sell orders, fill from the system handler's token balance at
+        // the current pool price. This makes the "Remaining Supply" (tokens sent to the
+        // system handler) actually serve as automated market-maker liquidity.
+        if (side === 'BUY' && matchResult.remaining > 1e-8 && tokenSymbol !== 'SYR') {
+            try {
+                // Find the system handler address for this token
+                const hRow = await pool.query(
+                    'SELECT system_address FROM system_handlers WHERE token_symbol = $1 LIMIT 1',
+                    [tokenSymbol]
+                );
+                if (hRow.rows.length > 0) {
+                    const handlerAddr = hRow.rows[0].system_address;
+                    const handlerBal  = nexusChain.state.getBalance(handlerAddr, tokenSymbol)
+                                      - mempool.getPendingTokenSpend(handlerAddr, tokenSymbol);
+                    const poolPrice   = nexusChain.state.getPoolPrice(tokenSymbol) ||
+                                       (menuBook.books[tokenSymbol]?.lastTradePrice || 0);
+
+                    if (handlerBal > 1e-8 && poolPrice > 0) {
+                        let fillAmount  = fixDust(Math.min(matchResult.remaining, handlerBal));
+                        const fillUsd   = fixDust(fillAmount * poolPrice);
+                        const remaining = fundsToCheck - matchResult.totalUsdCost;
+
+                        // Respect buyer's USD budget
+                        if (fillUsd > remaining) {
+                            fillAmount = fixDust(remaining / poolPrice);
+                        }
+
+                        if (fillAmount > 1e-8) {
+                            // Record the AMM fill as a MARKET_TRADE from the handler address
+                            await mempool.addTransaction({
+                                from: handlerAddr, to: uid,
+                                amount: fillAmount, amountUsd: fixDust(fillAmount * poolPrice),
+                                type: 'MARKET_TRADE', tokenSymbol,
+                                timestamp: Date.now(), isSystemGenerated: true
+                            });
+
+                            // Update pool state: usdReserve increases, tokenReserve decreases
+                            nexusChain.state.initPool(tokenSymbol);
+                            const lp = nexusChain.state.liquidityPools[tokenSymbol];
+                            lp.tokenReserve = fixDust(lp.tokenReserve - fillAmount);
+                            lp.usdReserve   = fixDust(lp.usdReserve   + fixDust(fillAmount * poolPrice));
+                            menuBook.books[tokenSymbol].lastTradePrice = poolPrice;
+
+                            matchResult.trades.push({ buyer: uid, seller: handlerAddr, amountSyr: fillAmount, amountUsd: fixDust(fillAmount * poolPrice), price: poolPrice, tokenSymbol });
+                            matchResult.executedSyr  = fixDust(matchResult.executedSyr  + fillAmount);
+                            matchResult.remaining    = fixDust(matchResult.remaining    - fillAmount);
+                            matchResult.totalUsdCost = fixDust(matchResult.totalUsdCost + fixDust(fillAmount * poolPrice));
+                        }
+                    }
+                }
+            } catch (ammErr) {
+                console.warn(chalk.yellow(`[AMM] Custom token fallback error for ${tokenSymbol}:`), ammErr.message);
+            }
+        }
+
         // System liquidity fallback for SYR BUY orders with remaining unfilled volume
         if (side === 'BUY' && matchResult.remaining > 1e-8 && tokenSymbol === 'SYR') {
             const systemBalance = nexusChain.getBalance('system', tokenSymbol) - mempool.getPendingTokenSpend('system', tokenSymbol);
-            if (systemBalance > 0) {
-                let tradeAmount = Math.min(matchResult.remaining, systemBalance);
+            // Centralization Fix 1 — Cap system minting power for SYR.
+            // The system can only market-make with SYR it has earned from deploy fees
+            // and referral revenue. Hard cap: system balance cannot exceed 2% of MAX_SUPPLY.
+            // This gives users a mathematical guarantee on maximum dilution.
+            const SYR_SYSTEM_MINT_CAP = MAX_SUPPLY * 0.02; // 2% of 6B = 120M SYR hard cap
+            const cappedSystemBalance = Math.min(systemBalance, SYR_SYSTEM_MINT_CAP);
+            if (cappedSystemBalance > 0) {
+                let tradeAmount = Math.min(matchResult.remaining, cappedSystemBalance);
                 const virtualSyrReserve = 5_000_000;
                 const virtualUsdReserve = virtualSyrReserve * currentPrice;
 

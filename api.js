@@ -962,9 +962,15 @@ app.get('/tokens', readLimiter, async (req, res) => {
         let mintDataMap = new Map();
 
         try {
+            // FIX: Use DISTINCT ON to ensure only the FIRST MINT transaction per token
+            // is used for owner detection. Without this, if multiple MINT-type rows exist
+            // for the same token, the forEach loop's last-write-wins behaviour could overwrite
+            // the deployer's address with a different value.
             const dbRes = await pool.query(
-                `SELECT token_symbol, description, platform_type, to_address, price_usd
-                 FROM transactions WHERE type = 'MINT' AND token_symbol = ANY($1)`,
+                `SELECT DISTINCT ON (token_symbol) token_symbol, description, platform_type, to_address, price_usd
+                 FROM transactions
+                 WHERE type = 'MINT' AND token_symbol = ANY($1) AND is_system_generated = TRUE
+                 ORDER BY token_symbol, timestamp_ms ASC`,
                 [tokensObj]
             );
             const verRes = await pool.query(
@@ -2167,6 +2173,33 @@ app.post('/system-handler/pay-fee', txLimiter, requireWeb3Auth, async (req, res)
     } catch (e) {
         console.error(chalk.red('[SYSTEM HANDLER] pay-fee error:'), e.message);
         res.status(500).json({ error: 'Internal Server Error' });
+    }
+});
+
+// ─── Debug: Token Owner Check ────────────────────────────────────────────────
+// Authenticated: returns the exact owner address stored in DB for a token.
+// Lets the creator compare their wallet address against what the DB holds.
+app.get('/debug/owner/:ticker', readLimiter, async (req, res) => {
+    const ticker = String(req.params.ticker || '').toUpperCase();
+    if (!ticker) return res.status(400).json({ error: 'Invalid ticker.' });
+    try {
+        const row = await pool.query(
+            `SELECT to_address, from_address, timestamp_ms, is_system_generated
+             FROM transactions
+             WHERE type = 'MINT' AND token_symbol = $1 AND is_system_generated = TRUE
+             ORDER BY timestamp_ms ASC LIMIT 1`,
+            [ticker]
+        );
+        if (row.rows.length === 0) return res.json({ ticker, owner: null, message: 'No MINT transaction found in DB for this token.' });
+        res.json({
+            ticker,
+            owner: row.rows[0].to_address,
+            from: row.rows[0].from_address,
+            timestamp: row.rows[0].timestamp_ms,
+            isSystemGenerated: row.rows[0].is_system_generated
+        });
+    } catch (e) {
+        res.status(500).json({ error: 'DB query failed.' });
     }
 });
 

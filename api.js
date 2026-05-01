@@ -740,7 +740,41 @@ app.get('/api/chart/kline', async (req, res) => {
         // Build the time-bucket expression based on timeframe
         let truncExpr;
         let sinceMs = null;  // optional look-back window for recent timeframes
+        // Supported timeframes: 1m, 3m, 5m, 15m, 30m, 45m, 1H, 2H, 3H, 4H, 1D, 1W, 1M, ALL
+        // For sub-hour timeframes we use minute-level floor truncation via integer math.
         switch (timeframe) {
+            case '1m':
+                truncExpr = `to_timestamp(floor(timestamp_ms / 60000) * 60)`;
+                sinceMs = Date.now() - 2 * 60 * 60 * 1000; // 2 hours
+                break;
+            case '3m':
+                truncExpr = `to_timestamp(floor(timestamp_ms / 180000) * 180)`;
+                sinceMs = Date.now() - 6 * 60 * 60 * 1000; // 6 hours
+                break;
+            case '5m':
+                truncExpr = `to_timestamp(floor(timestamp_ms / 300000) * 300)`;
+                sinceMs = Date.now() - 12 * 60 * 60 * 1000; // 12 hours
+                break;
+            case '15m':
+                truncExpr = `to_timestamp(floor(timestamp_ms / 900000) * 900)`;
+                sinceMs = Date.now() - 3 * 24 * 60 * 60 * 1000; // 3 days
+                break;
+            case '30m':
+                truncExpr = `to_timestamp(floor(timestamp_ms / 1800000) * 1800)`;
+                sinceMs = Date.now() - 7 * 24 * 60 * 60 * 1000; // 7 days
+                break;
+            case '45m':
+                truncExpr = `to_timestamp(floor(timestamp_ms / 2700000) * 2700)`;
+                sinceMs = Date.now() - 10 * 24 * 60 * 60 * 1000; // 10 days
+                break;
+            case '2H':
+                truncExpr = `date_trunc('hour', to_timestamp(timestamp_ms / 1000)) - (extract(hour from to_timestamp(timestamp_ms/1000))::int % 2) * interval '1 hour'`;
+                sinceMs = Date.now() - 60 * 24 * 60 * 60 * 1000; // 60 days
+                break;
+            case '3H':
+                truncExpr = `date_trunc('hour', to_timestamp(timestamp_ms / 1000)) - (extract(hour from to_timestamp(timestamp_ms/1000))::int % 3) * interval '1 hour'`;
+                sinceMs = Date.now() - 60 * 24 * 60 * 60 * 1000; // 60 days
+                break;
             case '4H':
                 // Group into 4-hour buckets
                 truncExpr = `date_trunc('hour', to_timestamp(timestamp_ms / 1000)) - (extract(hour from to_timestamp(timestamp_ms/1000))::int % 4) * interval '1 hour'`;
@@ -752,6 +786,10 @@ app.get('/api/chart/kline', async (req, res) => {
                 break;
             case '1W':
                 truncExpr = `date_trunc('week', to_timestamp(timestamp_ms / 1000))`;
+                sinceMs = null; // all time
+                break;
+            case '1M':
+                truncExpr = `date_trunc('month', to_timestamp(timestamp_ms / 1000))`;
                 sinceMs = null; // all time
                 break;
             case 'ALL':

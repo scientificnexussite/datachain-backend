@@ -81,12 +81,24 @@ class State {
     return fixDust(p.usdReserve / p.tokenReserve);
   }
 
-  applyTransaction(tx, currentPrice = 0, isReplay = false) {
+    applyTransaction(tx, currentPrice = 0, isReplay = false) {
     let { from, to, type } = tx;
-    
+
+    // --- ARMOR PLATE 6: THE LEDGER LOCK (Immutable Math Bounds) ---
+    // The absolute final barrier before writing to the database.
+    // Blocks negative numbers, zero, AND massive overflow attacks.
     let amount = parseFloat(tx.amount);
-    if (isNaN(amount) || amount <= 0) return false;
-    
+    let amountUsdCheck = parseFloat(tx.amountUsd || 0);
+
+    if (isNaN(amount) || amount <= 0 || amount > 100000000000) {
+        if (!isReplay) console.log(chalk.red(`[LEDGER SECURITY] Rejected: Invalid or overflow token amount.`));
+        return false;
+    }
+    if (isNaN(amountUsdCheck) || amountUsdCheck < 0 || amountUsdCheck > 100000000000) {
+        if (!isReplay) console.log(chalk.red(`[LEDGER SECURITY] Rejected: Invalid or overflow USD amount.`));
+        return false;
+    }
+
     type = String(type).toUpperCase();
     const tokenSymbol = tx.tokenSymbol ? String(tx.tokenSymbol).toUpperCase() : "SYR"; 
     

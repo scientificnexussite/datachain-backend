@@ -485,7 +485,18 @@ class DataChain {
     const validTransactions = rewardAmount > 0 ? [rewardTx] : [];
     if (rewardAmount > 0) tempState.applyTransaction(rewardTx, currentPrice, false);
 
-    for (const tx of transactions) {
+        for (const tx of transactions) {
+      // --- ARMOR PLATE 5: THE VAULT DOOR (Defense in Depth) ---
+      // Even if a hacker bypasses the API and injects memory directly, 
+      // the core ledger engine will intercept and destroy poisoned numbers here.
+      const safeAmount = parseFloat(tx.amount);
+      const safeUsd = parseFloat(tx.amountUsd || 0);
+      
+      if (isNaN(safeAmount) || safeAmount < 0 || isNaN(safeUsd) || safeUsd < 0) {
+          console.log(chalk.bgRed.white(` [SECURITY] FATAL: Block engine intercepted and destroyed a poisoned transaction payload! `));
+          continue; // Instantly skip this transaction, permanently dropping it from the chain
+      }
+
       if (tempState.applyTransaction(tx, currentPrice, false)) {
         validTransactions.push(tx);
       } else {

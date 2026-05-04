@@ -15,7 +15,7 @@ import mempool from './mempool.js';
 import { DataChain } from './datachain.js';
 import validator from './validator.js';
 import menuBook, { processReferralBonus } from './menubook.js'; // IMPROVEMENT 4 — static import
-import './p2p.js';
+import { initP2P, broadcastP2P } from './p2p.js';
 import config from './config.json' with { type: 'json' };
 
 // ─── PayPal Configuration ─────────────────────────────────────────────────────
@@ -120,6 +120,7 @@ app.use(bodyParser.json({ limit: '100kb' }));
 // ─── WebSocket Server ─────────────────────────────────────────────────────────
 const server = createServer(app);
 const wss    = new WebSocketServer({ server });
+initP2P(wss, nexusChain);
 
 global.broadcastWS = (event, data) => {
     wss.clients.forEach(client => {
@@ -1545,7 +1546,21 @@ app.get('/miner-balance', (req, res) => res.json({ address: config.blockchain.mi
 app.post('/tx/new', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const { signature, publicKey, uid, ...payloadData } = req.body;
-        const tx = { ...payloadData, amount: parseFloat(payloadData.amount) };
+
+        // --- ARMOR PLATE 3: ZERO-TRUST MATH ---
+        const parsedAmount = parseFloat(payloadData.amount);
+        if (isNaN(parsedAmount) || parsedAmount <= 0 || parsedAmount > 100000000000) {
+            return res.status(400).json({ error: 'Security Alert: Invalid mathematical amount detected.' });
+        }
+
+        // --- ARMOR PLATE 4: ANTI-REPLAY ATTACK (Time Lock) ---
+        const txTime = parseInt(payloadData.timestamp);
+        const timeDifference = Math.abs(Date.now() - txTime);
+        if (isNaN(txTime) || timeDifference > 300000) { // Expires after 5 minutes
+            return res.status(400).json({ error: 'Security Alert: Transaction timestamp expired or invalid.' });
+        }
+
+        const tx = { ...payloadData, amount: parsedAmount };
         if (signature && publicKey) { tx.signature = signature; tx.publicKey = publicKey; tx.uid = uid; }
 
         const { from, type, tokenSymbol = 'SYR' } = tx;
@@ -1595,9 +1610,11 @@ app.post('/tx/new', txLimiter, requireWeb3Auth, async (req, res) => {
         if (!validator.validateTransactionPayload(tx))
             return res.status(400).json({ error: 'Malformed payload or invalid cryptography.' });
 
-        if (await mempool.addTransaction(tx)) {
+                if (await mempool.addTransaction(tx)) {
+            broadcastP2P({ type: 'BROADCAST_TX', data: tx }); // Instantly gossips to Node 2
             res.status(201).json({ message: 'Transaction added to mempool.', tx });
         } else {
+            
             res.status(400).json({ error: 'MEMPOOL_FULL_OR_REPLAY' });
         }
     } catch (error) {

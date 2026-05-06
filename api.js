@@ -369,8 +369,9 @@ async function refreshAllPoolOrders() {
         }
     } catch(e) { /* table may not exist on first boot */ }
 
-    for (const ticker of tickersToProcess) {
-        if (ticker === 'SYR') continue; // SYR has its own market-making logic
+            for (const ticker of tickersToProcess) {
+            // Skip standard AMM for native and stablecoins
+            if (ticker === 'SYR' || ticker === 'SDX' || ticker === 'SDTX') continue; 
 
         menuBook._initTokenBook(ticker);
         const book = menuBook.books[ticker];
@@ -880,12 +881,15 @@ app.get('/api/chart/kline', async (req, res) => {
         // the deployer set an initial ask), synthesise a single candle from that price.
         // This eliminates the "Awaiting First Trade" overlay for tokens that have a
         // known price in the order book even before the first DB-confirmed trade.
-        if (formatted.length === 0) {
+                if (formatted.length === 0) {
             try {
                 await menuBook.ensureLoaded();
                 menuBook._initTokenBook(symbol);
                 const book = menuBook.books[symbol];
-                let fallbackPrice = (book && book.lastTradePrice > 0) ? book.lastTradePrice : null;
+                
+                // Hard peg the initial chart render to $1.00
+                let fallbackPrice = ['SDX', 'SDTX'].includes(symbol) ? 1.00 : ((book && book.lastTradePrice > 0) ? book.lastTradePrice : null);
+                
                 if (!fallbackPrice && book && book.asks && book.asks.length > 0) {
                     fallbackPrice = book.asks[0].priceUsd;  // lowest ask as seed price
                 }
@@ -1094,12 +1098,12 @@ app.post('/positions/:uid', requireWeb3Auth, async (req, res) => {
                     spent:    parseFloat(r.total_spent)    || 0
                 }])
             );
-
-            for (const { token, balance } of heldTokens) {
+            
+                        for (const { token, balance } of heldTokens) {
                 const cb = costBasis.get(token);
                 const avgPrice = cb && cb.acquired > 0
                     ? (cb.spent / cb.acquired)
-                    : (token === 'SYR' ? currentPrice : 0);
+                    : (token === 'SYR' ? currentPrice : (['SDX', 'SDTX'].includes(token) ? 1.00 : 0));
                 positionsArr.push({ asset: token, qty: balance, avgPrice });
             }
         }
@@ -1163,11 +1167,16 @@ app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
         const { side, amountSyr, priceUsd, tokenSymbol = 'SYR' } = req.body;
         const uid = req.user.uid;
 
-        if (!['BUY', 'SELL'].includes(side) || amountSyr <= 0 || priceUsd <= 0)
+                if (!['BUY', 'SELL'].includes(side) || amountSyr <= 0 || priceUsd <= 0)
             return res.status(400).json({ error: 'Invalid limit order parameters.' });
 
         const parsedAmount = parseFloat(amountSyr);
         const parsedPrice  = parseFloat(priceUsd);
+
+        // HARD PEG ENFORCEMENT: Block any limit order that attempts to deviate from $1.00
+        if (['SDX', 'SDTX'].includes(tokenSymbol) && parsedPrice !== 1.00) {
+            return res.status(400).json({ error: 'SDX and SDTX are stablecoins and strictly pegged to exactly $1.00 USD.' });
+        }
 
         if (side === 'BUY') {
             const availableUsd = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, tokenSymbol) - mempool.getPendingUsdSpend(uid);
@@ -1250,12 +1259,14 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                     'SELECT system_address FROM system_handlers WHERE token_symbol = $1 LIMIT 1',
                     [tokenSymbol]
                 );
-                if (hRow.rows.length > 0) {
+                                if (hRow.rows.length > 0) {
                     const handlerAddr = hRow.rows[0].system_address;
                     const handlerBal  = nexusChain.state.getBalance(handlerAddr, tokenSymbol)
                                       - mempool.getPendingTokenSpend(handlerAddr, tokenSymbol);
-                    const poolPrice   = nexusChain.state.getPoolPrice(tokenSymbol) ||
-                                       (menuBook.books[tokenSymbol]?.lastTradePrice || 0);
+                    
+                    // Force the pool price to $1.00 if it's a stablecoin
+                    const poolPrice   = ['SDX', 'SDTX'].includes(tokenSymbol) ? 1.00 : 
+                                       (nexusChain.state.getPoolPrice(tokenSymbol) || (menuBook.books[tokenSymbol]?.lastTradePrice || 0));
 
                     if (handlerBal > 1e-8 && poolPrice > 0) {
                         let fillAmount  = fixDust(Math.min(matchResult.remaining, handlerBal));
@@ -1528,7 +1539,10 @@ app.get('/stats', (req, res) => {
             circulating += bal;     // tokens held by real users
         }
     }
-    const tokenPrice = menuBook.books[token]?.lastTradePrice || menuBook.books[token]?.asks?.[0]?.priceUsd || 0;
+    
+    // Hard peg SDX and SDTX to $1.00 in the dashboard
+    const tokenPrice = ['SDX', 'SDTX'].includes(token) ? 1.00 : (menuBook.books[token]?.lastTradePrice || menuBook.books[token]?.asks?.[0]?.priceUsd || 0);
+    
     res.json({
         token,
         circulatingSupply: circulating,
@@ -1780,10 +1794,11 @@ app.post('/mint-new-cash', txLimiter, requireWeb3Auth, async (req, res) => {
         if (!/^[A-Z0-9]{1,10}$/.test(customTicker))
             return res.status(400).json({ error: 'Ticker must be 1-10 uppercase alphanumeric characters only.' });
 
-        const RESERVED = ['SYR', 'SYSTEM', 'USD', 'PAYPAL', 'GATEWAY', 'NEXUS'];
+                // PROTECT THE STABLECOINS: Added SDX and SDTX to the reserved list
+        const RESERVED = ['SYR', 'SYSTEM', 'USD', 'PAYPAL', 'GATEWAY', 'NEXUS', 'SDX', 'SDTX'];
         if (RESERVED.includes(customTicker))
             return res.status(400).json({ error: 'Ticker utilises a reserved network identifier.' });
-
+            
         if (nexusChain.state.balances[customTicker] && Object.keys(nexusChain.state.balances[customTicker]).length > 0)
             return res.status(400).json({ error: 'This ticker already exists.' });
 
@@ -2055,10 +2070,12 @@ app.post('/liquidity/withdraw', txLimiter, requireWeb3Auth, async (req, res) => 
 
         if (!tokenSymbol || tokenSymbol === 'SYR')
             return res.status(400).json({ error: 'Token symbol required (non-SYR).' });
-        if (isNaN(amount) || amount <= 0)
+                if (isNaN(amount) || amount <= 0)
             return res.status(400).json({ error: 'Amount must be a positive number.' });
 
-        const poolPrice = nexusChain.state.getPoolPrice(tokenSymbol);
+        // Enforce $1.00 withdrawal peg for stablecoins
+        const poolPrice = ['SDX', 'SDTX'].includes(tokenSymbol) ? 1.00 : nexusChain.state.getPoolPrice(tokenSymbol);
+        
         if (poolPrice <= 0)
             return res.status(400).json({ error: 'No active liquidity pool for this token.' });
 

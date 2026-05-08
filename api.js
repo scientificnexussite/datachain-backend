@@ -78,13 +78,16 @@ pool.query(`
     -- Each custom token can have one system address that auto-manages liquidity.
     -- Only the token creator can pay to generate one; the address only accepts
     -- the specific token it was created for (enforced in /tx/new).
-    CREATE TABLE IF NOT EXISTS system_handlers (
+        CREATE TABLE IF NOT EXISTS system_handlers (
         token_symbol  VARCHAR(20) PRIMARY KEY,
         system_address VARCHAR(100) NOT NULL,
         creator_uid   VARCHAR(100) NOT NULL,
         created_at    BIGINT
     );
 `).catch(err => console.error(chalk.red('[DB] API State & Feature tables init failed'), err));
+
+// SECURITY UPDATE: Safely add referral code column to existing database without crashing
+pool.query(`ALTER TABLE public_keys ADD COLUMN IF NOT EXISTS referral_code VARCHAR(5) UNIQUE;`).catch(() => {});
 
 // ─── Express App ──────────────────────────────────────────────────────────────
 const app  = express();
@@ -188,11 +191,20 @@ const requireWeb3Auth = async (req, res, next) => {
         return res.status(401).json({ error: 'Unauthorized: Missing Web3 ECDSA Signature.' });
 
     try {
-        const pkRes = await pool.query('SELECT public_key FROM public_keys WHERE uid = $1', [uid]);
-        if (pkRes.rows.length > 0 && pkRes.rows[0].public_key !== publicKey) {
-            return res.status(401).json({ error: 'Unauthorized: Public Key mismatch for this identity.' });
+        const pkRes = await pool.query('SELECT public_key, referral_code FROM public_keys WHERE uid = $1', [uid]);
+        if (pkRes.rows.length > 0) {
+            if (pkRes.rows[0].public_key !== publicKey) {
+                return res.status(401).json({ error: 'Unauthorized: Public Key mismatch for this identity.' });
+            }
+            // Retroactively generate a 5-char code for older users who don't have one
+            if (!pkRes.rows[0].referral_code) {
+                const newCode = crypto.randomBytes(4).toString('hex').substring(0, 5).toUpperCase();
+                await pool.query('UPDATE public_keys SET referral_code = $1 WHERE uid = $2', [newCode, uid]);
+            }
         } else if (pkRes.rows.length === 0) {
-            await pool.query('INSERT INTO public_keys (uid, public_key) VALUES ($1, $2)', [uid, publicKey]);
+            // Generate exact 5-character code for new users
+            const newCode = crypto.randomBytes(4).toString('hex').substring(0, 5).toUpperCase();
+            await pool.query('INSERT INTO public_keys (uid, public_key, referral_code) VALUES ($1, $2, $3)', [uid, publicKey, newCode]);
         }
 
         const verify = crypto.createVerify('SHA256');
@@ -937,22 +949,33 @@ app.get('/trending', readLimiter, async (req, res) => {
 // uid is taken from req.user.uid (the authenticated wallet) — NOT the request body —
 // so a user cannot falsely assign a referrer to someone else's wallet.
 app.post('/referral/signup', txLimiter, requireWeb3Auth, async (req, res) => {
-    const uid      = req.user.uid;          // authenticated wallet address
-    const { referrer } = req.body;
-    if (!referrer || uid === referrer)
-        return res.status(400).json({ error: 'Invalid referral code.' });
+    const uid = req.user.uid;
+    let { referrer } = req.body;
+    
+    // SECURITY: Enforce exact 5-character length constraint
+    if (!referrer || typeof referrer !== 'string' || referrer.trim().length !== 5) {
+        return res.status(400).json({ error: 'Referral code must be exactly 5 characters.' });
+    }
+    referrer = referrer.trim().toUpperCase();
+
     try {
+        // Look up the master wallet address attached to this 5-character code
+        const refUser = await pool.query('SELECT uid FROM public_keys WHERE referral_code = $1 LIMIT 1', [referrer]);
+        if (refUser.rows.length === 0) {
+            return res.status(404).json({ error: 'Referral code not found.' });
+        }
+        const referrerUid = refUser.rows[0].uid;
+
+        if (uid === referrerUid) return res.status(400).json({ error: 'You cannot refer yourself.' });
+
         // Prevent double-signing: if a referral already exists for this uid, reject
-        const existing = await pool.query(
-            'SELECT 1 FROM referrals WHERE referred_uid = $1 LIMIT 1',
-            [uid]
-        );
+        const existing = await pool.query('SELECT 1 FROM referrals WHERE referred_uid = $1 LIMIT 1', [uid]);
         if (existing.rows.length > 0)
             return res.status(409).json({ error: 'A referrer is already registered for this wallet.' });
 
         await pool.query(
             'INSERT INTO referrals (referred_uid, referrer_uid, created_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
-            [uid, referrer, Date.now()]
+            [uid, referrerUid, Date.now()]
         );
         res.json({ success: true });
     } catch (e) {
@@ -1629,10 +1652,35 @@ app.post('/tx/new', txLimiter, requireWeb3Auth, async (req, res) => {
             res.status(201).json({ message: 'Transaction added to mempool.', tx });
         } else {
             
-            res.status(400).json({ error: 'MEMPOOL_FULL_OR_REPLAY' });
+                        res.status(400).json({ error: 'MEMPOOL_FULL_OR_REPLAY' });
         }
     } catch (error) {
         res.status(500).json({ error: 'Internal Server Error.' });
+    }
+});
+
+// ─── Secure Integration Tags ──────────────────────────────────────────────────
+app.post('/api/integration-tags', txLimiter, requireWeb3Auth, async (req, res) => {
+    try {
+        const { tokenSymbol } = req.body;
+        const uid = req.user.uid;
+        if (!tokenSymbol) return res.status(400).json({ error: 'Token symbol required.' });
+
+        // Enforce strict creator-only access
+        const mintRes = await pool.query(
+            `SELECT to_address FROM transactions WHERE type = 'MINT' AND token_symbol = $1 AND is_system_generated = TRUE LIMIT 1`,
+            [tokenSymbol.toUpperCase()]
+        );
+
+        if (mintRes.rows.length === 0 || mintRes.rows[0].to_address !== uid) {
+            return res.status(403).json({ error: 'Unauthorized: Only the asset creator can generate integration tags.' });
+        }
+
+        // Generate a cryptographically secure, random 32-character hex string
+        const secureTag = crypto.randomBytes(16).toString('hex');
+        res.json({ secureTag });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to generate secure tags.' });
     }
 });
 

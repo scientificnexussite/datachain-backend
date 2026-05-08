@@ -78,11 +78,24 @@ pool.query(`
     -- Each custom token can have one system address that auto-manages liquidity.
     -- Only the token creator can pay to generate one; the address only accepts
     -- the specific token it was created for (enforced in /tx/new).
-        CREATE TABLE IF NOT EXISTS system_handlers (
+                CREATE TABLE IF NOT EXISTS system_handlers (
         token_symbol  VARCHAR(20) PRIMARY KEY,
         system_address VARCHAR(100) NOT NULL,
         creator_uid   VARCHAR(100) NOT NULL,
         created_at    BIGINT
+    );
+        // PHASE 4: Server-to-Server API Keys for Game Integrations
+    CREATE TABLE IF NOT EXISTS game_api_keys (
+        api_key VARCHAR(100) PRIMARY KEY,
+        creator_uid VARCHAR(100) NOT NULL,
+        created_at BIGINT
+    );
+    -- PHASE 5: Smart Allowances for In-Game Spending
+    CREATE TABLE IF NOT EXISTS game_allowances (
+        uid VARCHAR(100),
+        token_symbol VARCHAR(20),
+        allowance DOUBLE PRECISION,
+        PRIMARY KEY (uid, token_symbol)
     );
 `).catch(err => console.error(chalk.red('[DB] API State & Feature tables init failed'), err));
 
@@ -240,6 +253,24 @@ async function getPayPalAccessToken() {
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 const fixDust = (num) => Number(Number(num).toFixed(8));
+
+// PHASE 2 FIX: Helper to fetch the hard peg price for custom FDX tokens
+async function getHardPeg(tokenSymbol) {
+    if (['SDX', 'SDTX'].includes(tokenSymbol)) return 1.00;
+    if (tokenSymbol === 'SYR') return null;
+    try {
+        const mintTx = await pool.query(
+            `SELECT description FROM transactions WHERE type = 'MINT' AND token_symbol = $1 AND is_system_generated = TRUE LIMIT 1`,
+            [tokenSymbol]
+        );
+        if (mintTx.rows.length > 0) {
+            const descObj = JSON.parse(mintTx.rows[0].description || '{}');
+            const peg = parseFloat(descObj.pegPrice || descObj.internalPeg || descObj.initialPrice);
+            if (!isNaN(peg) && peg > 0) return peg;
+        }
+    } catch(e) {}
+    return null;
+}
 
 const MAX_SUPPLY   = 12_000_000_000;
 let currentPrice   = config.blockchain.starting_price;
@@ -408,8 +439,9 @@ async function refreshAllPoolOrders() {
             }
         } catch(e) {}
 
-        // Determine pool price: use liquidityPool if available, else derive from menubook last price
-        let poolPrice = nexusChain.state.getPoolPrice(ticker);
+                // Determine pool price: use liquidityPool if available, else derive from menubook last price
+        const hardPeg = await getHardPeg(ticker);
+        let poolPrice = hardPeg || nexusChain.state.getPoolPrice(ticker);
         if (poolPrice <= 0 && book.lastTradePrice > 0) {
             poolPrice = book.lastTradePrice;
         }
@@ -433,14 +465,19 @@ async function refreshAllPoolOrders() {
         const rawOrderSize = Math.min(parseFloat((combinedTokenBal * 0.01).toFixed(8)), 10_000);
         if (rawOrderSize < 1e-6) continue;
 
-        const bidPrice   = parseFloat((poolPrice * 0.995).toFixed(8));
-        const askPrice   = parseFloat((poolPrice * 1.005).toFixed(8));
-        const systemUsdBal = nexusChain.state.getUsd('system');
+               // PHASE 2 FIX: If a hard peg exists, lock the bid/ask spread exactly to the peg to prevent volatility.
+        const bidPrice   = hardPeg ? hardPeg : parseFloat((poolPrice * 0.995).toFixed(8));
+        const askPrice   = hardPeg ? hardPeg : parseFloat((poolPrice * 1.005).toFixed(8));
+        
+        // PHASE 3 FIX: Isolate Liquidity Pools (Prevent System Bank Run)
+        // Only core tokens use the central system bank. Custom tokens strictly use their handler's isolated USD.
+        const poolUsdBal = handlerAddress ? nexusChain.state.getUsd(handlerAddress) : nexusChain.state.getUsd('system');
+        const buyUid     = handlerAddress ? handlerAddress : 'system';
 
         // SELL: limited by combined token balance
         const sellOrderSize = Math.min(rawOrderSize, combinedTokenBal);
-        // BUY: limited by system USD balance
-        const buyOrderSize  = Math.min(rawOrderSize, bidPrice > 0 ? systemUsdBal / bidPrice : 0);
+        // BUY: limited by isolated USD balance
+        const buyOrderSize  = Math.min(rawOrderSize, bidPrice > 0 ? poolUsdBal / bidPrice : 0);
 
         if (sellOrderSize >= 1e-6) {
             // Place SELL order from the handler address if it has balance, else from 'system'
@@ -449,7 +486,8 @@ async function refreshAllPoolOrders() {
             await menuBook.addLimitOrder(sellUid, 'SELL', parseFloat(sellOrderSize.toFixed(8)), askPrice, ticker);
         }
         if (buyOrderSize >= 1e-6) {
-            await menuBook.addLimitOrder('system', 'BUY', parseFloat(buyOrderSize.toFixed(8)), bidPrice, ticker);
+            // Place BUY order strictly from the isolated funding address
+            await menuBook.addLimitOrder(buyUid, 'BUY', parseFloat(buyOrderSize.toFixed(8)), bidPrice, ticker);
         }
 
         console.log(chalk.cyan(`[POOL] ${ticker}: price=$${poolPrice.toFixed(4)} tokens=${combinedTokenBal.toFixed(0)} sell=${sellOrderSize.toFixed(2)} buy=${buyOrderSize.toFixed(2)}`));
@@ -1193,12 +1231,13 @@ app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
                 if (!['BUY', 'SELL'].includes(side) || amountSyr <= 0 || priceUsd <= 0)
             return res.status(400).json({ error: 'Invalid limit order parameters.' });
 
-        const parsedAmount = parseFloat(amountSyr);
+             const parsedAmount = parseFloat(amountSyr);
         const parsedPrice  = parseFloat(priceUsd);
 
-        // HARD PEG ENFORCEMENT: Block any limit order that attempts to deviate from $1.00
-        if (['SDX', 'SDTX'].includes(tokenSymbol) && parsedPrice !== 1.00) {
-            return res.status(400).json({ error: 'SDX and SDTX are stablecoins and strictly pegged to exactly $1.00 USD.' });
+        // HARD PEG ENFORCEMENT: Block limit orders that deviate from stablecoins or custom FDX pegs
+        const hardPeg = await getHardPeg(tokenSymbol);
+        if (hardPeg !== null && parsedPrice !== hardPeg) {
+            return res.status(400).json({ error: `${tokenSymbol} is rigidly pegged to exactly $${hardPeg} USD. Limit orders must match this price.` });
         }
 
         if (side === 'BUY') {
@@ -1267,8 +1306,42 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
         if (side === 'BUY' && availableUsd <= 0)
             return res.status(400).json({ error: 'Insufficient USD balance. Deposit funds to execute trade.' });
 
-        const fundsToCheck = side === 'BUY' ? availableUsd : availableToken;
+                const fundsToCheck = side === 'BUY' ? availableUsd : availableToken;
         const matchResult  = await menuBook.matchMarketOrder(uid, side, parsedAmount, fundsToCheck, null, tokenSymbol);
+
+        // ── PHASE 1 FIX: System-Backed Stablecoin Liquidity ──────────────────────
+        // The system acts as an infinite liquidity provider for SDX/SDTX at exactly $1.00.
+        // This allows users to instantly swap SDX for internal trading USD (and vice versa).
+        if (['SDX', 'SDTX'].includes(tokenSymbol) && matchResult.remaining > 1e-8) {
+            let tradeAmount = matchResult.remaining;
+            let stepTradeUsd = parseFloat((tradeAmount * 1.00).toFixed(8));
+            
+            if (side === 'BUY') {
+                // User is buying SDX with Internal USD
+                const maxAffordableUsd = fundsToCheck - matchResult.totalUsdCost;
+                if (maxAffordableUsd < stepTradeUsd) {
+                    stepTradeUsd = maxAffordableUsd;
+                    tradeAmount = stepTradeUsd;
+                }
+                if (tradeAmount > 1e-8) {
+                    await mempool.addTransaction({ from: uid, to: 'system', amount: stepTradeUsd, type: 'USD_WITHDRAWAL', timestamp: Date.now(), isSystemGenerated: true, description: 'Stablecoin Swap (USD Deduct)' });
+                    await mempool.addTransaction({ from: 'system', to: uid, amount: tradeAmount, type: 'MINT', tokenSymbol, timestamp: Date.now(), isSystemGenerated: true, description: 'Stablecoin Swap (SDX Mint)' });
+                }
+            } else {
+                // User is selling SDX for Internal USD
+                if (tradeAmount > 1e-8) {
+                    await mempool.addTransaction({ from: uid, to: 'system', amount: tradeAmount, type: 'TRANSFER', tokenSymbol, timestamp: Date.now(), isSystemGenerated: true, description: 'Stablecoin Swap (SDX Burn)' });
+                    await mempool.addTransaction({ from: 'system', to: uid, amount: stepTradeUsd, type: 'USD_DEPOSIT', timestamp: Date.now(), isSystemGenerated: true, description: 'Stablecoin Swap (USD Add)' });
+                }
+            }
+
+            if (tradeAmount > 1e-8) {
+                matchResult.trades.push({ buyer: side === 'BUY' ? uid : 'system', seller: side === 'SELL' ? uid : 'system', amountSyr: tradeAmount, amountUsd: stepTradeUsd, price: 1.00, tokenSymbol });
+                matchResult.executedSyr = fixDust(matchResult.executedSyr + tradeAmount);
+                matchResult.remaining = fixDust(matchResult.remaining - tradeAmount);
+                matchResult.totalUsdCost = fixDust(matchResult.totalUsdCost + stepTradeUsd);
+            }
+        }
 
         // ── FIX Issue 4: AMM fallback for custom tokens ────────────────────────────
         // For custom tokens with a system handler (nx_sys_ address), if the orderbook
@@ -1283,13 +1356,13 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                     [tokenSymbol]
                 );
                                 if (hRow.rows.length > 0) {
-                    const handlerAddr = hRow.rows[0].system_address;
+                                        const handlerAddr = hRow.rows[0].system_address;
                     const handlerBal  = nexusChain.state.getBalance(handlerAddr, tokenSymbol)
                                       - mempool.getPendingTokenSpend(handlerAddr, tokenSymbol);
                     
-                    // Force the pool price to $1.00 if it's a stablecoin
-                    const poolPrice   = ['SDX', 'SDTX'].includes(tokenSymbol) ? 1.00 : 
-                                       (nexusChain.state.getPoolPrice(tokenSymbol) || (menuBook.books[tokenSymbol]?.lastTradePrice || 0));
+                    // PHASE 2 FIX: Force the pool price to the rigid FDX peg
+                    const hardPeg     = await getHardPeg(tokenSymbol);
+                    const poolPrice   = hardPeg || nexusChain.state.getPoolPrice(tokenSymbol) || (menuBook.books[tokenSymbol]?.lastTradePrice || 0);
 
                     if (handlerBal > 1e-8 && poolPrice > 0) {
                         let fillAmount  = fixDust(Math.min(matchResult.remaining, handlerBal));
@@ -1647,7 +1720,7 @@ app.post('/tx/new', txLimiter, requireWeb3Auth, async (req, res) => {
         if (!validator.validateTransactionPayload(tx))
             return res.status(400).json({ error: 'Malformed payload or invalid cryptography.' });
 
-                if (await mempool.addTransaction(tx)) {
+                        if (await mempool.addTransaction(tx)) {
             broadcastP2P({ type: 'BROADCAST_TX', data: tx }); // Instantly gossips to Node 2
             res.status(201).json({ message: 'Transaction added to mempool.', tx });
         } else {
@@ -1655,6 +1728,187 @@ app.post('/tx/new', txLimiter, requireWeb3Auth, async (req, res) => {
                         res.status(400).json({ error: 'MEMPOOL_FULL_OR_REPLAY' });
         }
     } catch (error) {
+        res.status(500).json({ error: 'Internal Server Error.' });
+    }
+});
+
+// ─── PHASE 4: API Gateway (Server-to-Server Integrations) ─────────────────────
+
+// Route 1: Generate a Master API Key for the Game Server
+app.post('/api/keys/generate', txLimiter, requireWeb3Auth, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const apiKey = 'sk_live_' + crypto.randomBytes(32).toString('hex');
+        await pool.query(
+            'INSERT INTO game_api_keys (api_key, creator_uid, created_at) VALUES ($1, $2, $3)',
+            [apiKey, uid, Date.now()]
+        );
+        res.status(201).json({ apiKey, message: 'Server API Key generated. Store this securely on your game backend.' });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to generate API Key.' });
+    }
+});
+
+// Route 2: Silent In-Game Transfers (No ECDSA required)
+// Your Unity server hits this route with the x-api-key header to reward players
+app.post('/api/game/transfer', rateLimit({ windowMs: 60000, max: 300 }), async (req, res) => {
+    try {
+        const apiKey = req.headers['x-api-key'] || req.body.apiKey;
+        const { toAddress, amount, tokenSymbol } = req.body;
+        
+        if (!apiKey) return res.status(401).json({ error: 'Unauthorized: Missing API Key.' });
+        if (!toAddress || !amount || !tokenSymbol) return res.status(400).json({ error: 'Missing transfer parameters.' });
+        
+        const parsedAmount = parseFloat(amount);
+        if (isNaN(parsedAmount) || parsedAmount <= 0) return res.status(400).json({ error: 'Invalid mathematical amount.' });
+
+        // Authenticate API Key
+        const keyRes = await pool.query('SELECT creator_uid FROM game_api_keys WHERE api_key = $1 LIMIT 1', [apiKey]);
+        if (keyRes.rows.length === 0) return res.status(401).json({ error: 'Unauthorized: Invalid API Key.' });
+        const creatorUid = keyRes.rows[0].creator_uid;
+
+        // Verify the API Key owner is the actual creator of the token being sent
+        const mintRes = await pool.query(
+            `SELECT to_address FROM transactions WHERE type = 'MINT' AND token_symbol = $1 AND is_system_generated = TRUE LIMIT 1`,
+            [tokenSymbol.toUpperCase()]
+        );
+        if (mintRes.rows.length === 0 || mintRes.rows[0].to_address !== creatorUid) {
+            return res.status(403).json({ error: `Forbidden: API Key owner did not create ${tokenSymbol}.` });
+        }
+
+        // Auto-route funds: Try to pull from Creator's main wallet first, fallback to System Handler
+        let fromAddress = creatorUid;
+        let availableBalance = nexusChain.getBalance(creatorUid, tokenSymbol) - mempool.getPendingTokenSpend(creatorUid, tokenSymbol);
+
+        if (availableBalance < parsedAmount) {
+            const hRow = await pool.query('SELECT system_address FROM system_handlers WHERE token_symbol = $1 LIMIT 1', [tokenSymbol.toUpperCase()]);
+            if (hRow.rows.length > 0) {
+                const handlerAddr = hRow.rows[0].system_address;
+                const handlerBal = nexusChain.getBalance(handlerAddr, tokenSymbol) - mempool.getPendingTokenSpend(handlerAddr, tokenSymbol);
+                if (handlerBal >= parsedAmount) {
+                    fromAddress = handlerAddr;
+                    availableBalance = handlerBal;
+                }
+            }
+        }
+
+        if (availableBalance < parsedAmount) return res.status(400).json({ error: `Insufficient ${tokenSymbol} liquidity across creator accounts.` });
+
+        // Submit the silent transaction (isSystemGenerated bypasses the ECDSA check)
+        const tx = {
+            from: fromAddress, to: toAddress,
+            amount: parsedAmount, type: 'TRANSFER', tokenSymbol: tokenSymbol.toUpperCase(),
+            timestamp: Date.now(), isSystemGenerated: true, description: 'In-Game API Reward'
+        };
+
+                if (await mempool.addTransaction(tx)) {
+            broadcastP2P({ type: 'BROADCAST_TX', data: tx });
+            res.status(201).json({ success: true, message: 'Game reward dispatched silently.', tx });
+        } else {
+            res.status(400).json({ error: 'Failed to process game reward.' });
+        }
+    } catch (err) {
+        res.status(500).json({ error: 'Internal Server Error.' });
+    }
+});
+
+// ─── PHASE 5: Smart Allowances (In-Game Spending) ─────────────────────────────
+
+// Route 1: Player Approves Allowance (Requires ECDSA Signature)
+app.post('/api/allowance/approve', txLimiter, requireWeb3Auth, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        let { tokenSymbol, amount } = req.body;
+        tokenSymbol = String(tokenSymbol || '').toUpperCase().trim();
+        amount = parseFloat(amount);
+
+        if (!tokenSymbol || isNaN(amount) || amount < 0) 
+            return res.status(400).json({ error: 'Invalid allowance parameters.' });
+
+        await pool.query(
+            `INSERT INTO game_allowances (uid, token_symbol, allowance) 
+             VALUES ($1, $2, $3) 
+             ON CONFLICT (uid, token_symbol) 
+             DO UPDATE SET allowance = EXCLUDED.allowance`,
+            [uid, tokenSymbol, amount]
+        );
+
+        res.json({ success: true, message: `Successfully approved allowance of ${amount} ${tokenSymbol} for in-game spending.` });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to set allowance.' });
+    }
+});
+
+// Route 2: Game Server Charges Player (Requires API Key, NO ECDSA)
+app.post('/api/game/charge', rateLimit({ windowMs: 60000, max: 300 }), async (req, res) => {
+    try {
+        const apiKey = req.headers['x-api-key'] || req.body.apiKey;
+        const { playerAddress, amount, tokenSymbol } = req.body;
+        
+        if (!apiKey) return res.status(401).json({ error: 'Unauthorized: Missing API Key.' });
+        if (!playerAddress || !amount || !tokenSymbol) return res.status(400).json({ error: 'Missing charge parameters.' });
+        
+        const parsedAmount = parseFloat(amount);
+        if (isNaN(parsedAmount) || parsedAmount <= 0) return res.status(400).json({ error: 'Invalid mathematical amount.' });
+
+        // Authenticate API Key
+        const keyRes = await pool.query('SELECT creator_uid FROM game_api_keys WHERE api_key = $1 LIMIT 1', [apiKey]);
+        if (keyRes.rows.length === 0) return res.status(401).json({ error: 'Unauthorized: Invalid API Key.' });
+        const creatorUid = keyRes.rows[0].creator_uid;
+
+        // Verify the API Key owner is the actual creator of the token being charged
+        const mintRes = await pool.query(
+            `SELECT to_address FROM transactions WHERE type = 'MINT' AND token_symbol = $1 AND is_system_generated = TRUE LIMIT 1`,
+            [tokenSymbol.toUpperCase()]
+        );
+        if (mintRes.rows.length === 0 || mintRes.rows[0].to_address !== creatorUid) {
+            return res.status(403).json({ error: `Forbidden: API Key owner did not create ${tokenSymbol}.` });
+        }
+
+        // Check Player's Approved Allowance
+        const allowRes = await pool.query(
+            'SELECT allowance FROM game_allowances WHERE uid = $1 AND token_symbol = $2', 
+            [playerAddress, tokenSymbol.toUpperCase()]
+        );
+        const currentAllowance = allowRes.rows.length > 0 ? parseFloat(allowRes.rows[0].allowance) : 0;
+        
+        if (currentAllowance < parsedAmount) {
+            return res.status(403).json({ error: `Transaction Denied: Player has not approved enough allowance for ${tokenSymbol}. Remaining: ${currentAllowance}` });
+        }
+
+        // Check Player's Actual Balance
+        const availableBalance = nexusChain.getBalance(playerAddress, tokenSymbol) - mempool.getPendingTokenSpend(playerAddress, tokenSymbol);
+        if (availableBalance < parsedAmount) {
+            return res.status(400).json({ error: 'Transaction Denied: Player has insufficient funds.' });
+        }
+
+        // Determine recipient (Prefer System Handler for AMM liquidity, otherwise Creator Wallet)
+        let recipientAddress = creatorUid;
+        const hRow = await pool.query('SELECT system_address FROM system_handlers WHERE token_symbol = $1 LIMIT 1', [tokenSymbol.toUpperCase()]);
+        if (hRow.rows.length > 0) recipientAddress = hRow.rows[0].system_address;
+
+        // Deduct from allowance
+        await pool.query(
+            'UPDATE game_allowances SET allowance = allowance - $1 WHERE uid = $2 AND token_symbol = $3',
+            [parsedAmount, playerAddress, tokenSymbol.toUpperCase()]
+        );
+
+        // Execute Silent Transfer
+        const tx = {
+            from: playerAddress, to: recipientAddress,
+            amount: parsedAmount, type: 'TRANSFER', tokenSymbol: tokenSymbol.toUpperCase(),
+            timestamp: Date.now(), isSystemGenerated: true, description: 'In-Game API Charge'
+        };
+
+        if (await mempool.addTransaction(tx)) {
+            broadcastP2P({ type: 'BROADCAST_TX', data: tx });
+            res.status(201).json({ success: true, message: 'Player successfully charged.', tx });
+        } else {
+            // Refund allowance if mempool is full
+            await pool.query('UPDATE game_allowances SET allowance = allowance + $1 WHERE uid = $2 AND token_symbol = $3', [parsedAmount, playerAddress, tokenSymbol.toUpperCase()]);
+            res.status(400).json({ error: 'Failed to process game charge.' });
+        }
+    } catch (err) {
         res.status(500).json({ error: 'Internal Server Error.' });
     }
 });
@@ -1974,22 +2228,26 @@ app.post('/capture-paypal-order', requireWeb3Auth, async (req, res) => {
         const data = await response.json();
         if (!response.ok) throw new Error(data.message);
 
-        pendingPayPalOrders.delete(req.body.orderID);
+                pendingPayPalOrders.delete(req.body.orderID);
         saveApiState();
 
         const capturedAmount = parseFloat(data.purchase_units[0].payments.captures[0].amount.value);
+        
+        // PHASE 1 FIX: Physically mint SDX stablecoins 1:1 with incoming fiat
         await mempool.addTransaction({
-            from: 'paypal-gateway', to: req.user.uid,
-            amount: capturedAmount, type: 'USD_DEPOSIT',
-            timestamp: Date.now(), isSystemGenerated: true
+            from: 'system', to: req.user.uid,
+            amount: capturedAmount, type: 'MINT', tokenSymbol: 'SDX',
+            timestamp: Date.now(), isSystemGenerated: true,
+            description: '1:1 Fiat Deposit Mint'
         });
+        
         res.json({ status: 'COMPLETED', amount: capturedAmount });
     } catch (error) {
         res.status(500).json({ error: '[Sys-err] Payment system offline. Capture failed.' });
     }
 });
 
-// ─── PayPal Withdrawal ────────────────────────────────────────────────────────
+// ─── PayPal Withdrawal (PHASE 1 FIX) ──────────────────────────────────────────
 app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
     try {
         const { uid, amount, paypalEmail } = req.body;
@@ -2001,8 +2259,11 @@ app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
             return res.status(400).json({ error: 'Max single withdrawal is $5000.' });
         if (!paypalEmail || !paypalEmail.includes('@'))
             return res.status(400).json({ error: 'Valid PayPal email is required to process withdrawals.' });
-        if ((nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, 'SYR') - mempool.getPendingUsdSpend(uid)) < amount)
-            return res.status(400).json({ error: 'Insufficient available USD.' });
+        
+        // SECURITY: Require physical SDX tokens instead of internal USD
+        const availableSdx = nexusChain.getBalance(uid, 'SDX') - menuBook.getLockedToken(uid, 'SDX') - mempool.getPendingTokenSpend(uid, 'SDX');
+        if (availableSdx < amount)
+            return res.status(400).json({ error: 'Insufficient SDX stablecoins. You must hold physical SDX to withdraw fiat.' });
 
         try {
             const accessToken = await getPayPalAccessToken();
@@ -2020,10 +2281,12 @@ app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
             const payoutData = await payoutRes.json();
             if (!payoutRes.ok) throw new Error(payoutData.message || 'Payout rejected by PayPal');
 
+            // BURN the SDX tokens from circulation
             await mempool.addTransaction({
-                from: uid, to: 'paypal-gateway',
-                amount, type: 'USD_WITHDRAWAL',
-                timestamp: Date.now()
+                from: uid, to: 'system',
+                amount, type: 'TRANSFER', tokenSymbol: 'SDX',
+                timestamp: Date.now(), isSystemGenerated: true,
+                description: '1:1 Fiat Withdrawal Burn'
             });
             res.json({ success: true, message: 'Withdrawal processed and dispatched.' });
         } catch (paypalErr) {

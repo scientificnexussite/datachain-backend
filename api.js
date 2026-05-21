@@ -30,8 +30,33 @@ const PAYPAL_API_BASE      = process.env.PAYPAL_MODE === 'live'
     
 // ─── NowPayments Configuration ────────────────────────────────────────────────
 const NOWPAYMENTS_API_KEY  = process.env.NOWPAYMENTS_API_KEY || '';
+// NowPayments Mass Payout requires JWT auth in addition to the API key.
+// Set NOWPAYMENTS_EMAIL and NOWPAYMENTS_PASSWORD in Railway environment variables.
+const NOWPAYMENTS_EMAIL    = process.env.NOWPAYMENTS_EMAIL    || '';
+const NOWPAYMENTS_PASSWORD = process.env.NOWPAYMENTS_PASSWORD || '';
 const NOWPAYMENTS_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET || '';
 const NOWPAYMENTS_API_BASE = 'https://api.nowpayments.io/v1';
+
+// ── NowPayments JWT Helper ────────────────────────────────────────────────────
+// The NowPayments Mass Payout API (/payout) requires Bearer JWT authentication
+// IN ADDITION to the x-api-key header. Without this, the API returns:
+// "Authorization header is empty (Bearer JWTtoken is required)"
+// Call this before every payout request since JWTs expire quickly.
+async function getNowPaymentsJWT() {
+    if (!NOWPAYMENTS_EMAIL || !NOWPAYMENTS_PASSWORD) {
+        throw new Error('NOWPAYMENTS_EMAIL and NOWPAYMENTS_PASSWORD must be set in Railway environment variables.');
+    }
+    const authRes = await fetch(`${NOWPAYMENTS_API_BASE}/auth`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: NOWPAYMENTS_EMAIL, password: NOWPAYMENTS_PASSWORD })
+    });
+    const authData = await authRes.json();
+    if (!authRes.ok || !authData.token) {
+        throw new Error(`NowPayments JWT auth failed: ${authData.message || authData.error || 'Unknown error'}`);
+    }
+    return authData.token;
+}
 
 // ─── Database Schema Init ─────────────────────────────────────────────────────
 pool.query(`
@@ -2659,10 +2684,17 @@ app.post('/api/crypto/withdraw', txLimiter, requireWeb3Auth, async (req, res) =>
 
         console.log(chalk.cyan(`[NOWPAYMENTS] Requesting payout for ${parsedAmount} ${currency}...`));
 
-        // Call NowPayments Mass Payout API
+        // Get NowPayments JWT — required for Mass Payout in addition to x-api-key
+        const nowPayJWT = await getNowPaymentsJWT();
+
+        // Call NowPayments Mass Payout API with both auth headers
         const payoutRes = await fetch(`${NOWPAYMENTS_API_BASE}/payout`, {
             method: 'POST',
-            headers: { 'x-api-key': NOWPAYMENTS_API_KEY, 'Content-Type': 'application/json' },
+            headers: {
+                'x-api-key':     NOWPAYMENTS_API_KEY,
+                'Authorization': `Bearer ${nowPayJWT}`,
+                'Content-Type':  'application/json'
+            },
             body: JSON.stringify(payoutPayload)
         });
         const payoutData = await payoutRes.json();
@@ -2691,7 +2723,7 @@ app.post('/api/crypto/withdraw', txLimiter, requireWeb3Auth, async (req, res) =>
         await mempool.addTransaction(burnTx);
         broadcastP2P({ type: 'BROADCAST_TX', data: burnTx });
 
-        res.status(201).json({ success: true, message: `Withdrawal of ${parsedAmount} ${burnSymbol} initiated to ${network}.` });
+        res.status(201).json({ success: true, message: `Withdrawal of ${parsedAmount} ${safeBurn} initiated to ${network}.` });
     } catch (err) {
         console.error(chalk.red('[NOWPAYMENTS PAYOUT FATAL ERROR]'), err);
         res.status(500).json({ error: err.message || 'Withdrawal failed to process.' });

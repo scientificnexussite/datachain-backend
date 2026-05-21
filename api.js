@@ -2697,16 +2697,44 @@ app.post('/api/crypto/withdraw', txLimiter, requireWeb3Auth, async (req, res) =>
             },
             body: JSON.stringify(payoutPayload)
         });
-        const payoutData = await payoutRes.json();
 
-        // PHASE 1 FIX: Advanced Telemetry Logging
+        // ── SAFE RESPONSE PARSING ────────────────────────────────────────────
+        // NowPayments sometimes returns plain text (e.g. "Access denied | Invalid IP - x.x.x.x")
+        // instead of JSON when an IP-whitelist restriction blocks the request.
+        // Always read as text first, then try JSON — prevents SyntaxError crash.
+        const rawBody   = await payoutRes.text();
+        let   payoutData = {};
+        try   { payoutData = JSON.parse(rawBody); }
+        catch { payoutData = { message: rawBody }; }
+
+        // ── IP WHITELIST DETECTION ───────────────────────────────────────────
+        // NowPayments Payout API requires the calling server's IP to be whitelisted
+        // in your NowPayments account. Railway uses dynamic IPs that change on each
+        // deployment, causing "Access denied | Invalid IP" errors.
+        //
+        // HOW TO FIX (one-time setup in NowPayments dashboard):
+        //   1. Log in to NowPayments → Account Settings → API Settings
+        //   2. Find "IP Whitelist" or "Allowed IPs"
+        //   3. Either DISABLE IP filtering entirely (recommended for Railway)
+        //      OR add Railway's current IP shown in the error message.
+        //   Note: Railway IPs change — disabling IP restrictions is the safest
+        //   option and is still protected by your x-api-key + JWT credentials.
+        const msgLower = (payoutData.message || '').toLowerCase();
+        if (msgLower.includes('invalid ip') || msgLower.includes('access denied') || msgLower.includes('ip')) {
+            console.error(chalk.red.bold('[NOWPAYMENTS] IP WHITELIST BLOCK:'), rawBody);
+            return res.status(403).json({
+                error: `NowPayments blocked Railway's server IP. Fix: Log into NowPayments → Account Settings → API Settings → disable IP whitelist (or add the IP shown in the error). Raw: ${rawBody}`
+            });
+        }
+
+        // ── GENERAL ERROR HANDLING ───────────────────────────────────────────
         if (!payoutRes.ok || payoutData.error || payoutData.message) {
             console.error(chalk.red.bold('\n[NOWPAYMENTS API REJECTED PAYOUT REQUEST]'));
             console.error(chalk.yellow('Status Code:'), payoutRes.status);
-            console.error(chalk.yellow('Response Data:'), JSON.stringify(payoutData, null, 2));
+            console.error(chalk.yellow('Response Body:'), rawBody);
             console.error(chalk.yellow('Payload Sent:'), JSON.stringify(payoutPayload, null, 2));
             console.error(chalk.red.bold('------------------------------------------\n'));
-            return res.status(400).json({ error: payoutData.message || 'Gateway rejected payout request. Check Railway logs.' });
+            return res.status(400).json({ error: payoutData.message || payoutData.error || `Gateway error (${payoutRes.status}). Check Railway logs.` });
         }
 
                // SMART ROUTING: Burn the stablecoin OR deduct the internal USD fiat balance

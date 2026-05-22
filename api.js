@@ -62,15 +62,9 @@ async function getNowPaymentsJWT() {
 }
 
 // ── tryAutoWhitelistNowPayments ───────────────────────────────────────────────
-// Automatically adds a user's withdrawal address to the NowPayments payout
-// whitelist via API — no manual admin action needed.
-//
-// NowPayments provides two possible endpoint formats for whitelist management.
-// We try the primary endpoint first, then fall back to the alternate format.
-// If BOTH fail (e.g. NowPayments changes their API), the address stays 'pending'
-// and falls back to the manual admin review workflow.
-//
-// Returns: { success: true } on auto-approval, { success: false, error } otherwise.
+// Automatically adds a withdrawal address to NowPayments payout whitelist.
+// Tries three known endpoint formats since NowPayments API docs are inconsistent.
+// Returns { success: true } if any format works, { success: false, error } otherwise.
 async function tryAutoWhitelistNowPayments(address, currency, label) {
     try {
         const jwt = await getNowPaymentsJWT();
@@ -80,30 +74,41 @@ async function tryAutoWhitelistNowPayments(address, currency, label) {
             'Content-Type':  'application/json'
         };
 
-        // Primary: POST /v1/payout/whitelist
-        const r1 = await fetch(`${NOWPAYMENTS_API_BASE}/payout/whitelist`, {
-            method: 'POST', headers,
-            body: JSON.stringify({ currency, address, description: label || 'User withdrawal address' })
-        });
-        if (r1.ok) {
-            console.log(chalk.green(`[NP WHITELIST] Auto-approved: ${address} (${currency})`));
-            return { success: true };
-        }
-        const b1 = await r1.text();
+        // Three endpoint formats — NowPayments API docs show different versions
+        const attempts = [
+            { url: `${NOWPAYMENTS_API_BASE}/payout/whitelist`,
+              body: { currency, address, description: label || 'User withdrawal address' } },
+            { url: `${NOWPAYMENTS_API_BASE}/payout/whitelist-addresses`,
+              body: { currency, address, label: label || 'User withdrawal address' } },
+            { url: `${NOWPAYMENTS_API_BASE}/payout/whitelists`,
+              body: { currency, address, description: label || 'User withdrawal address' } }
+        ];
 
-        // Fallback: POST /v1/payout/whitelist-addresses
-        const r2 = await fetch(`${NOWPAYMENTS_API_BASE}/payout/whitelist-addresses`, {
-            method: 'POST', headers,
-            body: JSON.stringify({ currency, address, label: label || 'User withdrawal address' })
-        });
-        if (r2.ok) {
-            console.log(chalk.green(`[NP WHITELIST] Auto-approved (alt endpoint): ${address} (${currency})`));
-            return { success: true };
-        }
-        const b2 = await r2.text();
+        for (const attempt of attempts) {
+            try {
+                const r = await fetch(attempt.url, {
+                    method: 'POST', headers, body: JSON.stringify(attempt.body)
+                });
+                const raw = await r.text();
+                // Log every attempt for Railway visibility
+                console.log(chalk.cyan(`[NP WHITELIST] ${attempt.url} → ${r.status}: ${raw.substring(0, 150)}`));
 
-        console.log(chalk.yellow(`[NP WHITELIST] Both endpoints failed. Primary: ${b1} | Alt: ${b2}`));
-        return { success: false, error: b1 };
+                if (r.ok || r.status === 201 || r.status === 200) {
+                    console.log(chalk.green.bold(`[NP WHITELIST] ✓ Auto-approved: ${address} (${currency}) via ${attempt.url}`));
+                    return { success: true };
+                }
+                // 409 = already whitelisted — treat as success
+                if (r.status === 409 || raw.toLowerCase().includes('already') || raw.toLowerCase().includes('exist')) {
+                    console.log(chalk.green(`[NP WHITELIST] Already whitelisted: ${address} (${currency})`));
+                    return { success: true };
+                }
+            } catch(fetchErr) {
+                console.log(chalk.yellow(`[NP WHITELIST] Fetch error on ${attempt.url}: ${fetchErr.message}`));
+            }
+        }
+
+        console.log(chalk.yellow.bold(`[NP WHITELIST] All 3 endpoints failed for ${address}. Check Railway logs above for NowPayments responses.`));
+        return { success: false, error: 'All NowPayments whitelist endpoints rejected request' };
     } catch (err) {
         console.log(chalk.yellow(`[NP WHITELIST] Exception: ${err.message}`));
         return { success: false, error: err.message };
@@ -4465,6 +4470,43 @@ app.use((req, res) => { res.status(404).json({ error: 'API Node Endpoint Not Fou
     }
 
     await updateMarketEconomics();
+
+    // ── Auto-whitelist retry job ─────────────────────────────────────────────
+    // Scans ALL pending withdrawal addresses in the DB and attempts to whitelist
+    // each one on NowPayments. Runs at startup + every 5 minutes automatically.
+    // This means:
+    //   • Addresses added while server was down get approved at next startup
+    //   • Addresses that failed NowPayments are retried without any manual work
+    //   • Millions of users can register addresses with zero admin intervention
+    async function retryPendingWhitelists() {
+        try {
+            const pending = await pool.query(
+                `SELECT id, uid, address, network, currency, label FROM withdrawal_addresses WHERE status = 'pending'`
+            );
+            if (pending.rows.length === 0) return;
+
+            console.log(chalk.cyan(`[NP WHITELIST RETRY] Processing ${pending.rows.length} pending address(es)...`));
+            for (const row of pending.rows) {
+                const result = await tryAutoWhitelistNowPayments(row.address, row.currency, row.label);
+                if (result.success) {
+                    await pool.query(
+                        `UPDATE withdrawal_addresses SET status = 'approved', approved_at = $1 WHERE id = $2`,
+                        [Date.now(), row.id]
+                    );
+                    console.log(chalk.green(`[NP WHITELIST RETRY] ✓ Approved: ${row.address} (${row.network})`));
+                }
+                // Small delay between requests so we don't hit NowPayments rate limits
+                await new Promise(r => setTimeout(r, 800));
+            }
+        } catch (err) {
+            console.log(chalk.yellow(`[NP WHITELIST RETRY] Error: ${err.message}`));
+        }
+    }
+
+    // Run once at boot (catches addresses added while server was down)
+    retryPendingWhitelists();
+    // Then retry every 5 minutes automatically — no manual admin work ever needed
+    setInterval(retryPendingWhitelists, 5 * 60 * 1000);
 
     server.listen(port, '0.0.0.0', () => {
         console.log(chalk.blue.bold(`--- SCIENTIFIC NEXUS API RUNNING ON PORT ${port} ---`));

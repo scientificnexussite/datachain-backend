@@ -61,6 +61,102 @@ async function getNowPaymentsJWT() {
     return authData.token;
 }
 
+// ── tryAutoWhitelistNowPayments ───────────────────────────────────────────────
+// Automatically adds a user's withdrawal address to the NowPayments payout
+// whitelist via API — no manual admin action needed.
+//
+// NowPayments provides two possible endpoint formats for whitelist management.
+// We try the primary endpoint first, then fall back to the alternate format.
+// If BOTH fail (e.g. NowPayments changes their API), the address stays 'pending'
+// and falls back to the manual admin review workflow.
+//
+// Returns: { success: true } on auto-approval, { success: false, error } otherwise.
+async function tryAutoWhitelistNowPayments(address, currency, label) {
+    try {
+        const jwt = await getNowPaymentsJWT();
+        const headers = {
+            'x-api-key':     NOWPAYMENTS_API_KEY,
+            'Authorization': `Bearer ${jwt}`,
+            'Content-Type':  'application/json'
+        };
+
+        // Primary: POST /v1/payout/whitelist
+        const r1 = await fetch(`${NOWPAYMENTS_API_BASE}/payout/whitelist`, {
+            method: 'POST', headers,
+            body: JSON.stringify({ currency, address, description: label || 'User withdrawal address' })
+        });
+        if (r1.ok) {
+            console.log(chalk.green(`[NP WHITELIST] Auto-approved: ${address} (${currency})`));
+            return { success: true };
+        }
+        const b1 = await r1.text();
+
+        // Fallback: POST /v1/payout/whitelist-addresses
+        const r2 = await fetch(`${NOWPAYMENTS_API_BASE}/payout/whitelist-addresses`, {
+            method: 'POST', headers,
+            body: JSON.stringify({ currency, address, label: label || 'User withdrawal address' })
+        });
+        if (r2.ok) {
+            console.log(chalk.green(`[NP WHITELIST] Auto-approved (alt endpoint): ${address} (${currency})`));
+            return { success: true };
+        }
+        const b2 = await r2.text();
+
+        console.log(chalk.yellow(`[NP WHITELIST] Both endpoints failed. Primary: ${b1} | Alt: ${b2}`));
+        return { success: false, error: b1 };
+    } catch (err) {
+        console.log(chalk.yellow(`[NP WHITELIST] Exception: ${err.message}`));
+        return { success: false, error: err.message };
+    }
+}
+// Automatically adds a user's withdrawal address to the NowPayments payout
+// whitelist via API — no manual admin action needed.
+//
+// NowPayments provides two possible endpoint formats for whitelist management.
+// We try the primary endpoint first, then fall back to the alternate format.
+// If BOTH fail (e.g. NowPayments changes their API), the address stays 'pending'
+// and falls back to the manual admin review workflow.
+//
+// Returns: { success: true } on auto-approval, { success: false, error } otherwise.
+async function tryAutoWhitelistNowPayments(address, currency, label) {
+    try {
+        const jwt = await getNowPaymentsJWT();
+        const headers = {
+            'x-api-key':     NOWPAYMENTS_API_KEY,
+            'Authorization': `Bearer ${jwt}`,
+            'Content-Type':  'application/json'
+        };
+
+        // Primary: POST /v1/payout/whitelist
+        const r1 = await fetch(`${NOWPAYMENTS_API_BASE}/payout/whitelist`, {
+            method: 'POST', headers,
+            body: JSON.stringify({ currency, address, description: label || 'User withdrawal address' })
+        });
+        if (r1.ok) {
+            console.log(chalk.green(`[NP WHITELIST] Auto-approved: ${address} (${currency})`));
+            return { success: true };
+        }
+        const b1 = await r1.text();
+
+        // Fallback: POST /v1/payout/whitelist-addresses
+        const r2 = await fetch(`${NOWPAYMENTS_API_BASE}/payout/whitelist-addresses`, {
+            method: 'POST', headers,
+            body: JSON.stringify({ currency, address, label: label || 'User withdrawal address' })
+        });
+        if (r2.ok) {
+            console.log(chalk.green(`[NP WHITELIST] Auto-approved (alt endpoint): ${address} (${currency})`));
+            return { success: true };
+        }
+        const b2 = await r2.text();
+
+        console.log(chalk.yellow(`[NP WHITELIST] Both endpoints failed. Primary: ${b1} | Alt: ${b2}`));
+        return { success: false, error: b1 };
+    } catch (err) {
+        console.log(chalk.yellow(`[NP WHITELIST] Exception: ${err.message}`));
+        return { success: false, error: err.message };
+    }
+}
+
 // ─── Database Schema Init ─────────────────────────────────────────────────────
 pool.query(`
     CREATE TABLE IF NOT EXISTS api_state (
@@ -2728,18 +2824,38 @@ app.post('/api/withdrawal-address/add', txLimiter, requireWeb3Auth, async (req, 
             [uid, label.trim(), address.trim(), network.toUpperCase(), currency, Date.now()]
         );
 
-        // Log for admin review — admin must add this to NowPayments whitelist
-        console.log(chalk.yellow.bold('\n[WITHDRAWAL ADDRESS] NEW PENDING ADDRESS NEEDS NOWPAYMENTS WHITELISTING:'));
-        console.log(chalk.yellow(`  UID     : ${uid.substring(0, 12)}...`));
-        console.log(chalk.yellow(`  Label   : ${label}`));
+        // ── Auto-whitelist on NowPayments ────────────────────────────────────
+        // Attempt to add the address to NowPayments payout whitelist automatically.
+        // If this succeeds → instantly approve the address (user can withdraw now).
+        // If this fails    → keep as 'pending', Railway log shows action needed.
+        const whitelistResult = await tryAutoWhitelistNowPayments(address.trim(), currency, label.trim());
+
+        if (whitelistResult.success) {
+            // Instantly approve — NowPayments whitelist updated, no admin action needed
+            await pool.query(
+                `UPDATE withdrawal_addresses SET status = 'approved', approved_at = $1
+                 WHERE uid = $2 AND LOWER(address) = LOWER($3) AND network = $4`,
+                [Date.now(), uid, address.trim(), network.toUpperCase()]
+            );
+            return res.status(201).json({
+                message: `✓ Address approved and ready to use! You can withdraw to ${address.substring(0,8)}...${address.slice(-6)} immediately.`,
+                status: 'approved',
+                autoApproved: true
+            });
+        }
+
+        // Auto-whitelist failed — fallback to manual admin review
+        console.log(chalk.yellow.bold('\n[WITHDRAWAL ADDRESS] MANUAL ACTION NEEDED — NP AUTO-WHITELIST FAILED:'));
         console.log(chalk.yellow(`  Address : ${address}`));
         console.log(chalk.yellow(`  Network : ${network} → ${currency}`));
-        console.log(chalk.yellow('  ACTION  : Add above address to NowPayments → My Account → Payouts → Payout Addresses'));
-        console.log(chalk.yellow('            Then call POST /api/withdrawal-address/approve to activate it.\n'));
+        console.log(chalk.yellow(`  Error   : ${whitelistResult.error || 'unknown'}`));
+        console.log(chalk.yellow('  ACTION  : 1) Add address to NowPayments → My Account → Payouts → Payout Addresses'));
+        console.log(chalk.yellow('            2) Call POST /api/admin/withdrawal-address/approve with the address ID\n'));
 
         res.status(201).json({
-            message: 'Address saved. It will be reviewed and approved within 24 hours. You will be able to use it for withdrawals once approved.',
-            status: 'pending'
+            message: 'Address saved. It is being reviewed and will be approved within 24 hours.',
+            status: 'pending',
+            autoApproved: false
         });
     } catch (err) {
         if (err.code === '23505') { // unique_violation

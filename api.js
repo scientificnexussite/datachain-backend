@@ -34,6 +34,9 @@ const NOWPAYMENTS_API_KEY  = process.env.NOWPAYMENTS_API_KEY || '';
 // Set NOWPAYMENTS_EMAIL and NOWPAYMENTS_PASSWORD in Railway environment variables.
 const NOWPAYMENTS_EMAIL    = process.env.NOWPAYMENTS_EMAIL    || '';
 const NOWPAYMENTS_PASSWORD = process.env.NOWPAYMENTS_PASSWORD || '';
+// Admin wallet address — the only wallet that can instantly approve withdrawal addresses.
+// Set ADMIN_WALLET in Railway environment variables to your Syrpts wallet address.
+const ADMIN_WALLET         = (process.env.ADMIN_WALLET || '').toLowerCase();
 const NOWPAYMENTS_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET || '';
 const NOWPAYMENTS_API_BASE = 'https://api.nowpayments.io/v1';
 
@@ -190,7 +193,23 @@ pool.query(`
         updated_at BIGINT
     );
 
-    -- FEATURE 1: Activation Gates
+    -- PHASE 23: Withdrawal Address Book
+    -- Users pre-register withdrawal addresses before use. Each address must be
+    -- reviewed and added to NowPayments whitelist by admin before status → approved.
+    -- This keeps NowPayments security enabled while supporting a public platform.
+    CREATE TABLE IF NOT EXISTS withdrawal_addresses (
+        id           SERIAL PRIMARY KEY,
+        uid          VARCHAR(100) NOT NULL,
+        label        VARCHAR(100) NOT NULL,
+        address      VARCHAR(255) NOT NULL,
+        network      VARCHAR(20)  NOT NULL,
+        currency     VARCHAR(30)  NOT NULL,
+        status       VARCHAR(20)  DEFAULT 'pending',
+        created_at   BIGINT       NOT NULL,
+        approved_at  BIGINT,
+        UNIQUE (uid, address, network)
+    );
+
     CREATE TABLE IF NOT EXISTS feature_activations (
         uid VARCHAR(100) NOT NULL,
         feature VARCHAR(50) NOT NULL,
@@ -2652,6 +2671,164 @@ app.post('/api/crypto/webhook', express.json(), async (req, res) => {
 });
 
 // Route 3: Withdraw Crypto (Smart Routing for USD/SDX/SDTX -> External Payout)
+// ─── WITHDRAWAL ADDRESS BOOK ──────────────────────────────────────────────────
+// Users register withdrawal addresses here. Admin reviews and adds them to the
+// NowPayments payout whitelist in the NowPayments dashboard, then approves.
+// This keeps NowPayments security enabled while supporting a public platform.
+
+// ── 1. Add a new withdrawal address (starts as 'pending') ─────────────────────
+app.post('/api/withdrawal-address/add', txLimiter, requireWeb3Auth, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const { label, address, network } = req.body;
+
+        // KYC required to register withdrawal addresses
+        const kycRow = await pool.query(
+            `SELECT status FROM merchant_kyc WHERE uid = $1 ORDER BY created_at DESC LIMIT 1`,
+            [uid]
+        );
+        if (!kycRow.rows.length || kycRow.rows[0].status !== 'verified') {
+            return res.status(403).json({ error: 'KYC verification required to add withdrawal addresses.' });
+        }
+
+        if (!label || !address || !network) {
+            return res.status(400).json({ error: 'label, address, and network are all required.' });
+        }
+        if (label.length > 100) return res.status(400).json({ error: 'Label max 100 characters.' });
+
+        const currency = getCryptoTicker(network);
+        if (!currency) return res.status(400).json({ error: `Unsupported network: ${network}` });
+
+        // Check address format per network
+        const patterns = {
+            BSC: /^0x[a-fA-F0-9]{40}$/, ETH: /^0x[a-fA-F0-9]{40}$/,
+            MATIC: /^0x[a-fA-F0-9]{40}$/, TRX: /^T[1-9A-HJ-NP-Za-km-z]{33}$/,
+            APT: /^0x[a-fA-F0-9]{64}$/, SOL: /^[1-9A-HJ-NP-Za-km-z]{32,44}$/,
+            BTC: /^(1|3)[a-km-zA-HJ-NP-Z1-9]{25,34}$|^(bc1)[0-9A-Za-z]{39,59}$/
+        };
+        if (patterns[network.toUpperCase()] && !patterns[network.toUpperCase()].test(address)) {
+            return res.status(400).json({ error: `Invalid ${network} address format.` });
+        }
+
+        // Check for duplicate
+        const exists = await pool.query(
+            `SELECT id, status FROM withdrawal_addresses WHERE uid = $1 AND address = $2 AND network = $3`,
+            [uid, address, network.toUpperCase()]
+        );
+        if (exists.rows.length > 0) {
+            return res.status(409).json({
+                error: `This address is already saved (status: ${exists.rows[0].status}).`,
+                status: exists.rows[0].status
+            });
+        }
+
+        await pool.query(
+            `INSERT INTO withdrawal_addresses (uid, label, address, network, currency, status, created_at)
+             VALUES ($1, $2, $3, $4, $5, 'pending', $6)`,
+            [uid, label.trim(), address.trim(), network.toUpperCase(), currency, Date.now()]
+        );
+
+        // Log for admin review — admin must add this to NowPayments whitelist
+        console.log(chalk.yellow.bold('\n[WITHDRAWAL ADDRESS] NEW PENDING ADDRESS NEEDS NOWPAYMENTS WHITELISTING:'));
+        console.log(chalk.yellow(`  UID     : ${uid.substring(0, 12)}...`));
+        console.log(chalk.yellow(`  Label   : ${label}`));
+        console.log(chalk.yellow(`  Address : ${address}`));
+        console.log(chalk.yellow(`  Network : ${network} → ${currency}`));
+        console.log(chalk.yellow('  ACTION  : Add above address to NowPayments → My Account → Payouts → Payout Addresses'));
+        console.log(chalk.yellow('            Then call POST /api/withdrawal-address/approve to activate it.\n'));
+
+        res.status(201).json({
+            message: 'Address saved. It will be reviewed and approved within 24 hours. You will be able to use it for withdrawals once approved.',
+            status: 'pending'
+        });
+    } catch (err) {
+        if (err.code === '23505') { // unique_violation
+            return res.status(409).json({ error: 'This address already exists in your address book.' });
+        }
+        console.error('[WITHDRAWAL ADDRESS ADD]', err);
+        res.status(500).json({ error: 'Failed to save address.' });
+    }
+});
+
+// ── 2. List user's saved withdrawal addresses ─────────────────────────────────
+app.post('/api/withdrawal-address/list', readLimiter, requireWeb3Auth, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const rows = await pool.query(
+            `SELECT id, label, address, network, currency, status, created_at, approved_at
+             FROM withdrawal_addresses WHERE uid = $1 ORDER BY created_at DESC`,
+            [uid]
+        );
+        res.json({ addresses: rows.rows });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch addresses.' });
+    }
+});
+
+// ── 3. Remove a saved address ──────────────────────────────────────────────────
+app.post('/api/withdrawal-address/remove', txLimiter, requireWeb3Auth, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const { id } = req.body;
+        if (!id) return res.status(400).json({ error: 'Address ID required.' });
+
+        const del = await pool.query(
+            `DELETE FROM withdrawal_addresses WHERE id = $1 AND uid = $2 RETURNING id, address, network`,
+            [id, uid]
+        );
+        if (del.rowCount === 0) {
+            return res.status(404).json({ error: 'Address not found or not yours.' });
+        }
+        res.json({ message: 'Address removed.', removed: del.rows[0] });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to remove address.' });
+    }
+});
+
+// ── 4. Admin: Approve an address (after adding it to NowPayments whitelist) ───
+// This endpoint requires the caller to be the ADMIN_WALLET. Use this after you
+// have manually added the address to NowPayments payout whitelist in the dashboard.
+app.post('/api/admin/withdrawal-address/approve', txLimiter, requireWeb3Auth, async (req, res) => {
+    try {
+        const callerUid = req.user.uid.toLowerCase();
+        if (!ADMIN_WALLET || callerUid !== ADMIN_WALLET) {
+            return res.status(403).json({ error: 'Admin access required.' });
+        }
+
+        const { id } = req.body;
+        if (!id) return res.status(400).json({ error: 'Address ID required.' });
+
+        const upd = await pool.query(
+            `UPDATE withdrawal_addresses SET status = 'approved', approved_at = $1
+             WHERE id = $2 RETURNING id, uid, label, address, network`,
+            [Date.now(), id]
+        );
+        if (upd.rowCount === 0) return res.status(404).json({ error: 'Address not found.' });
+
+        console.log(chalk.green(`[WITHDRAWAL ADDRESS] APPROVED: ${upd.rows[0].address} (${upd.rows[0].network}) for user ${upd.rows[0].uid.substring(0, 10)}...`));
+        res.json({ message: 'Address approved. User can now withdraw to this address.', address: upd.rows[0] });
+    } catch (err) {
+        res.status(500).json({ error: 'Approval failed.' });
+    }
+});
+
+// ── 5. Admin: List all pending addresses needing NowPayments whitelisting ─────
+app.post('/api/admin/withdrawal-address/pending', readLimiter, requireWeb3Auth, async (req, res) => {
+    try {
+        const callerUid = req.user.uid.toLowerCase();
+        if (!ADMIN_WALLET || callerUid !== ADMIN_WALLET) {
+            return res.status(403).json({ error: 'Admin access required.' });
+        }
+        const rows = await pool.query(
+            `SELECT id, uid, label, address, network, currency, created_at
+             FROM withdrawal_addresses WHERE status = 'pending' ORDER BY created_at ASC`
+        );
+        res.json({ pending: rows.rows, count: rows.rowCount });
+    } catch (err) {
+        res.status(500).json({ error: 'Failed to fetch pending addresses.' });
+    }
+});
+
 app.post('/api/crypto/withdraw', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -2662,7 +2839,28 @@ app.post('/api/crypto/withdraw', txLimiter, requireWeb3Auth, async (req, res) =>
             return res.status(400).json({ error: 'Invalid withdrawal parameters. Minimum $5.00.' });
         }
 
-        // Verify requested asset is allowed
+        // ── ADDRESS BOOK VALIDATION ──────────────────────────────────────────
+        // Destination address must be pre-registered and approved in the user's
+        // withdrawal address book. This keeps NowPayments whitelist security
+        // enabled while supporting a public platform — same model as Binance/Coinbase.
+        const addrCheck = await pool.query(
+            `SELECT id, status FROM withdrawal_addresses
+             WHERE uid = $1 AND LOWER(address) = LOWER($2) AND network = $3`,
+            [uid, address, network.toUpperCase()]
+        );
+        if (addrCheck.rows.length === 0) {
+            return res.status(403).json({
+                error: 'Address not in your withdrawal address book. Add it first from the Withdraw page → Manage Addresses, then wait for approval.',
+                needsAddressBook: true
+            });
+        }
+        if (addrCheck.rows[0].status !== 'approved') {
+            return res.status(403).json({
+                error: `Address is pending approval (status: ${addrCheck.rows[0].status}). You will be able to use it once approved — usually within 24 hours.`,
+                needsAddressBook: true,
+                status: addrCheck.rows[0].status
+            });
+        }
         const safeBurn = ['SDX', 'SDTX', 'USD'].includes(burnAsset) ? burnAsset : 'SDTX';
 
         // Check if user has sufficient balance in the specific asset they chose

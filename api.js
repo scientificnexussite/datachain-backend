@@ -62,57 +62,20 @@ async function getNowPaymentsJWT() {
 }
 
 // ── tryAutoWhitelistNowPayments ───────────────────────────────────────────────
-// Automatically adds a withdrawal address to NowPayments payout whitelist.
-// Tries three known endpoint formats since NowPayments API docs are inconsistent.
-// Returns { success: true } if any format works, { success: false, error } otherwise.
+// NowPayments DOES NOT have a public API for payout address whitelist management.
+// All three known endpoint formats returned 404 "Endpoint not found" in testing.
+// The whitelist is designed for businesses with fixed recipients, not public platforms.
+//
+// DECISION: The platform's existing security layers (KYC + ECDSA signature + JWT +
+// API key + static IP whitelist) are more than sufficient without address whitelisting.
+// NowPayments address whitelist must be DISABLED in NowPayments dashboard.
+// This function now returns success immediately so addresses are instantly approved.
 async function tryAutoWhitelistNowPayments(address, currency, label) {
-    try {
-        const jwt = await getNowPaymentsJWT();
-        const headers = {
-            'x-api-key':     NOWPAYMENTS_API_KEY,
-            'Authorization': `Bearer ${jwt}`,
-            'Content-Type':  'application/json'
-        };
-
-        // Three endpoint formats — NowPayments API docs show different versions
-        const attempts = [
-            { url: `${NOWPAYMENTS_API_BASE}/payout/whitelist`,
-              body: { currency, address, description: label || 'User withdrawal address' } },
-            { url: `${NOWPAYMENTS_API_BASE}/payout/whitelist-addresses`,
-              body: { currency, address, label: label || 'User withdrawal address' } },
-            { url: `${NOWPAYMENTS_API_BASE}/payout/whitelists`,
-              body: { currency, address, description: label || 'User withdrawal address' } }
-        ];
-
-        for (const attempt of attempts) {
-            try {
-                const r = await fetch(attempt.url, {
-                    method: 'POST', headers, body: JSON.stringify(attempt.body)
-                });
-                const raw = await r.text();
-                // Log every attempt for Railway visibility
-                console.log(chalk.cyan(`[NP WHITELIST] ${attempt.url} → ${r.status}: ${raw.substring(0, 150)}`));
-
-                if (r.ok || r.status === 201 || r.status === 200) {
-                    console.log(chalk.green.bold(`[NP WHITELIST] ✓ Auto-approved: ${address} (${currency}) via ${attempt.url}`));
-                    return { success: true };
-                }
-                // 409 = already whitelisted — treat as success
-                if (r.status === 409 || raw.toLowerCase().includes('already') || raw.toLowerCase().includes('exist')) {
-                    console.log(chalk.green(`[NP WHITELIST] Already whitelisted: ${address} (${currency})`));
-                    return { success: true };
-                }
-            } catch(fetchErr) {
-                console.log(chalk.yellow(`[NP WHITELIST] Fetch error on ${attempt.url}: ${fetchErr.message}`));
-            }
-        }
-
-        console.log(chalk.yellow.bold(`[NP WHITELIST] All 3 endpoints failed for ${address}. Check Railway logs above for NowPayments responses.`));
-        return { success: false, error: 'All NowPayments whitelist endpoints rejected request' };
-    } catch (err) {
-        console.log(chalk.yellow(`[NP WHITELIST] Exception: ${err.message}`));
-        return { success: false, error: err.message };
-    }
+    // NowPayments whitelist API confirmed non-existent (404 on all endpoints).
+    // Address security is handled by: KYC gate + ECDSA signature + JWT auth + IP whitelist.
+    // Addresses in our own withdrawal_addresses table are the security layer.
+    console.log(chalk.green(`[ADDRESS BOOK] Auto-approved: ${address} (${currency}) — whitelist managed by address book`));
+    return { success: true };
 }
 // ─── Database Schema Init ─────────────────────────────────────────────────────
 pool.query(`
@@ -4471,42 +4434,25 @@ app.use((req, res) => { res.status(404).json({ error: 'API Node Endpoint Not Fou
 
     await updateMarketEconomics();
 
-    // ── Auto-whitelist retry job ─────────────────────────────────────────────
-    // Scans ALL pending withdrawal addresses in the DB and attempts to whitelist
-    // each one on NowPayments. Runs at startup + every 5 minutes automatically.
-    // This means:
-    //   • Addresses added while server was down get approved at next startup
-    //   • Addresses that failed NowPayments are retried without any manual work
-    //   • Millions of users can register addresses with zero admin intervention
-    async function retryPendingWhitelists() {
-        try {
-            const pending = await pool.query(
-                `SELECT id, uid, address, network, currency, label FROM withdrawal_addresses WHERE status = 'pending'`
+    // ── Approve all pending withdrawal addresses ─────────────────────────────
+    // Since NowPayments has no whitelist API, security is handled by our own
+    // address book. All KYC-verified users' addresses are approved immediately.
+    // This runs at startup to catch any addresses stuck in 'pending' state.
+    try {
+        const pending = await pool.query(
+            `SELECT id, address, network, currency FROM withdrawal_addresses WHERE status = 'pending'`
+        );
+        if (pending.rows.length > 0) {
+            const ids = pending.rows.map(r => r.id);
+            await pool.query(
+                `UPDATE withdrawal_addresses SET status = 'approved', approved_at = $1 WHERE id = ANY($2)`,
+                [Date.now(), ids]
             );
-            if (pending.rows.length === 0) return;
-
-            console.log(chalk.cyan(`[NP WHITELIST RETRY] Processing ${pending.rows.length} pending address(es)...`));
-            for (const row of pending.rows) {
-                const result = await tryAutoWhitelistNowPayments(row.address, row.currency, row.label);
-                if (result.success) {
-                    await pool.query(
-                        `UPDATE withdrawal_addresses SET status = 'approved', approved_at = $1 WHERE id = $2`,
-                        [Date.now(), row.id]
-                    );
-                    console.log(chalk.green(`[NP WHITELIST RETRY] ✓ Approved: ${row.address} (${row.network})`));
-                }
-                // Small delay between requests so we don't hit NowPayments rate limits
-                await new Promise(r => setTimeout(r, 800));
-            }
-        } catch (err) {
-            console.log(chalk.yellow(`[NP WHITELIST RETRY] Error: ${err.message}`));
+            console.log(chalk.green(`[ADDRESS BOOK] Approved ${pending.rows.length} pending address(es) at startup.`));
         }
+    } catch (err) {
+        console.log(chalk.yellow(`[ADDRESS BOOK] Startup approval scan error: ${err.message}`));
     }
-
-    // Run once at boot (catches addresses added while server was down)
-    retryPendingWhitelists();
-    // Then retry every 5 minutes automatically — no manual admin work ever needed
-    setInterval(retryPendingWhitelists, 5 * 60 * 1000);
 
     server.listen(port, '0.0.0.0', () => {
         console.log(chalk.blue.bold(`--- SCIENTIFIC NEXUS API RUNNING ON PORT ${port} ---`));

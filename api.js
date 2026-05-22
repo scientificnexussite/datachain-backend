@@ -2732,6 +2732,22 @@ app.post('/api/crypto/withdraw', txLimiter, requireWeb3Auth, async (req, res) =>
             });
         }
 
+        // ── PAYOUT ADDRESS WHITELIST DETECTION ──────────────────────────────
+        // NowPayments has a separate "Payout Address Whitelist" from the IP whitelist.
+        // This restricts which wallet addresses you can send payouts to.
+        // For a PUBLIC platform where any user withdraws to their own address,
+        // this MUST be disabled in NowPayments account settings:
+        //   NowPayments → My Account → Payouts → Payout Addresses → Disable whitelist
+        const isAddrBlock = msgLower.includes('not whitelisted')
+                         || msgLower.includes('address') && msgLower.includes('whitelist')
+                         || msgLower.includes('whitelisted');
+        if (isAddrBlock) {
+            console.error(chalk.red.bold('[NOWPAYMENTS] PAYOUT ADDRESS NOT WHITELISTED:'), rawBody);
+            return res.status(403).json({
+                error: 'Withdrawal address is not whitelisted on NowPayments. Fix: Log into NowPayments → My Account → Payouts → Payout Addresses → DISABLE the address whitelist. This setting is designed for fixed-recipient businesses, not public platforms.'
+            });
+        }
+
         // ── GENERAL ERROR HANDLING ───────────────────────────────────────────
         if (!payoutRes.ok || payoutData.error || payoutData.message) {
             console.error(chalk.red.bold('\n[NOWPAYMENTS API REJECTED PAYOUT REQUEST]'));

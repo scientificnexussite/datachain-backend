@@ -108,7 +108,7 @@ async function tryAutoWhitelistNowPayments(address, currency, label) {
         console.log(chalk.yellow(`[NP WHITELIST] Exception: ${err.message}`));
         return { success: false, error: err.message };
     }
-
+}
 // ─── Database Schema Init ─────────────────────────────────────────────────────
 pool.query(`
     CREATE TABLE IF NOT EXISTS api_state (

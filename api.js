@@ -2978,11 +2978,17 @@ app.post('/api/open-token/deploy', txLimiter, requireWeb3Auth, async (req, res) 
             return res.status(409).json({ error: `Ticker ${safeTicker} is already taken.` });
 
         // ── Fee collection ────────────────────────────────────────────────────
-        const syrPrice  = nexusChain.state.getSyrPrice ? nexusChain.state.getSyrPrice() : (await getHardPeg('SYR') || 0.00000001);
-        const platformFeeSyr = syrPrice > 0 ? parseFloat((1.0 / syrPrice).toFixed(8)) : 0;
+        // PLATFORM FEE: 1 SDX ($1 stablecoin) — NOT SYR.
+        // Using SYR caused "insufficient funds" because at seed price $0.00000001,
+        // $1 = 100,000,000 SYR which users never have.
+        // SDX is always pegged to $1, so 1 SDX = $1 reliably.
+        const PLATFORM_FEE_SDX = 1.0;
+        const availSdx = nexusChain.getBalance(uid, 'SDX') - menuBook.getLockedToken(uid, 'SDX') - mempool.getPendingTokenSpend(uid, 'SDX');
+        if (availSdx < PLATFORM_FEE_SDX)
+            return res.status(400).json({ error: `Insufficient SDX. Need 1.00 SDX for platform fee, have ${availSdx.toFixed(4)} SDX.` });
 
-        let networkFee    = 0;
-        let networkOwner  = null;
+        let networkFee   = 0;
+        let networkOwner = null;
         const parentUpper = (parentTicker || '').toUpperCase();
         if (parentUpper) {
             const feeRow = await pool.query('SELECT fee_syr, owner_uid FROM network_deploy_fees WHERE parent_ticker = $1', [parentUpper]);
@@ -2991,20 +2997,19 @@ app.post('/api/open-token/deploy', txLimiter, requireWeb3Auth, async (req, res) 
                 networkOwner = feeRow.rows[0].owner_uid;
             }
         }
-
-        const totalFeeSyr = platformFeeSyr + networkFee;
-        const availSyr    = nexusChain.state.getSyr(uid) - mempool.getPendingSyrSpend(uid);
-        if (availSyr < totalFeeSyr)
-            return res.status(400).json({ error: `Insufficient SYR. Need ${totalFeeSyr.toFixed(8)}, have ${availSyr.toFixed(8)}.` });
-
-        // ── Deduct platform fee → system ──────────────────────────────────────
-        if (platformFeeSyr > 0) {
-            await mempool.addTransaction({
-                from: uid, to: 'system', amount: platformFeeSyr, type: 'SYR_TRANSFER',
-                tokenSymbol: 'SYR', timestamp: Date.now(), isSystemGenerated: true,
-                description: `OpenChain deploy fee: ${safeTicker}`
-            });
+        // Check SYR balance for network fee
+        if (networkFee > 0) {
+            const availSyr = nexusChain.getBalance(uid, 'SYR') - menuBook.getLockedToken(uid, 'SYR') - mempool.getPendingTokenSpend(uid, 'SYR');
+            if (availSyr < networkFee)
+                return res.status(400).json({ error: `Insufficient SYR for network fee. Need ${networkFee} SYR, have ${availSyr.toFixed(4)}.` });
         }
+
+        // ── Deduct platform fee: 1 SDX → system ──────────────────────────────
+        await mempool.addTransaction({
+            from: uid, to: 'system', amount: PLATFORM_FEE_SDX, type: 'TOKEN_TRANSFER',
+            tokenSymbol: 'SDX', timestamp: Date.now(), isSystemGenerated: true,
+            description: `OpenChain deploy fee: ${safeTicker}`
+        });
 
         // ── Deduct network fee → parent token owner ───────────────────────────
         if (networkFee > 0 && networkOwner) {

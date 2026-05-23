@@ -209,7 +209,27 @@ pool.query(`
         updated_at BIGINT
     );
 
-    -- PHASE 23: Withdrawal Address Book
+    -- OPENCHAIN TERMINAL: Open token deployment (no KYC, no domain verification)
+    CREATE TABLE IF NOT EXISTS open_tokens (
+        id           SERIAL PRIMARY KEY,
+        uid          VARCHAR(255) NOT NULL,
+        ticker       VARCHAR(20)  NOT NULL UNIQUE,
+        name         VARCHAR(50)  NOT NULL,
+        description  TEXT         DEFAULT '',
+        logo_url     TEXT         DEFAULT '',
+        parent_ticker VARCHAR(20),
+        total_supply BIGINT       NOT NULL,
+        status       VARCHAR(20)  DEFAULT 'active',
+        created_at   BIGINT       NOT NULL
+    );
+    -- Token owners can set a SYR fee for others deploying under their network
+    CREATE TABLE IF NOT EXISTS network_deploy_fees (
+        parent_ticker VARCHAR(20) PRIMARY KEY,
+        owner_uid     VARCHAR(255) NOT NULL,
+        fee_syr       DECIMAL(20,8) NOT NULL DEFAULT 0,
+        updated_at    BIGINT       NOT NULL
+    );
+
     -- Users pre-register withdrawal addresses before use. Each address must be
     -- reviewed and added to NowPayments whitelist by admin before status → approved.
     -- This keeps NowPayments security enabled while supporting a public platform.
@@ -2864,6 +2884,167 @@ app.post('/api/admin/withdrawal-address/pending', readLimiter, requireWeb3Auth, 
         res.status(500).json({ error: 'Failed to fetch pending addresses.' });
     }
 });
+
+// ─── OPENCHAIN TERMINAL ENDPOINTS ────────────────────────────────────────────
+// Open token deployment — no KYC, no domain verification required.
+
+// 1. Public list of all open tokens
+app.get('/api/open-tokens', readLimiter, async (req, res) => {
+    try {
+        const rows = await pool.query(
+            `SELECT ticker, name, description, logo_url, parent_ticker, total_supply, created_at
+             FROM open_tokens WHERE status = 'active' ORDER BY created_at DESC LIMIT 200`
+        );
+        res.json(rows.rows);
+    } catch(err) { res.status(500).json({ error: 'Failed to load tokens.' }); }
+});
+
+// 2. User's deployed open tokens
+app.post('/api/open-token/my-tokens', readLimiter, requireWeb3Auth, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const rows = await pool.query(
+            `SELECT ticker, name, description, logo_url, parent_ticker, total_supply, created_at
+             FROM open_tokens WHERE uid = $1 ORDER BY created_at DESC`, [uid]
+        );
+        res.json({ tokens: rows.rows });
+    } catch(err) { res.status(500).json({ error: 'Failed to load your tokens.' }); }
+});
+
+// 3. Get network deploy fee for a parent ticker
+app.get('/api/open-token/network-fee/:ticker', readLimiter, async (req, res) => {
+    try {
+        const ticker = req.params.ticker.toUpperCase();
+        const row = await pool.query('SELECT fee_syr, owner_uid FROM network_deploy_fees WHERE parent_ticker = $1', [ticker]);
+        if (row.rows.length === 0) return res.json({ fee_syr: 0 });
+        res.json({ fee_syr: parseFloat(row.rows[0].fee_syr), owner_uid: row.rows[0].owner_uid });
+    } catch(err) { res.status(500).json({ error: 'Failed to fetch fee.' }); }
+});
+
+// 4. Set / update network deploy fee (only the token owner can do this)
+app.post('/api/open-token/set-network-fee', txLimiter, requireWeb3Auth, async (req, res) => {
+    try {
+        const uid    = req.user.uid;
+        const ticker = (req.body.ticker || '').toUpperCase();
+        const feeSyr = Math.max(0, parseFloat(req.body.feeSyr) || 0);
+        if (!ticker) return res.status(400).json({ error: 'Ticker required.' });
+
+        // Verify caller owns this token (check verified tokens or open tokens)
+        const owned = await pool.query(
+            `SELECT 1 FROM transactions WHERE type = 'MINT' AND token_symbol = $1
+             AND (is_system_generated = TRUE) LIMIT 1`, [ticker]
+        );
+        // Also allow if they created an open token with this ticker
+        const openOwned = await pool.query(
+            `SELECT 1 FROM open_tokens WHERE ticker = $1 AND uid = $2 LIMIT 1`, [ticker, uid]
+        );
+        if (owned.rows.length === 0 && openOwned.rows.length === 0) {
+            return res.status(403).json({ error: 'You do not own this token.' });
+        }
+
+        await pool.query(
+            `INSERT INTO network_deploy_fees (parent_ticker, owner_uid, fee_syr, updated_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (parent_ticker) DO UPDATE SET fee_syr = $3, updated_at = $4`,
+            [ticker, uid, feeSyr, Date.now()]
+        );
+        res.json({ success: true, ticker, fee_syr: feeSyr });
+    } catch(err) { res.status(500).json({ error: 'Failed to set fee.' }); }
+});
+
+// 5. Deploy an open token — no KYC, no domain verification
+app.post('/api/open-token/deploy', txLimiter, requireWeb3Auth, async (req, res) => {
+    try {
+        const uid          = req.user.uid;
+        const { name, ticker, totalSupply, logoUrl, description, parentTicker } = req.body;
+
+        // ── Input validation ──────────────────────────────────────────────────
+        if (!name || name.length > 25)
+            return res.status(400).json({ error: 'Token name required (max 25 characters).' });
+        const safeTicker = (ticker || '').toUpperCase().replace(/[^A-Z0-9]/g,'');
+        if (!safeTicker || safeTicker.length > 10)
+            return res.status(400).json({ error: 'Invalid ticker (max 10 alphanumeric characters).' });
+        const parsedSupply = parseInt(totalSupply);
+        if (isNaN(parsedSupply) || parsedSupply < 1 || parsedSupply > 10_000_000_000)
+            return res.status(400).json({ error: 'Invalid supply (max 10 billion).' });
+
+        // ── Check ticker not already taken ────────────────────────────────────
+        const existing = await pool.query(
+            `SELECT 1 FROM open_tokens WHERE ticker = $1
+             UNION SELECT 1 FROM transactions WHERE type = 'MINT' AND token_symbol = $1 LIMIT 1`,
+            [safeTicker]
+        );
+        if (existing.rows.length > 0)
+            return res.status(409).json({ error: `Ticker ${safeTicker} is already taken.` });
+
+        // ── Fee collection ────────────────────────────────────────────────────
+        const syrPrice  = nexusChain.state.getSyrPrice ? nexusChain.state.getSyrPrice() : (await getHardPeg('SYR') || 0.00000001);
+        const platformFeeSyr = syrPrice > 0 ? parseFloat((1.0 / syrPrice).toFixed(8)) : 0;
+
+        let networkFee    = 0;
+        let networkOwner  = null;
+        const parentUpper = (parentTicker || '').toUpperCase();
+        if (parentUpper) {
+            const feeRow = await pool.query('SELECT fee_syr, owner_uid FROM network_deploy_fees WHERE parent_ticker = $1', [parentUpper]);
+            if (feeRow.rows.length > 0) {
+                networkFee   = parseFloat(feeRow.rows[0].fee_syr) || 0;
+                networkOwner = feeRow.rows[0].owner_uid;
+            }
+        }
+
+        const totalFeeSyr = platformFeeSyr + networkFee;
+        const availSyr    = nexusChain.state.getSyr(uid) - mempool.getPendingSyrSpend(uid);
+        if (availSyr < totalFeeSyr)
+            return res.status(400).json({ error: `Insufficient SYR. Need ${totalFeeSyr.toFixed(8)}, have ${availSyr.toFixed(8)}.` });
+
+        // ── Deduct platform fee → system ──────────────────────────────────────
+        if (platformFeeSyr > 0) {
+            await mempool.addTransaction({
+                from: uid, to: 'system', amount: platformFeeSyr, type: 'SYR_TRANSFER',
+                tokenSymbol: 'SYR', timestamp: Date.now(), isSystemGenerated: true,
+                description: `OpenChain deploy fee: ${safeTicker}`
+            });
+        }
+
+        // ── Deduct network fee → parent token owner ───────────────────────────
+        if (networkFee > 0 && networkOwner) {
+            await mempool.addTransaction({
+                from: uid, to: networkOwner, amount: networkFee, type: 'SYR_TRANSFER',
+                tokenSymbol: 'SYR', timestamp: Date.now() + 1, isSystemGenerated: true,
+                description: `Network deploy fee: ${safeTicker} under ${parentUpper}`
+            });
+        }
+
+        // ── Mint the new open token ───────────────────────────────────────────
+        await mempool.addTransaction({
+            from: 'system', to: uid, amount: parsedSupply, type: 'MINT',
+            tokenSymbol: safeTicker, priceUsd: 0,
+            platformType: 'openchain',
+            description: JSON.stringify({
+                name, desc: description || '', logoUrl: logoUrl || '',
+                parentNetwork: parentUpper || null, url: ''
+            }),
+            timestamp: Date.now() + 2, isSystemGenerated: true
+        });
+
+        // ── Record in open_tokens table ───────────────────────────────────────
+        await pool.query(
+            `INSERT INTO open_tokens (uid, ticker, name, description, logo_url, parent_ticker, total_supply, status, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8)`,
+            [uid, safeTicker, name, description || '', logoUrl || '',
+             parentUpper || null, parsedSupply, Date.now()]
+        );
+
+        console.log(chalk.green(`[OPENCHAIN] Token deployed: ${safeTicker} by ${uid.substring(0,12)}...`));
+        res.status(201).json({ success: true, ticker: safeTicker, name, supply: parsedSupply });
+
+    } catch(err) {
+        console.error('[OPENCHAIN DEPLOY]', err);
+        res.status(500).json({ error: err.message || 'Deployment failed.' });
+    }
+});
+
+// ─── END OPENCHAIN ENDPOINTS ──────────────────────────────────────────────────
 
 app.post('/api/crypto/withdraw', txLimiter, requireWeb3Auth, async (req, res) => {
     try {

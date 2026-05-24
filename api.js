@@ -2064,7 +2064,7 @@ app.get('/balance/:address', (req, res) => {
     res.json({ address: req.params.address, token, balance: totalSyr - lockedSyr, total: totalSyr, locked: lockedSyr });
 });
 
-app.get('/stats', (req, res) => {
+app.get('/stats', async (req, res) => {
     const token = (req.query.token || 'SYR').toUpperCase();
 
     // For SYR, use cached stats

@@ -2111,25 +2111,29 @@ app.get('/stats', async (req, res) => {
     // STATS FIX: menuBook.books[token].lastTradePrice resets to 0 on every server
     // restart because it's in-memory only. Fall back to the DB (last MARKET_TRADE
     // row for this token) so price always reflects the last actual trade, not 0.
+    // COLUMN FIX: transactions table has no 'price_usd' column.
+    // Price = amount_usd / amount (same formula used by /pricehistory endpoint).
     let tokenPrice = ['SDX', 'SDTX'].includes(token) ? 1.00 : (menuBook.books[token]?.lastTradePrice || menuBook.books[token]?.asks?.[0]?.priceUsd || 0);
 
     if (tokenPrice === 0 && !['SDX', 'SDTX'].includes(token)) {
         try {
             const lastTrade = await pool.query(
-                `SELECT price_usd FROM transactions
-                 WHERE token_symbol = $1 AND type = 'MARKET_TRADE' AND price_usd > 0
+                `SELECT (amount_usd / amount) AS computed_price
+                 FROM transactions
+                 WHERE token_symbol = $1 AND type = 'MARKET_TRADE'
+                   AND amount > 0 AND amount_usd > 0
                  ORDER BY timestamp_ms DESC LIMIT 1`,
                 [token]
             );
             if (lastTrade.rows.length > 0) {
-                const dbPrice = parseFloat(lastTrade.rows[0].price_usd) || 0;
+                const dbPrice = parseFloat(lastTrade.rows[0].computed_price) || 0;
                 if (dbPrice > 0) {
                     tokenPrice = dbPrice;
-                    // Restore into menuBook so subsequent requests use memory
+                    // Restore into menuBook so subsequent in-memory requests use this price
                     if (menuBook.books[token]) menuBook.books[token].lastTradePrice = dbPrice;
                 }
             }
-        } catch(e) {}
+        } catch(e) { /* silent — tokenPrice stays 0 */ }
     }
 
     res.json({

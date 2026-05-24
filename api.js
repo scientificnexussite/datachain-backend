@@ -517,11 +517,13 @@ const MAX_SUPPLY   = 12_000_000_000;
 let currentPrice   = config.blockchain.starting_price;
 
 const apiCache = {
-    stats:   { data: null, time: 0 },
-    network: { data: null, time: 0 },
-    menubook: new Map()
+    stats:      { data: null, time: 0 },
+    network:    { data: null, time: 0 },
+    menubook:   new Map(),
+    tokenStats: new Map()  // Layer 1: per-custom-token stats cache (key = ticker)
 };
-const CACHE_TTL = 10000; // FIX 17: Increased to 10s to prevent DB hammering
+const CACHE_TTL       = 10000; // 10s — general purpose
+const TOKEN_STATS_TTL = 30000; // 30s — custom token stats (price, supply, holders)
 
 let pendingPayPalOrders  = new Map();
 let pendingVerifications = new Map();
@@ -574,6 +576,7 @@ async function updateMarketEconomics() {
         apiCache.stats.time   = 0;
         apiCache.network.time = 0;
         apiCache.menubook.clear();
+        apiCache.tokenStats.clear();
 
         if (global.broadcastWS) {
             global.broadcastWS('PRICE_UPDATE', { token: 'SYR', price: currentPrice, timestamp: Date.now() });
@@ -2091,6 +2094,15 @@ app.get('/stats', async (req, res) => {
         return res.json(apiCache.stats.data);
     }
 
+    // ── Layer 1: Check per-token cache first ─────────────────────────────────
+    // Custom token stats are cached for 30s. This means after the first cold-start
+    // request wakes Railway and populates the cache, all subsequent requests within
+    // 30s return instantly from memory — no DB queries, no timeout possible.
+    const cachedToken = apiCache.tokenStats.get(token);
+    if (cachedToken && (Date.now() - cachedToken.time < TOKEN_STATS_TTL)) {
+        return res.json(cachedToken.data);
+    }
+
     // FIX: For custom tokens, return token-specific stats including:
     //   - circulatingSupply: tokens held by real users (not system/handler addresses)
     //   - handlerSupply: tokens sent to the system handler address (this is what
@@ -2102,17 +2114,12 @@ app.get('/stats', async (req, res) => {
     for (const addr in tokenBals) {
         const bal = tokenBals[addr] || 0;
         if (addr.startsWith('nx_sys_')) {
-            handlerSupply += bal;   // tokens in the system handler = "remaining" pool
+            handlerSupply += bal;
         } else if (addr !== 'system' && addr !== 'liquidity-pool') {
-            circulating += bal;     // tokens held by real users
+            circulating += bal;
         }
     }
-    
-    // STATS FIX: menuBook.books[token].lastTradePrice resets to 0 on every server
-    // restart because it's in-memory only. Fall back to the DB (last MARKET_TRADE
-    // row for this token) so price always reflects the last actual trade, not 0.
-    // COLUMN FIX: transactions table has no 'price_usd' column.
-    // Price = amount_usd / amount (same formula used by /pricehistory endpoint).
+
     let tokenPrice = ['SDX', 'SDTX'].includes(token) ? 1.00 : (menuBook.books[token]?.lastTradePrice || menuBook.books[token]?.asks?.[0]?.priceUsd || 0);
 
     if (tokenPrice === 0 && !['SDX', 'SDTX'].includes(token)) {
@@ -2129,21 +2136,25 @@ app.get('/stats', async (req, res) => {
                 const dbPrice = parseFloat(lastTrade.rows[0].computed_price) || 0;
                 if (dbPrice > 0) {
                     tokenPrice = dbPrice;
-                    // Restore into menuBook so subsequent in-memory requests use this price
                     if (menuBook.books[token]) menuBook.books[token].lastTradePrice = dbPrice;
                 }
             }
-        } catch(e) { /* silent — tokenPrice stays 0 */ }
+        } catch(e) { /* silent */ }
     }
 
-    res.json({
+    const statsPayload = {
         token,
         circulatingSupply: circulating,
         handlerSupply,
-        remainingSupply: handlerSupply,
-        currentPrice: tokenPrice,
-        marketCap: circulating * tokenPrice
-    });
+        remainingSupply:   handlerSupply,
+        currentPrice:      tokenPrice,
+        marketCap:         circulating * tokenPrice
+    };
+
+    // Write to cache so next request within 30s is instant
+    apiCache.tokenStats.set(token, { data: statsPayload, time: Date.now() });
+
+    res.json(statsPayload);
 });
 
 app.get('/supply',        (req, res) => res.json({ remainingSupply: nexusChain.getRemainingSupply('SYR') }));
@@ -3228,13 +3239,27 @@ app.get('/api/token/creator/:ticker', readLimiter, async (req, res) => {
     const norm = (a) => String(a || '').trim().replace(/^nx_/, '');
 
     try {
-        // Primary check: MINT transaction (DelChain FDX tokens)
-        const mintRow = await pool.query(
-            `SELECT to_address FROM transactions
-             WHERE type = 'MINT' AND token_symbol = $1 AND is_system_generated = TRUE
-             ORDER BY timestamp_ms ASC LIMIT 1`,
-            [ticker]
-        );
+        // Layer 1 optimization: run all 3 DB queries IN PARALLEL instead of sequentially.
+        // Previous: mint → (if fail) handler → (if fail) open_tokens = 3 round trips.
+        // Now: all 3 fire at once, results checked in priority order = ~60% faster.
+        const [mintRow, handlerRow, openRow] = await Promise.all([
+            pool.query(
+                `SELECT to_address FROM transactions
+                 WHERE type = 'MINT' AND token_symbol = $1 AND is_system_generated = TRUE
+                 ORDER BY timestamp_ms ASC LIMIT 1`,
+                [ticker]
+            ),
+            pool.query(
+                'SELECT creator_uid FROM system_handlers WHERE token_symbol = $1 LIMIT 1',
+                [ticker]
+            ),
+            pool.query(
+                'SELECT uid FROM open_tokens WHERE ticker = $1 LIMIT 1',
+                [ticker]
+            )
+        ]);
+
+        // Primary: MINT transaction creator
         if (mintRow.rows.length > 0) {
             const mintOwner = mintRow.rows[0].to_address || '';
             if (norm(mintOwner) === norm(uid)) {
@@ -3242,24 +3267,14 @@ app.get('/api/token/creator/:ticker', readLimiter, async (req, res) => {
             }
         }
 
-        // Secondary check: system handler creator (handler wallet may differ from MINT)
-        const handlerRow = await pool.query(
-            'SELECT creator_uid FROM system_handlers WHERE token_symbol = $1 LIMIT 1',
-            [ticker]
-        );
+        // Secondary: system handler creator
         if (handlerRow.rows.length > 0) {
             if (norm(handlerRow.rows[0].creator_uid) === norm(uid)) {
                 return res.json({ isCreator: true, ticker, source: 'handler' });
             }
         }
 
-        // Tertiary check: open_tokens table (OpenTerminal deployments).
-        // For OpenTerminal tokens, the MINT goes to a system address, NOT the creator.
-        // The open_tokens table stores the actual deployer uid — use this for badge check.
-        const openRow = await pool.query(
-            'SELECT uid FROM open_tokens WHERE ticker = $1 LIMIT 1',
-            [ticker]
-        );
+        // Tertiary: open_tokens deployer
         if (openRow.rows.length > 0) {
             if (norm(openRow.rows[0].uid) === norm(uid)) {
                 return res.json({ isCreator: true, ticker, source: 'open_tokens' });

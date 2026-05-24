@@ -1436,9 +1436,12 @@ app.get('/tokens', readLimiter, async (req, res) => {
                 lastPrice,
                 description:  meta.description,
                 platformType: meta.platformType,
+                // FIX: 'source' field lets frontend classify tokens without extra API calls.
+                // 'OpenTerminal' = permissionless open-chain; 'DelChain' = verified FDX platform.
+                source:       meta.platformType === 'openchain' ? 'OpenTerminal' : 'DelChain',
                 owner:        meta.owner,
                 initialPrice: meta.initialPrice,
-                                isVerified:   meta.isVerified,
+                isVerified:   meta.isVerified,
                 logoUrl:      meta.logoUrl,       // FEATURE — included in API response
                 publicUrl:    meta.publicUrl      // PHASE 8 — Public Visit URL
             };
@@ -3117,7 +3120,94 @@ app.post('/api/open-token/deploy', txLimiter, requireWeb3Auth, async (req, res) 
     }
 });
 
-// ─── Creator Verification Endpoint (Issue 1 FIX) ─────────────────────────────
+// ─── Admin: Migrate Legacy OpenTerminal Supply to System Pool ─────────────────
+// POST /api/admin/migrate-open-supply
+// Headers: X-Admin-Key: <ADMIN_SECRET>
+// For OpenTerminal tokens deployed BEFORE the system-address fix was in place, the
+// full supply went to the creator's personal wallet. This endpoint migrates that
+// supply to the correct system pool address so users can trade the token.
+// Only affects tokens in open_tokens table that are missing an open_token_supply row.
+const ADMIN_SECRET = process.env.ADMIN_SECRET || 'nexus-admin-2025';
+app.post('/api/admin/migrate-open-supply', async (req, res) => {
+    const key = req.headers['x-admin-key'] || '';
+    if (key !== ADMIN_SECRET) {
+        return res.status(403).json({ error: 'Forbidden: invalid admin key.' });
+    }
+    try {
+        // Find all open_tokens that have NO open_token_supply entry yet
+        const legacyRes = await pool.query(
+            `SELECT ot.ticker, ot.uid, ot.total_supply
+             FROM open_tokens ot
+             LEFT JOIN open_token_supply ots ON ot.ticker = ots.ticker
+             WHERE ots.ticker IS NULL
+             ORDER BY ot.created_at ASC`
+        );
+        if (legacyRes.rows.length === 0) {
+            return res.json({ success: true, message: 'No legacy tokens to migrate.', migrated: [] });
+        }
+
+        const migrated = [];
+        const failed   = [];
+
+        for (const row of legacyRes.rows) {
+            const { ticker, uid: creatorUid, total_supply } = row;
+            const supply = parseInt(total_supply) || 0;
+            if (supply <= 0) { failed.push({ ticker, reason: 'zero supply' }); continue; }
+
+            // Check how much is actually still in the creator's balance
+            const creatorBal = nexusChain.state.getBalance(creatorUid, ticker);
+            if (creatorBal <= 0) {
+                // Supply already moved or never existed — just register the supply entry
+                const sysAddr = `nx_open_${ticker.toLowerCase()}_system`;
+                await pool.query(
+                    `INSERT INTO open_token_supply (ticker, system_address, total_supply, created_at)
+                     VALUES ($1, $2, $3, $4) ON CONFLICT (ticker) DO NOTHING`,
+                    [ticker, sysAddr, supply, Date.now()]
+                );
+                migrated.push({ ticker, note: 'balance was 0 — registered supply entry only' });
+                continue;
+            }
+
+            try {
+                // Generate a deterministic system address for this token
+                const sysAddr = `nx_open_${ticker.toLowerCase()}_system`;
+
+                // Transfer from creator wallet → system address in the ledger
+                nexusChain.state.debit(creatorUid, ticker, creatorBal);
+                nexusChain.state.credit(sysAddr, ticker, creatorBal);
+
+                // Record the transfer in transactions table for audit trail
+                await pool.query(
+                    `INSERT INTO transactions
+                     (type, from_address, to_address, token_symbol, amount, amount_usd, timestamp_ms, description, is_system_generated)
+                     VALUES ('SYSTEM_MIGRATE', $1, $2, $3, $4, 0, $5, $6, TRUE)`,
+                    [creatorUid, sysAddr, ticker, creatorBal, Date.now(),
+                     `Admin migration: moved ${creatorBal} ${ticker} from creator to system pool`]
+                );
+
+                // Register in open_token_supply
+                await pool.query(
+                    `INSERT INTO open_token_supply (ticker, system_address, total_supply, created_at)
+                     VALUES ($1, $2, $3, $4) ON CONFLICT (ticker) DO UPDATE SET system_address = $2`,
+                    [ticker, sysAddr, supply, Date.now()]
+                );
+
+                migrated.push({ ticker, creatorUid: creatorUid.substring(0, 12) + '...', amount: creatorBal, sysAddr });
+                console.log(chalk.green(`[MIGRATE] ${ticker}: moved ${creatorBal} from creator → ${sysAddr}`));
+            } catch(e) {
+                failed.push({ ticker, reason: e.message });
+                console.error(chalk.red(`[MIGRATE] ${ticker} failed:`, e.message));
+            }
+        }
+
+        res.json({ success: true, migrated, failed, total: legacyRes.rows.length });
+    } catch(e) {
+        console.error('[ADMIN MIGRATE]', e);
+        res.status(500).json({ error: e.message || 'Migration failed.' });
+    }
+});
+
+
 // GET /api/token/creator/:ticker?uid=WALLET_ADDRESS
 // Returns { isCreator: true/false } — used by frontend to show creator badge/settings
 // without exposing the raw MINT owner address to the client.
@@ -3130,6 +3220,9 @@ app.get('/api/token/creator/:ticker', readLimiter, async (req, res) => {
     if (['SYR', 'SDX', 'SDTX'].includes(ticker))
         return res.json({ isCreator: false, ticker });
 
+    // Normalise: strip nx_ prefix for comparison
+    const norm = (a) => String(a || '').trim().replace(/^nx_/, '');
+
     try {
         // Primary check: MINT transaction (DelChain FDX tokens)
         const mintRow = await pool.query(
@@ -3140,8 +3233,6 @@ app.get('/api/token/creator/:ticker', readLimiter, async (req, res) => {
         );
         if (mintRow.rows.length > 0) {
             const mintOwner = mintRow.rows[0].to_address || '';
-            // Normalise: strip nx_ prefix for comparison
-            const norm = (a) => a.trim().startsWith('nx_') ? a.trim().slice(3) : a.trim();
             if (norm(mintOwner) === norm(uid)) {
                 return res.json({ isCreator: true, ticker, source: 'mint' });
             }
@@ -3153,9 +3244,21 @@ app.get('/api/token/creator/:ticker', readLimiter, async (req, res) => {
             [ticker]
         );
         if (handlerRow.rows.length > 0) {
-            const norm = (a) => a.trim().startsWith('nx_') ? a.trim().slice(3) : a.trim();
             if (norm(handlerRow.rows[0].creator_uid) === norm(uid)) {
                 return res.json({ isCreator: true, ticker, source: 'handler' });
+            }
+        }
+
+        // Tertiary check: open_tokens table (OpenTerminal deployments).
+        // For OpenTerminal tokens, the MINT goes to a system address, NOT the creator.
+        // The open_tokens table stores the actual deployer uid — use this for badge check.
+        const openRow = await pool.query(
+            'SELECT uid FROM open_tokens WHERE ticker = $1 LIMIT 1',
+            [ticker]
+        );
+        if (openRow.rows.length > 0) {
+            if (norm(openRow.rows[0].uid) === norm(uid)) {
+                return res.json({ isCreator: true, ticker, source: 'open_tokens' });
             }
         }
 

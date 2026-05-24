@@ -2125,15 +2125,14 @@ app.get('/stats', async (req, res) => {
     if (tokenPrice === 0 && !['SDX', 'SDTX'].includes(token)) {
         try {
             const lastTrade = await pool.query(
-                `SELECT (amount_usd / amount) AS computed_price
-                 FROM transactions
+                `SELECT price_usd FROM transactions
                  WHERE token_symbol = $1 AND type = 'MARKET_TRADE'
-                   AND amount > 0 AND amount_usd > 0
+                   AND price_usd > 0
                  ORDER BY timestamp_ms DESC LIMIT 1`,
                 [token]
             );
             if (lastTrade.rows.length > 0) {
-                const dbPrice = parseFloat(lastTrade.rows[0].computed_price) || 0;
+                const dbPrice = parseFloat(lastTrade.rows[0].price_usd) || 0;
                 if (dbPrice > 0) {
                     tokenPrice = dbPrice;
                     if (menuBook.books[token]) menuBook.books[token].lastTradePrice = dbPrice;

@@ -37,6 +37,23 @@ pool.query(`
         platform_type VARCHAR(50),
         description TEXT
     );
+    -- CRITICAL PERFORMANCE INDEXES
+    -- Without these, every token-specific query does a full table scan across
+    -- thousands of rows, causing 15-30 second timeouts that break:
+    --   /stats, /api/token/creator, /pricehistory, /txhistory, /kline
+    -- These are CREATE INDEX IF NOT EXISTS — safe to run on every startup.
+    CREATE INDEX IF NOT EXISTS idx_tx_token_symbol
+        ON transactions (token_symbol);
+    CREATE INDEX IF NOT EXISTS idx_tx_token_type
+        ON transactions (token_symbol, type);
+    CREATE INDEX IF NOT EXISTS idx_tx_token_type_ts
+        ON transactions (token_symbol, type, timestamp_ms DESC);
+    CREATE INDEX IF NOT EXISTS idx_tx_from_addr
+        ON transactions (from_address);
+    CREATE INDEX IF NOT EXISTS idx_tx_to_addr
+        ON transactions (to_address);
+    CREATE INDEX IF NOT EXISTS idx_tx_timestamp
+        ON transactions (timestamp_ms DESC);
 `).catch(err => console.error(chalk.red("[DB] Blocks init failed"), err));
 
 // Database Migration Fix (29 April 2026) — Ensure price_usd column exists.

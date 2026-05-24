@@ -83,6 +83,12 @@ pool.query(`
         id VARCHAR(50) PRIMARY KEY,
         data JSONB
     );
+    CREATE TABLE IF NOT EXISTS open_token_supply (
+        ticker        VARCHAR(20)  PRIMARY KEY,
+        system_address VARCHAR(100) NOT NULL,
+        total_supply   BIGINT       NOT NULL DEFAULT 0,
+        created_at     BIGINT       NOT NULL DEFAULT 0
+    );
     CREATE TABLE IF NOT EXISTS public_keys (
         uid VARCHAR(100) PRIMARY KEY,
         public_key TEXT
@@ -2909,14 +2915,40 @@ app.post('/api/admin/withdrawal-address/pending', readLimiter, requireWeb3Auth, 
 // ─── OPENCHAIN TERMINAL ENDPOINTS ────────────────────────────────────────────
 // Open token deployment — no KYC, no domain verification required.
 
-// 1. Public list of all open tokens
+// 1. Public list of all open tokens (includes remaining_supply from open_token_supply table)
 app.get('/api/open-tokens', readLimiter, async (req, res) => {
     try {
         const rows = await pool.query(
-            `SELECT ticker, name, description, logo_url, parent_ticker, total_supply, created_at
-             FROM open_tokens WHERE status = 'active' ORDER BY created_at DESC LIMIT 200`
+            `SELECT ot.ticker, ot.name, ot.description, ot.logo_url, ot.parent_ticker,
+                    ot.total_supply, ot.created_at,
+                    COALESCE(ots.total_supply, ot.total_supply) AS initial_supply,
+                    ots.system_address
+             FROM open_tokens ot
+             LEFT JOIN open_token_supply ots ON ots.ticker = ot.ticker
+             WHERE ot.status = 'active' ORDER BY ot.created_at DESC LIMIT 200`
         );
-        res.json(rows.rows);
+        // Augment with live remaining_supply from in-memory ledger
+        const result = rows.rows.map(r => {
+            let remainingSupply = r.total_supply;
+            if (r.system_address) {
+                const sysAddr = r.system_address;
+                const ticker  = r.ticker;
+                try {
+                    remainingSupply = nexusChain.state.getBalance(sysAddr, ticker) || 0;
+                } catch(e) {}
+            }
+            return {
+                ticker:          r.ticker,
+                name:            r.name,
+                description:     r.description,
+                logoUrl:         r.logo_url,
+                parentTicker:    r.parent_ticker,
+                totalSupply:     r.total_supply,
+                remainingSupply,
+                createdAt:       r.created_at
+            };
+        });
+        res.json(result);
     } catch(err) { res.status(500).json({ error: 'Failed to load tokens.' }); }
 });
 
@@ -3041,9 +3073,16 @@ app.post('/api/open-token/deploy', txLimiter, requireWeb3Auth, async (req, res) 
             });
         }
 
-        // ── Mint the new open token ───────────────────────────────────────────
+        // ── SUPPLY ROUTING: All supply goes to hidden system address (Task 3) ────
+        // OpenTerminal tokens NEVER send supply to the creator's wallet.
+        // The entire supply lands in a hidden system-controlled address.
+        // The creator can see "Remaining Supply" on their token card but
+        // cannot freely withdraw it — supply enters circulation only via trade.
+        const openSystemAddress = 'nx_open_' + crypto.randomBytes(16).toString('hex');
+
+        // ── Mint the new open token → system address (NOT creator uid) ────────
         await mempool.addTransaction({
-            from: 'system', to: uid, amount: parsedSupply, type: 'MINT',
+            from: 'system', to: openSystemAddress, amount: parsedSupply, type: 'MINT',
             tokenSymbol: safeTicker, priceUsd: 0,
             platformType: 'openchain',
             description: JSON.stringify({
@@ -3061,12 +3100,176 @@ app.post('/api/open-token/deploy', txLimiter, requireWeb3Auth, async (req, res) 
              parentUpper || null, parsedSupply, Date.now()]
         );
 
-        console.log(chalk.green(`[OPENCHAIN] Token deployed: ${safeTicker} by ${uid.substring(0,12)}...`));
+        // ── Record the system address → open_token_supply table ───────────────
+        await pool.query(
+            `INSERT INTO open_token_supply (ticker, system_address, total_supply, created_at)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (ticker) DO NOTHING`,
+            [safeTicker, openSystemAddress, parsedSupply, Date.now()]
+        );
+
+        console.log(chalk.green(`[OPENCHAIN] Token deployed: ${safeTicker} → system ${openSystemAddress.substring(0,20)}... by ${uid.substring(0,12)}...`));
         res.status(201).json({ success: true, ticker: safeTicker, name, supply: parsedSupply });
 
     } catch(err) {
         console.error('[OPENCHAIN DEPLOY]', err);
         res.status(500).json({ error: err.message || 'Deployment failed.' });
+    }
+});
+
+// ─── Creator Verification Endpoint (Issue 1 FIX) ─────────────────────────────
+// GET /api/token/creator/:ticker?uid=WALLET_ADDRESS
+// Returns { isCreator: true/false } — used by frontend to show creator badge/settings
+// without exposing the raw MINT owner address to the client.
+app.get('/api/token/creator/:ticker', readLimiter, async (req, res) => {
+    const ticker = String(req.params.ticker || '').toUpperCase().trim();
+    const uid    = String(req.query.uid || '').trim();
+    if (!ticker || !uid) return res.status(400).json({ error: 'ticker and uid required.' });
+
+    // System tokens are never "creator-owned" by a wallet
+    if (['SYR', 'SDX', 'SDTX'].includes(ticker))
+        return res.json({ isCreator: false, ticker });
+
+    try {
+        // Primary check: MINT transaction (DelChain FDX tokens)
+        const mintRow = await pool.query(
+            `SELECT to_address FROM transactions
+             WHERE type = 'MINT' AND token_symbol = $1 AND is_system_generated = TRUE
+             ORDER BY timestamp_ms ASC LIMIT 1`,
+            [ticker]
+        );
+        if (mintRow.rows.length > 0) {
+            const mintOwner = mintRow.rows[0].to_address || '';
+            // Normalise: strip nx_ prefix for comparison
+            const norm = (a) => a.trim().startsWith('nx_') ? a.trim().slice(3) : a.trim();
+            if (norm(mintOwner) === norm(uid)) {
+                return res.json({ isCreator: true, ticker, source: 'mint' });
+            }
+        }
+
+        // Secondary check: system handler creator (handler wallet may differ from MINT)
+        const handlerRow = await pool.query(
+            'SELECT creator_uid FROM system_handlers WHERE token_symbol = $1 LIMIT 1',
+            [ticker]
+        );
+        if (handlerRow.rows.length > 0) {
+            const norm = (a) => a.trim().startsWith('nx_') ? a.trim().slice(3) : a.trim();
+            if (norm(handlerRow.rows[0].creator_uid) === norm(uid)) {
+                return res.json({ isCreator: true, ticker, source: 'handler' });
+            }
+        }
+
+        res.json({ isCreator: false, ticker });
+    } catch(e) {
+        res.status(500).json({ error: 'Creator check failed.' });
+    }
+});
+
+// ─── Unified Token List Endpoint ──────────────────────────────────────────────
+// GET /api/tokens/all — returns { delchain: [...], openchain: [...] }
+// DelChain = tokens minted via /mint-new-cash (verified, domain-linked)
+// OpenChain = tokens minted via /api/open-token/deploy (permissionless)
+app.get('/api/tokens/all', readLimiter, async (req, res) => {
+    try {
+        // ── DelChain tokens: from /tokens (in-memory ledger + DB meta) ─────────
+        const tokensObj = Object.keys(nexusChain.state.balances).filter(
+            t => !['SYR', 'SDX', 'SDTX', 'system', 'staking_pool', 'liquidity-pool'].includes(t)
+        );
+
+        // Get platform types + verified + mint owners
+        const SYSTEM_TICKERS = new Set(['SYR', 'SDX', 'SDTX']);
+        let mintDataMap = new Map();
+        try {
+            const bulkRes = await pool.query(
+                `SELECT t.token_symbol, t.description, t.platform_type, t.to_address,
+                        v.is_verified,
+                        m.logo_base64, m.public_url
+                 FROM transactions t
+                 LEFT JOIN token_verifications v ON v.ticker = t.token_symbol
+                 LEFT JOIN token_metadata      m ON m.ticker = t.token_symbol
+                 WHERE t.type = 'MINT' AND t.is_system_generated = TRUE`
+            );
+            const verMap = new Map();
+            bulkRes.rows.forEach(row => {
+                let parsedDesc = {};
+                try { parsedDesc = row.description ? JSON.parse(row.description) : {}; } catch(e){}
+                const isSystemToken = SYSTEM_TICKERS.has(row.token_symbol);
+                const platformType  = row.platform_type || parsedDesc.platformType || '';
+                mintDataMap.set(row.token_symbol, {
+                    description:  JSON.stringify(parsedDesc),
+                    platformType,
+                    owner:        isSystemToken ? 'system' : (row.to_address || ''),
+                    isVerified:   isSystemToken ? true : (verMap.get(row.token_symbol) || false),
+                    logoUrl:      parsedDesc.logoUrl || '',
+                    publicUrl:    parsedDesc.publicUrl || '',
+                    isOpenChain:  platformType === 'openchain'
+                });
+            });
+        } catch(e) {
+            console.error(chalk.yellow('[API /tokens/all] Meta query failed:', e.message));
+        }
+
+        const allTokens = tokensObj.map(ticker => {
+            let circulating = 0;
+            for (const address in nexusChain.state.balances[ticker]) {
+                const bal = nexusChain.state.balances[ticker][address];
+                if (address !== 'system') circulating += bal;
+            }
+            const lastPrice = menuBook.books[ticker]?.lastTradePrice || 0;
+            const meta = mintDataMap.get(ticker) || { description: '', platformType: '', owner: '', isVerified: false, logoUrl: '', isOpenChain: false };
+            return {
+                ticker,
+                supply: circulating,
+                lastPrice,
+                description:  meta.description,
+                platformType: meta.platformType,
+                owner:        meta.owner,
+                isVerified:   meta.isVerified,
+                logoUrl:      meta.logoUrl,
+                publicUrl:    meta.publicUrl,
+                isOpenChain:  meta.isOpenChain
+            };
+        });
+
+        // ── OpenChain tokens from open_tokens table with remaining supply ─────
+        const openRows = await pool.query(
+            `SELECT ot.ticker, ot.name, ot.description, ot.logo_url, ot.parent_ticker,
+                    ot.total_supply, ot.created_at, ots.system_address, ot.uid AS owner_uid
+             FROM open_tokens ot
+             LEFT JOIN open_token_supply ots ON ots.ticker = ot.ticker
+             WHERE ot.status = 'active' ORDER BY ot.created_at DESC LIMIT 200`
+        ).catch(() => ({ rows: [] }));
+
+        const openTokens = openRows.rows.map(r => {
+            let remainingSupply = r.total_supply;
+            if (r.system_address) {
+                try { remainingSupply = nexusChain.state.getBalance(r.system_address, r.ticker) || 0; } catch(e) {}
+            }
+            let parsedDesc = {};
+            try { parsedDesc = r.description ? JSON.parse(r.description) : {}; } catch(e) {}
+            return {
+                ticker:          r.ticker,
+                name:            parsedDesc.name || r.name || r.ticker,
+                supply:          r.total_supply,
+                remainingSupply,
+                lastPrice:       menuBook.books[r.ticker]?.lastTradePrice || 0,
+                description:     r.description,
+                platformType:    'openchain',
+                owner:           r.owner_uid || '',
+                isVerified:      false,
+                logoUrl:         r.logo_url || '',
+                publicUrl:       '',
+                isOpenChain:     true
+            };
+        });
+
+        const delchain = allTokens.filter(t => !t.isOpenChain);
+        const openchain = openTokens;
+
+        res.json({ delchain, openchain });
+    } catch(e) {
+        console.error(chalk.red('[API /tokens/all]'), e.message);
+        res.status(500).json({ error: 'Failed to load tokens.' });
     }
 });
 

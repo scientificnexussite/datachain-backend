@@ -1443,6 +1443,31 @@ app.get('/tokens', readLimiter, async (req, res) => {
             console.error(chalk.yellow('[API] Bulk MINT query failed, proceeding with empty metadata.'));
         }
 
+        // ISSUE FIX 3: Classify OpenTerminal tokens correctly even when their MINT
+        // is not in the transactions table (e.g. blockchain only has 3 blocks loaded).
+        // Without this: OpenTerminal tokens fallthrough as platformType:'' → shown in
+        // DelChain portfolio instead of being filtered out.
+        try {
+            const openRes = await pool.query(
+                `SELECT ticker, uid FROM open_tokens WHERE ticker = ANY($1)`,
+                [tokensObj]
+            );
+            openRes.rows.forEach(row => {
+                const existing = mintDataMap.get(row.ticker);
+                if (existing) {
+                    // Force correct classification even if MINT row had wrong platform_type
+                    existing.platformType = 'openchain';
+                } else {
+                    // Add entry for tokens whose MINT wasn't in transactions table
+                    mintDataMap.set(row.ticker, {
+                        description: '',  platformType: 'openchain',
+                        owner: row.uid || '', initialPrice: 0,
+                        isVerified: false, logoUrl: '', publicUrl: ''
+                    });
+                }
+            });
+        } catch(e) { /* silent — openchain classification may be incomplete */ }
+
         const tokens = tokensObj.map(ticker => {
             let totalCirculating = 0;
             let totalHolders     = 0;   // FIX — count holders in the same loop, no extra DB query

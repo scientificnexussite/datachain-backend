@@ -89,6 +89,14 @@ pool.query(`
         total_supply   BIGINT       NOT NULL DEFAULT 0,
         created_at     BIGINT       NOT NULL DEFAULT 0
     );
+    -- Issue 3: Creator broadcast notifications visible to all DelChain terminal users
+    CREATE TABLE IF NOT EXISTS broadcast_notifications (
+        id         SERIAL  PRIMARY KEY,
+        uid        VARCHAR(200) NOT NULL,
+        message    TEXT         NOT NULL,
+        type       VARCHAR(20)  NOT NULL DEFAULT 'info',
+        created_at BIGINT       NOT NULL DEFAULT 0
+    );
     CREATE TABLE IF NOT EXISTS public_keys (
         uid VARCHAR(100) PRIMARY KEY,
         public_key TEXT
@@ -2163,7 +2171,9 @@ app.get('/stats', async (req, res) => {
     let handlerSupply = 0;
     for (const addr in tokenBals) {
         const bal = tokenBals[addr] || 0;
-        if (addr.startsWith('nx_sys_')) {
+        if (addr.startsWith('nx_sys_') || addr.startsWith('nx_open_')) {
+            // Issue 4 Fix: OpenChain tokens use nx_open_ addresses (not nx_sys_).
+            // Previously only nx_sys_ was counted → OpenChain System Pool always showed 0.
             handlerSupply += bal;
         } else if (addr !== 'system' && addr !== 'liquidity-pool') {
             circulating += bal;
@@ -2218,7 +2228,7 @@ app.get('/quick-stats/:ticker', readLimiter, (req, res) => {
     let supply = 0, holders = 0, handlerSupply = 0;
     for (const addr in tokenBals) {
         const bal = tokenBals[addr] || 0;
-        if (addr.startsWith('nx_sys_')) {
+        if (addr.startsWith('nx_sys_') || addr.startsWith('nx_open_')) {
             handlerSupply += bal;
         } else if (addr !== 'system' && addr !== 'liquidity-pool') {
             supply += bal;
@@ -3008,6 +3018,47 @@ app.post('/api/admin/withdrawal-address/pending', readLimiter, requireWeb3Auth, 
 // Open token deployment — no KYC, no domain verification required.
 
 // 1. Public list of all open tokens (includes remaining_supply from open_token_supply table)
+// ── Issue 3: Broadcast Notification Endpoints ─────────────────────────────────
+// GET  /api/notifications          — public, returns last 50 broadcasts
+// POST /api/notifications/broadcast — creator only, sends announcement to all users
+const DELCHAIN_CREATOR_UID = 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE5z7IyY';
+
+app.get('/api/notifications', readLimiter, async (req, res) => {
+    try {
+        const result = await pool.query(
+            `SELECT id, uid, message, type, created_at
+             FROM broadcast_notifications
+             ORDER BY created_at DESC LIMIT 50`
+        );
+        res.json(result.rows);
+    } catch(e) {
+        res.status(500).json({ error: 'Failed to fetch notifications.' });
+    }
+});
+
+app.post('/api/notifications/broadcast', txLimiter, requireWeb3Auth, async (req, res) => {
+    const uid  = req.user?.uid || '';
+    // Only the DelChain creator can broadcast
+    const normUid = String(uid).trim().replace(/^nx_/, '');
+    const normCreator = String(DELCHAIN_CREATOR_UID).trim().replace(/^nx_/, '');
+    if (normUid !== normCreator) {
+        return res.status(403).json({ error: 'Only the DelChain creator can broadcast notifications.' });
+    }
+    const message = String(req.body?.message || '').trim().substring(0, 200);
+    const type    = ['info','success','warning','alert'].includes(req.body?.type) ? req.body.type : 'info';
+    if (!message) return res.status(400).json({ error: 'Message is required.' });
+    try {
+        await pool.query(
+            `INSERT INTO broadcast_notifications (uid, message, type, created_at) VALUES ($1, $2, $3, $4)`,
+            [uid, message, type, Date.now()]
+        );
+        console.log(chalk.cyan(`[BROADCAST] Creator sent: "${message.substring(0,40)}..."`));
+        res.json({ success: true });
+    } catch(e) {
+        res.status(500).json({ error: 'Failed to save notification.' });
+    }
+});
+
 app.get('/api/open-tokens', readLimiter, async (req, res) => {
     try {
         const rows = await pool.query(
@@ -5063,6 +5114,52 @@ app.use((req, res) => { res.status(404).json({ error: 'API Node Endpoint Not Fou
     // Pre-load all token owner addresses into memory so /quick-stats and creator
     // checks never need to do a per-request DB query after initial warmup.
     await preloadTokenOwners();
+
+    // Issue 4: Auto-migrate legacy OpenChain tokens that have no system address.
+    // Tokens deployed BEFORE the nx_open_ system address feature (like DORANT) have
+    // their full supply in the creator's wallet. Move it to the system pool so
+    // the token can be traded and System Pool shows the correct balance.
+    try {
+        const legacyRes = await pool.query(
+            `SELECT ot.ticker, ot.uid, ot.total_supply
+             FROM open_tokens ot
+             LEFT JOIN open_token_supply ots ON ot.ticker = ots.ticker
+             WHERE ots.ticker IS NULL
+             ORDER BY ot.created_at ASC`
+        );
+        if (legacyRes.rows.length > 0) {
+            console.log(chalk.yellow(`[AUTO-MIGRATE] Found ${legacyRes.rows.length} legacy OpenChain token(s) without system addresses. Migrating...`));
+            for (const row of legacyRes.rows) {
+                const { ticker, uid: creatorUid, total_supply } = row;
+                const supply = parseInt(total_supply) || 0;
+                if (supply <= 0) continue;
+                try {
+                    const sysAddr = `nx_open_${ticker.toLowerCase()}_system`;
+                    const creatorBal = nexusChain.state.getBalance(creatorUid, ticker) || 0;
+                    if (creatorBal > 0) {
+                        nexusChain.state.debit(creatorUid, ticker, creatorBal);
+                        nexusChain.state.credit(sysAddr, ticker, creatorBal);
+                        await pool.query(
+                            `INSERT INTO transactions (type, from_address, to_address, token_symbol, amount, amount_usd, timestamp_ms, description, is_system_generated)
+                             VALUES ('SYSTEM_MIGRATE', $1, $2, $3, $4, 0, $5, $6, TRUE)`,
+                            [creatorUid, sysAddr, ticker, creatorBal, Date.now(),
+                             `Auto-migration: moved ${creatorBal} ${ticker} from creator to system pool`]
+                        );
+                    }
+                    await pool.query(
+                        `INSERT INTO open_token_supply (ticker, system_address, total_supply, created_at)
+                         VALUES ($1, $2, $3, $4) ON CONFLICT (ticker) DO UPDATE SET system_address = $2`,
+                        [ticker, sysAddr, supply, Date.now()]
+                    );
+                    console.log(chalk.green(`[AUTO-MIGRATE] ${ticker}: system address created → ${sysAddr}`));
+                } catch(e) {
+                    console.error(chalk.red(`[AUTO-MIGRATE] ${ticker} failed:`, e.message));
+                }
+            }
+        }
+    } catch(e) {
+        console.warn(chalk.yellow('[AUTO-MIGRATE] Legacy token scan failed:', e.message));
+    }
 
     server.listen(port, '0.0.0.0', () => {
         console.log(chalk.blue.bold(`--- SCIENTIFIC NEXUS API RUNNING ON PORT ${port} ---`));

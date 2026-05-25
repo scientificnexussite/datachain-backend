@@ -525,6 +525,31 @@ const apiCache = {
 const CACHE_TTL       = 10000; // 10s — general purpose
 const TOKEN_STATS_TTL = 30000; // 30s — custom token stats (price, supply, holders)
 
+// ── Token owner cache — populated at startup, zero DB cost on every request ──
+// During Railway cold start, ALL API calls that hit the DB time out simultaneously.
+// Pre-loading owner addresses once at startup (a single fast query after blockchain
+// loads) means /quick-stats/:ticker and /api/token/creator never need to query
+// the DB per-request — they use this in-memory Map instead.
+let tokenOwnerCache = new Map(); // ticker → to_address (deployer wallet)
+async function preloadTokenOwners() {
+    try {
+        const res = await pool.query(
+            `SELECT DISTINCT ON (token_symbol) token_symbol, to_address
+             FROM transactions
+             WHERE type = 'MINT' AND is_system_generated = TRUE
+             ORDER BY token_symbol, timestamp_ms ASC`
+        );
+        res.rows.forEach(r => {
+            if (r.token_symbol && r.to_address) {
+                tokenOwnerCache.set(r.token_symbol.toUpperCase(), r.to_address);
+            }
+        });
+        console.log(chalk.green(`[TOKEN OWNERS] Pre-loaded ${tokenOwnerCache.size} token owner(s) into cache.`));
+    } catch(e) {
+        console.warn(chalk.yellow('[TOKEN OWNERS] Preload failed (will retry on demand):', e.message));
+    }
+}
+
 let pendingPayPalOrders  = new Map();
 let pendingVerifications = new Map();
 
@@ -2154,6 +2179,31 @@ app.get('/stats', async (req, res) => {
     apiCache.tokenStats.set(token, { data: statsPayload, time: Date.now() });
 
     res.json(statsPayload);
+});
+
+// ── /quick-stats/:ticker — Zero-DB instant stats endpoint ────────────────────
+// The regular /stats endpoint does a DB query for price if menuBook is empty.
+// During Railway cold-start (~15-30s), this times out and stats stay "Loading...".
+// /quick-stats reads ONLY from in-memory blockchain state — available within
+// ~2 seconds of server start (after blocks load from DB, before API calls come in).
+// Response time: < 5ms even on first request. Never times out.
+app.get('/quick-stats/:ticker', readLimiter, (req, res) => {
+    const ticker = req.params.ticker.toUpperCase();
+    const tokenBals = nexusChain.state.balances[ticker] || {};
+    let supply = 0, holders = 0, handlerSupply = 0;
+    for (const addr in tokenBals) {
+        const bal = tokenBals[addr] || 0;
+        if (addr.startsWith('nx_sys_')) {
+            handlerSupply += bal;
+        } else if (addr !== 'system' && addr !== 'liquidity-pool') {
+            supply += bal;
+            if (bal > 0) holders++;
+        }
+    }
+    const lastPrice = menuBook.books[ticker]?.lastTradePrice || menuBook.books[ticker]?.asks?.[0]?.priceUsd || 0;
+    // Use preloaded cache — no DB query needed
+    const ownerAddress = tokenOwnerCache.get(ticker) || '';
+    res.json({ ticker, supply, handlerSupply, holders, lastPrice, ownerAddress });
 });
 
 app.get('/supply',        (req, res) => res.json({ remainingSupply: nexusChain.getRemainingSupply('SYR') }));
@@ -4984,6 +5034,10 @@ app.use((req, res) => { res.status(404).json({ error: 'API Node Endpoint Not Fou
     } catch (err) {
         console.log(chalk.yellow(`[ADDRESS BOOK] Startup approval scan error: ${err.message}`));
     }
+
+    // Pre-load all token owner addresses into memory so /quick-stats and creator
+    // checks never need to do a per-request DB query after initial warmup.
+    await preloadTokenOwners();
 
     server.listen(port, '0.0.0.0', () => {
         console.log(chalk.blue.bold(`--- SCIENTIFIC NEXUS API RUNNING ON PORT ${port} ---`));

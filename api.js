@@ -97,6 +97,16 @@ pool.query(`
         type       VARCHAR(20)  NOT NULL DEFAULT 'info',
         created_at BIGINT       NOT NULL DEFAULT 0
     );
+    -- Issue 1/3: Token burn/deletion system — 7-day countdown before permanent removal
+    CREATE TABLE IF NOT EXISTS token_burn_requests (
+        id           SERIAL       PRIMARY KEY,
+        ticker       VARCHAR(20)  NOT NULL UNIQUE,
+        creator_uid  VARCHAR(200) NOT NULL,
+        requested_at BIGINT       NOT NULL DEFAULT 0,
+        execute_at   BIGINT       NOT NULL DEFAULT 0,
+        status       VARCHAR(20)  NOT NULL DEFAULT 'pending',
+        platform     VARCHAR(20)  NOT NULL DEFAULT 'delchain'
+    );
     CREATE TABLE IF NOT EXISTS public_keys (
         uid VARCHAR(100) PRIMARY KEY,
         public_key TEXT
@@ -1725,6 +1735,8 @@ app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
         if (matchResult.trades.length > 0) {
             const lastTradePrice = matchResult.trades[matchResult.trades.length - 1].price;
             await checkServerAlerts(tokenSymbol, lastTradePrice);
+            // Issue 4 Fix: Invalidate stats cache so next /stats returns the fresh trade price
+            apiCache.tokenStats.delete(tokenSymbol);
         }
 
         res.status(201).json({ message: 'Limit order processed.', order, executedTrades: matchResult.trades });
@@ -1761,7 +1773,9 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
 
         if (side === 'SELL' && parsedAmount > availableToken)
             return res.status(400).json({ error: `Insufficient ${tokenSymbol} balance to execute trade.` });
-        if (side === 'BUY' && availableUsd <= 0)
+        // Issue 7 Fix: Use 0.000001 threshold (not <= 0) to catch near-zero floating-point balances.
+        // Previously a balance of $0.0000001 (dust from rounding) would pass the check and execute.
+        if (side === 'BUY' && availableUsd < 0.000001)
             return res.status(400).json({ error: 'Insufficient USD balance. Deposit funds to execute trade.' });
 
                 const fundsToCheck = side === 'BUY' ? availableUsd : availableToken;
@@ -1846,7 +1860,16 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                             const lp = nexusChain.state.liquidityPools[tokenSymbol];
                             lp.tokenReserve = fixDust(lp.tokenReserve - fillAmount);
                             lp.usdReserve   = fixDust(lp.usdReserve   + fixDust(fillAmount * poolPrice));
-                            menuBook.books[tokenSymbol].lastTradePrice = poolPrice;
+                            // Issue 4/5 FIX: Compute new price from UPDATED reserves, not old poolPrice.
+                            // Previously: lastTradePrice = poolPrice (BEFORE trade) → price never moved.
+                            // Now: compute actual new market price from the updated pool state.
+                            // Also: only update if the new price is the more recent/accurate signal —
+                            // don't overwrite a $0.01 limit-order price with a $0.00000001 pool price.
+                            const newAmmPrice = lp.tokenReserve > 0 ? fixDust(lp.usdReserve / lp.tokenReserve) : poolPrice;
+                            const existingLast = menuBook.books[tokenSymbol]?.lastTradePrice || 0;
+                            menuBook.books[tokenSymbol].lastTradePrice = newAmmPrice > existingLast ? newAmmPrice : Math.max(newAmmPrice, existingLast);
+                            // Invalidate per-token stats cache so next /stats returns the updated price
+                            apiCache.tokenStats.delete(tokenSymbol);
 
                             matchResult.trades.push({ buyer: uid, seller: handlerAddr, amountSyr: fillAmount, amountUsd: fixDust(fillAmount * poolPrice), price: poolPrice, tokenSymbol });
                             matchResult.executedSyr  = fixDust(matchResult.executedSyr  + fillAmount);
@@ -1897,7 +1920,10 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                             const lp = nexusChain.state.liquidityPools[tokenSymbol];
                             lp.tokenReserve = fixDust(lp.tokenReserve + fillAmount);
                             lp.usdReserve   = fixDust(lp.usdReserve   - fillUsd);
-                            menuBook.books[tokenSymbol].lastTradePrice = poolPrice;
+                            // Issue 4/5 FIX: Use post-trade pool price as lastTradePrice
+                            const newAmmSellPrice = lp.tokenReserve > 0 ? fixDust(lp.usdReserve / lp.tokenReserve) : poolPrice;
+                            menuBook.books[tokenSymbol].lastTradePrice = Math.max(newAmmSellPrice, menuBook.books[tokenSymbol]?.lastTradePrice || 0);
+                            apiCache.tokenStats.delete(tokenSymbol);
 
                             matchResult.trades.push({ buyer: handlerAddr, seller: uid, amountSyr: fillAmount, amountUsd: fillUsd, price: poolPrice, tokenSymbol });
                             matchResult.executedSyr  = fixDust(matchResult.executedSyr  + fillAmount);
@@ -1977,6 +2003,8 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
         // IMPROVEMENT 6 — Trigger server-side alert check after every market trade
         const lastTradePrice = matchResult.trades[matchResult.trades.length - 1].price;
         await checkServerAlerts(tokenSymbol, lastTradePrice);
+        // Issue 4 Fix: Invalidate per-token stats cache so price refreshes immediately
+        apiCache.tokenStats.delete(tokenSymbol);
 
         res.status(201).json({
             message: 'Market order executed',
@@ -4703,30 +4731,222 @@ app.post('/api/crypto/convert', txLimiter, requireWeb3Auth, async (req, res) => 
 });
 
 // ─── Token Burn Mechanism (Limitation 20) ────────────────────────────────────
+// ─── Issue 1/3: Token Burn → 7-Day Deletion System ───────────────────────────
+// POST /api/token/burn-request  — Creator initiates a 7-day deletion countdown
+// GET  /api/token/burn-status/:ticker — Returns countdown status
+// POST /api/token/burn-cancel   — Creator cancels a pending deletion (within 7 days)
+// Internal: processPendingBurns() runs at startup + every hour
+
+// Helper: get all holders of a token with balance > 0
+async function getTokenHolders(ticker) {
+    const bals = nexusChain.state.balances[ticker.toUpperCase()] || {};
+    return Object.entries(bals)
+        .filter(([addr, bal]) => bal > 0 && !addr.startsWith('nx_sys_') && !addr.startsWith('nx_open_') && addr !== 'system')
+        .map(([addr, bal]) => ({ addr, bal }));
+}
+
+// Helper: send deletion alert to all holders (via broadcast_notifications + push to anyone who queries)
+async function alertTokenDeletion(ticker, daysLeft) {
+    const msg = daysLeft > 0
+        ? `⚠️ TOKEN DELETION ALERT: ${ticker} will be permanently deleted in ${daysLeft} day(s). Move your ${ticker} funds now. No refunds after deletion.`
+        : `🔥 ${ticker} has been permanently deleted by its creator. All remaining balances have been zeroed.`;
+    const type = daysLeft > 0 ? 'warning' : 'alert';
+    try {
+        await pool.query(
+            `INSERT INTO broadcast_notifications (uid, message, type, created_at) VALUES ($1, $2, $3, $4)`,
+            ['system', msg, type, Date.now()]
+        );
+        console.log(chalk.yellow(`[BURN] Alert sent for ${ticker}: ${daysLeft} days left`));
+    } catch(e) { console.error('[BURN] Alert failed:', e.message); }
+}
+
+// Execute the actual deletion of a token
+async function executeTokenDeletion(ticker, creatorUid) {
+    try {
+        ticker = ticker.toUpperCase();
+        // Zero all balances in the blockchain state
+        const bals = nexusChain.state.balances[ticker] || {};
+        for (const addr in bals) {
+            if (bals[addr] > 0) {
+                nexusChain.state.balances[ticker][addr] = 0;
+            }
+        }
+        // Remove from all in-memory structures
+        delete nexusChain.state.balances[ticker];
+        delete nexusChain.state.liquidityPools[ticker];
+        if (menuBook.books[ticker]) delete menuBook.books[ticker];
+        apiCache.tokenStats.delete(ticker);
+
+        // Mark as deleted in DB (don't remove — keep for audit trail)
+        await pool.query(
+            `UPDATE token_burn_requests SET status = 'executed' WHERE ticker = $1`,
+            [ticker]
+        );
+        // Remove from open_tokens and open_token_supply if applicable
+        await pool.query(`DELETE FROM open_tokens WHERE ticker = $1`, [ticker]).catch(() => {});
+        await pool.query(`DELETE FROM open_token_supply WHERE ticker = $1`, [ticker]).catch(() => {});
+
+        // Record in transactions table for audit
+        await pool.query(
+            `INSERT INTO transactions (type, from_address, to_address, token_symbol, amount, amount_usd, timestamp_ms, description, is_system_generated)
+             VALUES ('TOKEN_DELETED', $1, 'void', $2, 0, 0, $3, 'Creator-initiated permanent token deletion after 7-day countdown', TRUE)`,
+            [creatorUid, ticker, Date.now()]
+        ).catch(() => {});
+
+        await alertTokenDeletion(ticker, 0);
+        console.log(chalk.red(`[BURN] ✓ Token ${ticker} permanently deleted.`));
+    } catch(e) {
+        console.error(chalk.red(`[BURN] Deletion failed for ${ticker}:`, e.message));
+    }
+}
+
+// Process all pending burn requests that have passed their execute_at deadline
+async function processPendingBurns() {
+    try {
+        const now = Date.now();
+        const pending = await pool.query(
+            `SELECT ticker, creator_uid, execute_at FROM token_burn_requests WHERE status = 'pending' AND execute_at <= $1`,
+            [now]
+        );
+        for (const row of pending.rows) {
+            console.log(chalk.red(`[BURN] Executing deletion for ${row.ticker}...`));
+            await executeTokenDeletion(row.ticker, row.creator_uid);
+        }
+        // Send 3-day and 1-day warnings for approaching burns
+        const approaching = await pool.query(
+            `SELECT ticker, execute_at FROM token_burn_requests WHERE status = 'pending' AND execute_at > $1`,
+            [now]
+        );
+        for (const row of approaching.rows) {
+            const msLeft = row.execute_at - now;
+            const daysLeft = Math.ceil(msLeft / (24 * 60 * 60 * 1000));
+            if (daysLeft === 3 || daysLeft === 1) {
+                await alertTokenDeletion(row.ticker, daysLeft);
+            }
+        }
+    } catch(e) { console.error('[BURN] processPendingBurns error:', e.message); }
+}
+
+// POST /api/token/burn-request — Initiates 7-day deletion countdown
+app.post('/api/token/burn-request', txLimiter, requireWeb3Auth, async (req, res) => {
+    try {
+        const uid    = req.user.uid;
+        const ticker = String(req.body?.ticker || '').toUpperCase().trim();
+        const platform = String(req.body?.platform || 'delchain').toLowerCase();
+        if (!ticker) return res.status(400).json({ error: 'Ticker required.' });
+
+        // Verify creator — check both transactions table and open_tokens
+        let isCreator = false;
+        const mintRes = await pool.query(
+            `SELECT to_address FROM transactions WHERE type = 'MINT' AND token_symbol = $1 AND is_system_generated = TRUE LIMIT 1`,
+            [ticker]
+        );
+        const normAddr = (a) => String(a || '').trim().replace(/^nx_/, '');
+        if (mintRes.rows.length > 0 && normAddr(mintRes.rows[0].to_address) === normAddr(uid)) isCreator = true;
+
+        // Also check open_tokens for OpenChain tokens
+        if (!isCreator) {
+            const openRes = await pool.query(`SELECT uid FROM open_tokens WHERE ticker = $1 LIMIT 1`, [ticker]);
+            if (openRes.rows.length > 0 && normAddr(openRes.rows[0].uid) === normAddr(uid)) isCreator = true;
+        }
+
+        // Also check tokenOwnerCache
+        if (!isCreator && tokenOwnerCache.has(ticker)) {
+            if (normAddr(tokenOwnerCache.get(ticker)) === normAddr(uid)) isCreator = true;
+        }
+
+        if (!isCreator) return res.status(403).json({ error: 'Only the token creator can initiate deletion.' });
+
+        // Check if already pending
+        const existing = await pool.query(
+            `SELECT status FROM token_burn_requests WHERE ticker = $1 LIMIT 1`, [ticker]
+        );
+        if (existing.rows.length > 0 && existing.rows[0].status === 'pending') {
+            return res.status(409).json({ error: 'A deletion request for this token is already pending.' });
+        }
+        if (existing.rows.length > 0 && existing.rows[0].status === 'executed') {
+            return res.status(410).json({ error: 'This token has already been deleted.' });
+        }
+
+        const now      = Date.now();
+        const sevenDay = 7 * 24 * 60 * 60 * 1000;
+        const executeAt = now + sevenDay;
+
+        await pool.query(
+            `INSERT INTO token_burn_requests (ticker, creator_uid, requested_at, execute_at, status, platform)
+             VALUES ($1, $2, $3, $4, 'pending', $5)
+             ON CONFLICT (ticker) DO UPDATE SET status = 'pending', requested_at = $3, execute_at = $4`,
+            [ticker, uid, now, executeAt, platform]
+        );
+
+        // Immediately notify all users
+        await alertTokenDeletion(ticker, 7);
+        console.log(chalk.yellow(`[BURN] Deletion initiated for ${ticker} by ${uid.substring(0,12)}... → executes ${new Date(executeAt).toISOString()}`));
+        res.json({ success: true, ticker, executeAt, message: `${ticker} deletion scheduled. All holders have been notified. The token will be permanently deleted after 7 days.` });
+    } catch(e) {
+        console.error('[BURN-REQUEST]', e);
+        res.status(500).json({ error: 'Failed to initiate deletion.' });
+    }
+});
+
+// GET /api/token/burn-status/:ticker — Returns countdown info
+app.get('/api/token/burn-status/:ticker', readLimiter, async (req, res) => {
+    const ticker = String(req.params.ticker || '').toUpperCase().trim();
+    try {
+        const r = await pool.query(
+            `SELECT status, requested_at, execute_at FROM token_burn_requests WHERE ticker = $1 LIMIT 1`,
+            [ticker]
+        );
+        if (r.rows.length === 0) return res.json({ pending: false, ticker });
+        const row = r.rows[0];
+        const msLeft   = Math.max(0, row.execute_at - Date.now());
+        const daysLeft = Math.ceil(msLeft / (24 * 60 * 60 * 1000));
+        res.json({ pending: row.status === 'pending', executed: row.status === 'executed', ticker, executeAt: row.execute_at, daysLeft, hoursLeft: Math.ceil(msLeft / 3600000) });
+    } catch(e) { res.status(500).json({ error: 'Failed to fetch burn status.' }); }
+});
+
+// POST /api/token/burn-cancel — Creator cancels a pending deletion (grace period)
+app.post('/api/token/burn-cancel', txLimiter, requireWeb3Auth, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const ticker = String(req.body?.ticker || '').toUpperCase().trim();
+        const normAddr = (a) => String(a || '').trim().replace(/^nx_/, '');
+        const r = await pool.query(`SELECT creator_uid, status FROM token_burn_requests WHERE ticker = $1 LIMIT 1`, [ticker]);
+        if (r.rows.length === 0) return res.status(404).json({ error: 'No pending deletion found for this token.' });
+        if (r.rows[0].status !== 'pending') return res.status(400).json({ error: 'Cannot cancel — deletion already executed.' });
+        if (normAddr(r.rows[0].creator_uid) !== normAddr(uid)) return res.status(403).json({ error: 'Only the creator can cancel deletion.' });
+        await pool.query(`UPDATE token_burn_requests SET status = 'cancelled' WHERE ticker = $1`, [ticker]);
+        // Notify users the deletion was cancelled
+        await pool.query(`INSERT INTO broadcast_notifications (uid, message, type, created_at) VALUES ($1, $2, $3, $4)`,
+            ['system', `✅ ${ticker} deletion has been CANCELLED by the creator. The token will continue to exist.`, 'success', Date.now()]);
+        res.json({ success: true, message: `Deletion of ${ticker} has been cancelled.` });
+    } catch(e) { res.status(500).json({ error: 'Failed to cancel deletion.' }); }
+});
+
+// Keep old /api/token/burn for backward compatibility (now triggers deletion flow)
 app.post('/api/token/burn', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const uid = req.user.uid;
-        const { tokenSymbol, amount } = req.body;
-        const parsedAmount = parseFloat(amount);
-        if (!tokenSymbol || isNaN(parsedAmount) || parsedAmount <= 0) return res.status(400).json({ error: 'Invalid burn parameters.' });
-        
-        const mintRes = await pool.query("SELECT to_address FROM transactions WHERE type = 'MINT' AND token_symbol = $1 AND is_system_generated = TRUE LIMIT 1", [tokenSymbol.toUpperCase()]);
-        if (mintRes.rows.length === 0 || mintRes.rows[0].to_address !== uid) return res.status(403).json({ error: 'Only the creator can burn this token.' });
-
-        const availableBal = nexusChain.getBalance(uid, tokenSymbol) - mempool.getPendingTokenSpend(uid, tokenSymbol);
-        if (availableBal < parsedAmount) return res.status(400).json({ error: 'Insufficient balance to burn.' });
-
-        const burnTx = {
-            from: uid, to: 'dead_burn_address', amount: parsedAmount, type: 'TRANSFER', tokenSymbol: tokenSymbol.toUpperCase(),
-            timestamp: Date.now(), isSystemGenerated: true, description: 'Creator Supply Burn'
-        };
-        if (await mempool.addTransaction(burnTx)) {
-            broadcastP2P({ type: 'BROADCAST_TX', data: burnTx });
-            res.json({ success: true, message: `Successfully burned ${parsedAmount} ${tokenSymbol}.` });
-        } else {
-            res.status(400).json({ error: 'Failed to add burn to mempool.' });
-        }
-    } catch (e) { res.status(500).json({ error: 'Burn failed.' }); }
+        const { tokenSymbol } = req.body;
+        if (!tokenSymbol) return res.status(400).json({ error: 'tokenSymbol required.' });
+        // Redirect to the new deletion flow via internal call
+        req.body.ticker   = tokenSymbol;
+        req.body.platform = 'delchain';
+        // Re-use burn-request logic inline
+        const ticker = String(tokenSymbol).toUpperCase().trim();
+        const normAddr = (a) => String(a || '').trim().replace(/^nx_/, '');
+        let isCreator = false;
+        const mintRes = await pool.query(`SELECT to_address FROM transactions WHERE type = 'MINT' AND token_symbol = $1 AND is_system_generated = TRUE LIMIT 1`, [ticker]);
+        if (mintRes.rows.length > 0 && normAddr(mintRes.rows[0].to_address) === normAddr(uid)) isCreator = true;
+        if (!isCreator && tokenOwnerCache.has(ticker) && normAddr(tokenOwnerCache.get(ticker)) === normAddr(uid)) isCreator = true;
+        if (!isCreator) return res.status(403).json({ error: 'Only the creator can burn this token.' });
+        const existing = await pool.query(`SELECT status FROM token_burn_requests WHERE ticker = $1 LIMIT 1`, [ticker]);
+        if (existing.rows.length > 0 && existing.rows[0].status === 'pending') return res.status(409).json({ error: 'Deletion already pending.' });
+        const now = Date.now();
+        await pool.query(`INSERT INTO token_burn_requests (ticker, creator_uid, requested_at, execute_at, status, platform) VALUES ($1,$2,$3,$4,'pending','delchain') ON CONFLICT (ticker) DO UPDATE SET status='pending', requested_at=$3, execute_at=$4`, [ticker, uid, now, now + 7*24*60*60*1000]);
+        await alertTokenDeletion(ticker, 7);
+        res.json({ success: true, message: `${ticker} deletion scheduled in 7 days. All holders notified.` });
+    } catch(e) { res.status(500).json({ error: 'Burn failed.' }); }
 });
 
 // FEATURE 28: Stripe Card Deposit Session
@@ -5114,6 +5334,11 @@ app.use((req, res) => { res.status(404).json({ error: 'API Node Endpoint Not Fou
     // Pre-load all token owner addresses into memory so /quick-stats and creator
     // checks never need to do a per-request DB query after initial warmup.
     await preloadTokenOwners();
+
+    // Issue 1/3: Process any pending token deletions that passed their 7-day deadline
+    await processPendingBurns();
+    // Run every hour to catch upcoming deletions and send day-before warnings
+    setInterval(processPendingBurns, 60 * 60 * 1000);
 
     // Issue 4: Auto-migrate legacy OpenChain tokens that have no system address.
     // Tokens deployed BEFORE the nx_open_ system address feature (like DORANT) have

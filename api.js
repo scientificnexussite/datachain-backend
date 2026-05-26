@@ -17,9 +17,7 @@ import validator from './validator.js';
 import menuBook, { processReferralBonus } from './menubook.js'; // IMPROVEMENT 4 — static import
 import { initP2P, broadcastP2P } from './p2p.js';
 import config from './config.json' with { type: 'json' };
-import Stripe from 'stripe';
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || 'sk_test_dummy', { apiVersion: '2023-10-16' });
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
+// Stripe removed — KYC verification system disabled. No USA address/number required.
 
 // ─── PayPal Configuration ─────────────────────────────────────────────────────
 const PAYPAL_CLIENT_ID     = process.env.PAYPAL_CLIENT_ID;
@@ -339,48 +337,7 @@ app.use(cors({
     allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization']
 }));
 // ─── Stripe Identity & Payments Webhook (Must be before bodyParser) ───────────
-app.post('/api/kyc/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
-    const sig = req.headers['stripe-signature'];
-    let event;
-    try {
-        event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
-    } catch (err) {
-        return res.status(400).send(`Webhook Error: ${err.message}`);
-    }
-
-    if (event.type === 'identity.verification_session.verified') {
-        const session = event.data.object;
-        const uid = session.metadata.uid;
-        await pool.query(
-            "UPDATE merchant_kyc SET status = 'verified', verified_at = $1 WHERE uid = $2",
-            [Date.now(), uid]
-        );
-        console.log(chalk.green(`[KYC] Merchant verified via Stripe: ${uid.substring(0,12)}...`));
-    } else if (event.type === 'identity.verification_session.requires_input') {
-        const session = event.data.object;
-        await pool.query("UPDATE merchant_kyc SET status = 'failed' WHERE uid = $1", [session.metadata.uid]);
-    } 
-    // FEATURE 28: Process Stripe Fiat Deposits
-    else if (event.type === 'checkout.session.completed') {
-        const session = event.data.object;
-        if (session.metadata && session.metadata.type === 'sdx_deposit') {
-            const uid = session.metadata.uid;
-            const amountPaid = session.amount_total / 100; // Stripe provides amount in cents
-            
-            // Mint SDX Stablecoins 1:1 with the deposited fiat
-            const mintTx = {
-                from: 'system', to: uid, amount: amountPaid, type: 'MINT', tokenSymbol: 'SDX',
-                timestamp: Date.now(), isSystemGenerated: true, description: 'Stripe Fiat Deposit'
-            };
-            
-            if (await mempool.addTransaction(mintTx)) {
-                broadcastP2P({ type: 'BROADCAST_TX', data: mintTx });
-                console.log(chalk.green(`[STRIPE] Successfully minted ${amountPaid} SDX for ${uid.substring(0,12)}...`));
-            }
-        }
-    }
-    res.send();
-});
+// KYC webhook removed — Stripe verification system disabled.
 
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ limit: '10mb', extended: true }));
@@ -1669,20 +1626,7 @@ app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
         const { side, amountSyr, priceUsd, tokenSymbol = 'SYR' } = req.body;
         const uid = req.user.uid;
 
-        // ── KYC GATE: All trading requires identity verification ───────────────
-        // Platform policy: no user may buy or sell any asset without completing
-        // the Stripe Identity KYC flow. This protects against anonymous wash
-        // trading, fake volume, and regulatory issues as the platform scales.
-        const kycRow = await pool.query(
-            `SELECT status FROM merchant_kyc WHERE uid = $1 ORDER BY created_at DESC LIMIT 1`,
-            [uid]
-        );
-        if (!kycRow.rows.length || kycRow.rows[0].status !== 'verified') {
-            return res.status(403).json({
-                error: 'Identity Verification Required. Complete KYC in the Syrpts Terminal to place orders.',
-                kycRequired: true
-            });
-        }
+        // KYC gate removed — identity verification no longer required to trade.
 
             return res.status(400).json({ error: 'Invalid limit order parameters.' });
 
@@ -1751,17 +1695,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
         const { side, amountSyr, tokenSymbol = 'SYR' } = req.body;
         const uid          = req.user.uid;
 
-        // ── KYC GATE: All trading requires identity verification ───────────────
-        const kycRow2 = await pool.query(
-            `SELECT status FROM merchant_kyc WHERE uid = $1 ORDER BY created_at DESC LIMIT 1`,
-            [uid]
-        );
-        if (!kycRow2.rows.length || kycRow2.rows[0].status !== 'verified') {
-            return res.status(403).json({
-                error: 'Identity Verification Required. Complete KYC in the Syrpts Terminal to place orders.',
-                kycRequired: true
-            });
-        }
+        // KYC gate removed — identity verification no longer required to trade.
 
         const parsedAmount = parseFloat(amountSyr);
 
@@ -2875,14 +2809,7 @@ app.post('/api/withdrawal-address/add', txLimiter, requireWeb3Auth, async (req, 
         const uid = req.user.uid;
         const { label, address, network } = req.body;
 
-        // KYC required to register withdrawal addresses
-        const kycRow = await pool.query(
-            `SELECT status FROM merchant_kyc WHERE uid = $1 ORDER BY created_at DESC LIMIT 1`,
-            [uid]
-        );
-        if (!kycRow.rows.length || kycRow.rows[0].status !== 'verified') {
-            return res.status(403).json({ error: 'KYC verification required to add withdrawal addresses.' });
-        }
+        // KYC gate removed — identity verification no longer required.
 
         if (!label || !address || !network) {
             return res.status(400).json({ error: 'label, address, and network are all required.' });
@@ -4950,123 +4877,19 @@ app.post('/api/token/burn', txLimiter, requireWeb3Auth, async (req, res) => {
 });
 
 // FEATURE 28: Stripe Card Deposit Session
-app.post('/api/stripe/deposit-session', txLimiter, requireWeb3Auth, async (req, res) => {
-    try {
-        const uid = req.user.uid;
-        const amount = parseFloat(req.body.amount);
-        if (isNaN(amount) || amount < 5) return res.status(400).json({ error: 'Minimum card deposit is $5.00' });
+// Stripe card deposit removed — STRIPE_SECRET_KEY no longer needed.
 
-        const session = await stripe.checkout.sessions.create({
-            payment_method_types: ['card'],
-            line_items: [{
-                price_data: { 
-                    currency: 'usd', 
-                    product_data: { name: 'SDX Network Stablecoin (1:1 USD Peg)' }, 
-                    unit_amount: Math.round(amount * 100) 
-                },
-                quantity: 1,
-            }],
-            mode: 'payment',
-            success_url: `https://${process.env.RAILWAY_PUBLIC_DOMAIN || 'localhost:8080'}/deposit-success?session_id={CHECKOUT_SESSION_ID}`,
-            cancel_url: 'https://syrpts-terminal.vercel.app',
-            metadata: { uid: uid, type: 'sdx_deposit' }
-        });
-        
-        res.json({ checkout_url: session.url });
-    } catch(err) {
-        res.status(500).json({ error: 'Failed to initialize secure card checkout.' });
-    }
+// KYC endpoints removed — /api/kyc/create-session, /api/kyc/return, /api/kyc/status
+// Status endpoint returns verified=true so no existing code breaks.
+app.post('/api/kyc/status', readLimiter, requireWeb3Auth, (req, res) => {
+    // KYC removed: always return verified so no frontend lock-screens appear
+    res.json({ status: 'verified' });
 });
-
-// ─── PHASE 10: KYC & P2P Merchant System ──────────────────────────────────────
-
-// Route: Create Stripe Checkout + KYC Session (Path 2: Strict Gatekeeper)
-app.post('/api/kyc/create-session', txLimiter, requireWeb3Auth, async (req, res) => {
-    try {
-        const uid = req.user.uid;
-        const kycRes = await pool.query('SELECT status FROM merchant_kyc WHERE uid = $1', [uid]);
-        if (kycRes.rows.length > 0 && kycRes.rows[0].status === 'verified') {
-            return res.status(400).json({ error: 'You are already a verified merchant.' });
-        }
-
-        // Generate the URL the user will return to after paying
-        const returnUrl = `https://${process.env.RAILWAY_PUBLIC_DOMAIN || 'localhost:8080'}/api/kyc/return?session_id={CHECKOUT_SESSION_ID}`;
-
-        // Create a Stripe Checkout Session that INCLUDES Identity Verification
-        const session = await stripe.checkout.sessions.create({
-            payment_method_types: ['card'],
-            line_items: [{
-                price_data: {
-                    currency: 'usd',
-                    product_data: {
-                        name: 'P2P Merchant Verification Fee',
-                        description: 'One-time application and network compliance check.',
-                    },
-                    unit_amount: 300, // $3.00 USD
-                },
-                quantity: 1,
-            }],
-            mode: 'payment',
-            success_url: returnUrl,
-            cancel_url: 'https://syrpts-terminal.vercel.app', // Return to terminal if they cancel
-            metadata: { uid: uid }, // Attach the wallet address so the webhook knows who paid
-            payment_intent_data: {
-                setup_future_usage: 'on_session',
-            }
-        });
-
-        await pool.query(
-            `INSERT INTO merchant_kyc (uid, stripe_session_id, status, created_at) 
-             VALUES ($1, $2, 'awaiting_payment', $3)
-             ON CONFLICT (uid) DO UPDATE SET stripe_session_id = EXCLUDED.stripe_session_id, status = 'awaiting_payment'`,
-            [uid, session.id, Date.now()]
-        );
-
-        // Return the checkout URL instead of the client_secret
-        res.json({ checkout_url: session.url });
-    } catch (err) {
-        console.error(chalk.red('[KYC ERROR]'), err.message);
-        res.status(500).json({ error: 'Failed to initialize secure checkout.' });
-    }
+app.post('/api/kyc/create-session', txLimiter, requireWeb3Auth, (req, res) => {
+    res.json({ status: 'verified', message: 'Verification not required.' });
 });
-
-// Route: Handle the return from Stripe Checkout
-app.get('/api/kyc/return', async (req, res) => {
-    try {
-        const { session_id } = req.query;
-        if (!session_id) return res.status(400).send("Session ID missing.");
-
-        const session = await stripe.checkout.sessions.retrieve(session_id);
-        if (session.payment_status === 'paid') {
-            const uid = session.metadata.uid;
-            
-            // Now that they have paid, generate the actual Identity Verification link
-            const verificationSession = await stripe.identity.verificationSessions.create({
-                type: 'document',
-                metadata: { uid: uid },
-                return_url: 'https://syrpts-terminal.vercel.app',
-            });
-            
-            // Redirect the user directly into the ID scanner
-            res.redirect(303, verificationSession.url);
-        } else {
-            res.redirect(303, 'https://syrpts-terminal.vercel.app');
-        }
-    } catch (e) {
-        res.status(500).send("Failed to process payment return.");
-    }
-});
-
-// POST /api/kyc/status - Fetch KYC verification status
-app.post('/api/kyc/status', readLimiter, requireWeb3Auth, async (req, res) => {
-    try {
-        const uid = req.user.uid;
-        const kycRes = await pool.query('SELECT status FROM merchant_kyc WHERE uid = $1', [uid]);
-        if (kycRes.rows.length === 0) return res.json({ status: 'unverified' });
-        res.json({ status: kycRes.rows[0].status });
-    } catch (err) {
-        res.status(500).json({ error: 'Failed to fetch KYC status.' });
-    }
+app.get('/api/kyc/return', (req, res) => {
+    res.redirect(303, 'https://syrpts-terminal.vercel.app');
 });
 
 // POST /p2p/admin-resolve - Limitation 7 FIX: Force resolve a disputed P2P trade
@@ -5126,16 +4949,7 @@ app.post('/p2p/post-offer', txLimiter, requireWeb3Auth, async (req, res) => {
         const uid = req.user.uid;
         const { assetSymbol, amount, rate, currency, payMethod, payDetails } = req.body;
         
-        // Ensure user is KYC Verified
-        const kycRes = await pool.query("SELECT status, verified_at FROM merchant_kyc WHERE uid = $1", [uid]);
-        if (kycRes.rows.length === 0 || kycRes.rows[0].status !== 'verified') {
-            return res.status(403).json({ error: 'Identity verification (KYC) required to post P2P offers.' });
-        }
-        
-        const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
-        if (Date.now() - parseInt(kycRes.rows[0].verified_at) < thirtyDaysMs) {
-            console.log(chalk.yellow(`[KYC] Merchant ${uid.substring(0,12)} is fresh, but allowing offer post for beta phase.`));
-        }
+        // KYC gate removed from P2P offers
 
         const parsedAmount = parseFloat(amount);
         if (isNaN(parsedAmount) || parsedAmount <= 0) return res.status(400).json({ error: 'Invalid mathematical amount.' });

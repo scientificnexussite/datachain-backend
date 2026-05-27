@@ -320,9 +320,11 @@ app.use(helmet());
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 const allowedOrigins = [
+    'https://scientificnexus.net',
+    'https://www.scientificnexus.net',
+    'https://syrpts-terminal.vercel.app',
     'https://scientific-nexus-site.vercel.app',
-    'https://scientific-nexus-data-chain.vercel.app',
-    'https://syrpts-terminal.vercel.app'
+    'https://scientific-nexus-data-chain.vercel.app'
 ];
 
 app.use(cors({

@@ -1630,6 +1630,12 @@ app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
 
         // KYC gate removed — identity verification no longer required to trade.
 
+        // Fix 3: SDX and SDTX are non-tradeable stablecoins. They have dedicated
+        // deposit/withdrawal endpoints and must NOT go through the order book.
+        if (['SDX', 'SDTX'].includes(tokenSymbol)) {
+            return res.status(400).json({ error: `${tokenSymbol} is a stablecoin pegged at $1.00. Use the Manage Real Cash deposit/withdrawal system instead.` });
+        }
+
             return res.status(400).json({ error: 'Invalid limit order parameters.' });
 
              const parsedAmount = parseFloat(amountSyr);
@@ -1681,6 +1687,10 @@ app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
         if (matchResult.trades.length > 0) {
             const lastTradePrice = matchResult.trades[matchResult.trades.length - 1].price;
             await checkServerAlerts(tokenSymbol, lastTradePrice);
+            // Issue 4 Fix: Broadcast PRICE_UPDATE for ALL tokens so chart updates live
+            if (global.broadcastWS) {
+                global.broadcastWS('PRICE_UPDATE', { token: tokenSymbol, price: lastTradePrice, timestamp: Date.now() });
+            }
             // Issue 4 Fix: Invalidate stats cache so next /stats returns the fresh trade price
             apiCache.tokenStats.delete(tokenSymbol);
         }
@@ -1698,6 +1708,11 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
         const uid          = req.user.uid;
 
         // KYC gate removed — identity verification no longer required to trade.
+
+        // Fix 3: SDX and SDTX are non-tradeable stablecoins.
+        if (['SDX', 'SDTX'].includes(tokenSymbol)) {
+            return res.status(400).json({ error: `${tokenSymbol} is a stablecoin pegged at $1.00. Use the Manage Real Cash deposit/withdrawal system instead.` });
+        }
 
         const parsedAmount = parseFloat(amountSyr);
 
@@ -1939,6 +1954,10 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
         // IMPROVEMENT 6 — Trigger server-side alert check after every market trade
         const lastTradePrice = matchResult.trades[matchResult.trades.length - 1].price;
         await checkServerAlerts(tokenSymbol, lastTradePrice);
+        // Issue 4 Fix: Broadcast PRICE_UPDATE for ALL tokens so chart updates live
+        if (global.broadcastWS) {
+            global.broadcastWS('PRICE_UPDATE', { token: tokenSymbol, price: lastTradePrice, timestamp: Date.now() });
+        }
         // Issue 4 Fix: Invalidate per-token stats cache so price refreshes immediately
         apiCache.tokenStats.delete(tokenSymbol);
 

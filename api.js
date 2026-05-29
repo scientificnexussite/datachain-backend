@@ -469,10 +469,40 @@ async function getPayPalAccessToken() {
 // ─── Utilities ────────────────────────────────────────────────────────────────
 const fixDust = (num) => Number(Number(num).toFixed(8));
 
-// PHASE 2 FIX: Helper to fetch the hard peg price for custom FDX tokens
+// ─── Dynamic Trading Fee ──────────────────────────────────────────────────────
+// Base fee: 0.15% (cheaper than Binance VIP0). Scales up to 0.30% during congestion.
+const BASE_FEE_RATE = 0.0015; // 0.15%
+const MAX_FEE_RATE  = 0.003;  // 0.30%
+const MEMPOOL_MAX   = 5000;
+
+function getCurrentFeeRate() {
+    const count = mempool.getPendingCount();
+    const load  = count / MEMPOOL_MAX; // 0.0 → 1.0
+    if (load < 0.5) return BASE_FEE_RATE;                                    // Normal
+    if (load < 0.8) return parseFloat((BASE_FEE_RATE * (1 + (load - 0.5) / 0.3)).toFixed(6)); // Linear ramp
+    return MAX_FEE_RATE;                                                     // Congested
+}
+
+function getNetworkStatus() {
+    const count = mempool.getPendingCount();
+    const load = count / MEMPOOL_MAX;
+    const feeRate = getCurrentFeeRate();
+    let status = 'normal';
+    if (load >= 0.8) status = 'congested';
+    else if (load >= 0.5) status = 'busy';
+    return { mempoolCount: count, mempoolLoad: parseFloat(load.toFixed(3)), feeRate, status };
+}
+
+// ─── Hard Peg — ONLY SDX/SDTX ($1.00 stablecoins) ────────────────────────────
+// Custom FDX/OpenChain tokens float freely via AMM + order book.
 async function getHardPeg(tokenSymbol) {
     if (['SDX', 'SDTX'].includes(tokenSymbol)) return 1.00;
-    if (tokenSymbol === 'SYR') return null;
+    return null; // SYR and all custom tokens float freely
+}
+
+// ─── Seed Price — Used for initial price discovery only, NOT enforcement ──────
+// Returns the pegPrice stored in the MINT description, or $0.00000001 as default.
+async function getSeedPrice(tokenSymbol) {
     try {
         const mintTx = await pool.query(
             `SELECT description FROM transactions WHERE type = 'MINT' AND token_symbol = $1 AND is_system_generated = TRUE LIMIT 1`,
@@ -484,9 +514,6 @@ async function getHardPeg(tokenSymbol) {
             if (!isNaN(peg) && peg > 0) return peg;
         }
     } catch(e) {}
-    // POLICY: New tokens with no pegPrice in the MINT description start at
-    // $0.00000001. This is the fixed seed price after removing the user-
-    // controlled launch-price field from the deploy form.
     return 0.00000001;
 }
 
@@ -710,6 +737,11 @@ async function refreshAllPoolOrders() {
         if (poolPrice <= 0 && book.asks && book.asks.length > 0) {
             poolPrice = book.asks[0].priceUsd;
         }
+        // For custom tokens with no pool price yet, use the seed price as initial reference
+        if (poolPrice <= 0) {
+            const seed = await getSeedPrice(ticker);
+            if (seed > 0) poolPrice = seed;
+        }
         if (poolPrice <= 0 || combinedTokenBal <= 0) continue;
 
         // Update the liquidity pool state to reflect the handler's balance
@@ -727,9 +759,9 @@ async function refreshAllPoolOrders() {
         const rawOrderSize = Math.min(parseFloat((combinedTokenBal * 0.01).toFixed(8)), 10_000);
         if (rawOrderSize < 1e-6) continue;
 
-               // PHASE 2 FIX: If a hard peg exists, lock the bid/ask spread exactly to the peg to prevent volatility.
-        const bidPrice   = hardPeg ? hardPeg : parseFloat((poolPrice * 0.995).toFixed(8));
-        const askPrice   = hardPeg ? hardPeg : parseFloat((poolPrice * 1.005).toFixed(8));
+        // ±2.5% spread for free-floating tokens; exact peg for SDX/SDTX
+        const bidPrice   = hardPeg ? hardPeg : parseFloat((poolPrice * 0.975).toFixed(8));
+        const askPrice   = hardPeg ? hardPeg : parseFloat((poolPrice * 1.025).toFixed(8));
         
         // PHASE 3 FIX: Isolate Liquidity Pools (Prevent System Bank Run)
         // Only core tokens use the central system bank. Custom tokens strictly use their handler's isolated USD.
@@ -794,6 +826,11 @@ setInterval(async () => {
                 await refreshAllPoolOrders();
             } catch (poolErr) {
                 console.warn(chalk.yellow('[POOL] Market-making refresh failed:'), poolErr.message);
+            }
+
+            // Broadcast network status (fee rate, congestion) after every successful block
+            if (global.broadcastWS) {
+                global.broadcastWS('NETWORK_STATUS', getNetworkStatus());
             }
 
             // Post-mining cleanup: release locks that were waiting on these txs
@@ -1016,13 +1053,30 @@ app.get('/menubook', async (req, res) => {
 app.get('/network', (req, res) => {
     if (Date.now() - apiCache.network.time < CACHE_TTL && apiCache.network.data)
         return res.json(apiCache.network.data);
+    const ns = getNetworkStatus();
     apiCache.network.data = {
         chainLength: nexusChain.blockCount,
         difficulty:  nexusChain.difficulty,
-        mempoolCount: mempool.getPendingCount()
+        mempoolCount: ns.mempoolCount,
+        mempoolLoad:  ns.mempoolLoad,
+        feeRate:      ns.feeRate,
+        status:       ns.status
     };
     apiCache.network.time = Date.now();
     res.json(apiCache.network.data);
+});
+
+// ─── Fee Estimate ─────────────────────────────────────────────────────────────
+app.get('/api/fee-estimate', (req, res) => {
+    const amount = parseFloat(req.query.amount) || 0;
+    const ns = getNetworkStatus();
+    res.json({
+        feeRate: ns.feeRate,
+        feePercentage: (ns.feeRate * 100).toFixed(2) + '%',
+        estimatedFee: fixDust(amount * ns.feeRate),
+        status: ns.status,
+        mempoolLoad: ns.mempoolLoad
+    });
 });
 
 // ─── Price History (IMPROVEMENT 5 — readLimiter applied) ─────────────────────
@@ -1636,10 +1690,11 @@ app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
             return res.status(400).json({ error: `${tokenSymbol} is a stablecoin pegged at $1.00. Use the Manage Real Cash deposit/withdrawal system instead.` });
         }
 
-            return res.status(400).json({ error: 'Invalid limit order parameters.' });
-
-             const parsedAmount = parseFloat(amountSyr);
+        const parsedAmount = parseFloat(amountSyr);
         const parsedPrice  = parseFloat(priceUsd);
+
+        if (!['BUY', 'SELL'].includes(side) || isNaN(parsedAmount) || parsedAmount <= 0 || isNaN(parsedPrice) || parsedPrice <= 0)
+            return res.status(400).json({ error: 'Invalid limit order parameters.' });
 
         // HARD PEG ENFORCEMENT: Block limit orders that deviate from stablecoins or custom FDX pegs
         const hardPeg = await getHardPeg(tokenSymbol);
@@ -1695,7 +1750,23 @@ app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
             apiCache.tokenStats.delete(tokenSymbol);
         }
 
-        res.status(201).json({ message: 'Limit order processed.', order, executedTrades: matchResult.trades });
+        // ── Trading Fee Collection (same as market orders) ──────────────────────
+        let limitFeeUsd = 0;
+        if (matchResult.trades.length > 0) {
+            const feeRate = getCurrentFeeRate();
+            const totalUsdCost = matchResult.trades.reduce((sum, t) => sum + (t.amountUsd || 0), 0);
+            limitFeeUsd = fixDust(totalUsdCost * feeRate);
+            if (limitFeeUsd > 1e-8) {
+                await mempool.addTransaction({
+                    from: uid, to: 'system',
+                    amount: limitFeeUsd, type: 'USD_WITHDRAWAL',
+                    timestamp: Date.now(), isSystemGenerated: true,
+                    description: `Trading fee (${(feeRate * 100).toFixed(2)}%)`
+                });
+            }
+        }
+
+        res.status(201).json({ message: 'Limit order processed.', order, executedTrades: matchResult.trades, feeAmount: limitFeeUsd });
     } catch (error) {
         res.status(500).json({ error: 'Internal Server Error' });
     }
@@ -1811,21 +1882,17 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                             const lp = nexusChain.state.liquidityPools[tokenSymbol];
                             lp.tokenReserve = fixDust(lp.tokenReserve - fillAmount);
                             lp.usdReserve   = fixDust(lp.usdReserve   + fixDust(fillAmount * poolPrice));
-                            // Issue 4/5 FIX: Compute new price from UPDATED reserves, not old poolPrice.
-                            // Previously: lastTradePrice = poolPrice (BEFORE trade) → price never moved.
-                            // Now: compute actual new market price from the updated pool state.
-                            // Also: only update if the new price is the more recent/accurate signal —
-                            // don't overwrite a $0.01 limit-order price with a $0.00000001 pool price.
+                            // Compute new price from UPDATED reserves (x*y=k constant-product).
                             const newAmmPrice = lp.tokenReserve > 0 ? fixDust(lp.usdReserve / lp.tokenReserve) : poolPrice;
-                            const existingLast = menuBook.books[tokenSymbol]?.lastTradePrice || 0;
-                            menuBook.books[tokenSymbol].lastTradePrice = newAmmPrice > existingLast ? newAmmPrice : Math.max(newAmmPrice, existingLast);
+                            menuBook.books[tokenSymbol].lastTradePrice = newAmmPrice;
                             // Invalidate per-token stats cache so next /stats returns the updated price
                             apiCache.tokenStats.delete(tokenSymbol);
 
-                            matchResult.trades.push({ buyer: uid, seller: handlerAddr, amountSyr: fillAmount, amountUsd: fixDust(fillAmount * poolPrice), price: poolPrice, tokenSymbol });
+                            const fillExecUsd = fixDust(fillAmount * newAmmPrice);
+                            matchResult.trades.push({ buyer: uid, seller: handlerAddr, amountSyr: fillAmount, amountUsd: fillExecUsd, price: newAmmPrice, tokenSymbol, _recorded: true });
                             matchResult.executedSyr  = fixDust(matchResult.executedSyr  + fillAmount);
                             matchResult.remaining    = fixDust(matchResult.remaining    - fillAmount);
-                                                        matchResult.totalUsdCost = fixDust(matchResult.totalUsdCost + fixDust(fillAmount * poolPrice));
+                            matchResult.totalUsdCost = fixDust(matchResult.totalUsdCost + fillExecUsd);
                         }
                     }
                 }
@@ -1871,12 +1938,12 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                             const lp = nexusChain.state.liquidityPools[tokenSymbol];
                             lp.tokenReserve = fixDust(lp.tokenReserve + fillAmount);
                             lp.usdReserve   = fixDust(lp.usdReserve   - fillUsd);
-                            // Issue 4/5 FIX: Use post-trade pool price as lastTradePrice
+                            // Post-trade pool price — price DECREASES on sells (no Math.max guard)
                             const newAmmSellPrice = lp.tokenReserve > 0 ? fixDust(lp.usdReserve / lp.tokenReserve) : poolPrice;
-                            menuBook.books[tokenSymbol].lastTradePrice = Math.max(newAmmSellPrice, menuBook.books[tokenSymbol]?.lastTradePrice || 0);
+                            menuBook.books[tokenSymbol].lastTradePrice = newAmmSellPrice;
                             apiCache.tokenStats.delete(tokenSymbol);
 
-                            matchResult.trades.push({ buyer: handlerAddr, seller: uid, amountSyr: fillAmount, amountUsd: fillUsd, price: poolPrice, tokenSymbol });
+                            matchResult.trades.push({ buyer: handlerAddr, seller: uid, amountSyr: fillAmount, amountUsd: fillUsd, price: newAmmSellPrice, tokenSymbol, _recorded: true });
                             matchResult.executedSyr  = fixDust(matchResult.executedSyr  + fillAmount);
                             matchResult.remaining    = fixDust(matchResult.remaining    - fillAmount);
                             matchResult.totalUsdCost = fixDust(matchResult.totalUsdCost + fillUsd);
@@ -1888,25 +1955,32 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
             }
         }
 
-        // System liquidity fallback for SYR BUY orders with remaining unfilled volume
+        // ── SYR BUY-side AMM fallback — Persistent constant-product pool (x*y=k) ──
+        // Uses 5% of circulating supply as virtual reserve for lower volatility.
         if (side === 'BUY' && matchResult.remaining > 1e-8 && tokenSymbol === 'SYR') {
             const systemBalance = nexusChain.getBalance('system', tokenSymbol) - mempool.getPendingTokenSpend('system', tokenSymbol);
-            // Centralization Fix 1 — Cap system minting power for SYR.
-            // The system can only market-make with SYR it has earned from deploy fees
-            // and referral revenue. Hard cap: system balance cannot exceed 2% of MAX_SUPPLY.
-            // This gives users a mathematical guarantee on maximum dilution.
-            const SYR_SYSTEM_MINT_CAP = MAX_SUPPLY * 0.02; // 2% of 6B = 120M SYR hard cap
+            const SYR_SYSTEM_MINT_CAP = MAX_SUPPLY * 0.02;
             const cappedSystemBalance = Math.min(systemBalance, SYR_SYSTEM_MINT_CAP);
-            if (cappedSystemBalance > 0) {
-                                let tradeAmount = Math.min(matchResult.remaining, cappedSystemBalance);
-                const virtualSyrReserve = Math.max(5_000_000, (MAX_SUPPLY - nexusChain.getRemainingSupply('SYR')) * 0.05); // FIX 9: Dynamic 5% of circulating supply
-                const virtualUsdReserve = virtualSyrReserve * currentPrice;
 
-                let stepTradeUsd       = parseFloat((tradeAmount * currentPrice).toFixed(8));
-                let maxAffordableUsd   = fundsToCheck - matchResult.totalUsdCost;
+            if (cappedSystemBalance > 0) {
+                // Use persistent pool state (same x*y=k as custom tokens)
+                nexusChain.state.initPool('SYR');
+                const lp = nexusChain.state.liquidityPools['SYR'];
+
+                // Bootstrap pool on first trade if reserves are empty
+                if (lp.tokenReserve <= 0 || lp.usdReserve <= 0) {
+                    const circulatingSupply = MAX_SUPPLY - nexusChain.getRemainingSupply('SYR');
+                    lp.tokenReserve = Math.max(5_000_000, circulatingSupply * 0.05);
+                    lp.usdReserve = lp.tokenReserve * currentPrice;
+                }
+
+                let tradeAmount = Math.min(matchResult.remaining, cappedSystemBalance);
+                const preTradePrice = lp.usdReserve / lp.tokenReserve;
+                let stepTradeUsd    = fixDust(tradeAmount * preTradePrice);
+                let maxAffordableUsd = fundsToCheck - matchResult.totalUsdCost;
 
                 if (maxAffordableUsd < stepTradeUsd) {
-                    tradeAmount  = parseFloat((maxAffordableUsd / currentPrice).toFixed(8));
+                    tradeAmount  = fixDust(maxAffordableUsd / preTradePrice);
                     stepTradeUsd = maxAffordableUsd;
                 }
 
@@ -1918,13 +1992,16 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                         timestamp: Date.now(), isSystemGenerated: true
                     });
 
-                    const newSyrReserve = virtualSyrReserve - tradeAmount;
-                    const newUsdReserve = (virtualSyrReserve * virtualUsdReserve) / newSyrReserve;
-                    currentPrice = parseFloat((newUsdReserve / newSyrReserve).toFixed(6));
-                    menuBook.books[tokenSymbol].lastTradePrice = currentPrice;
+                    // Update persistent pool reserves (x*y=k)
+                    lp.tokenReserve = fixDust(lp.tokenReserve - tradeAmount);
+                    lp.usdReserve   = fixDust(lp.usdReserve + stepTradeUsd);
+                    const newPrice   = fixDust(lp.usdReserve / lp.tokenReserve);
+
+                    currentPrice = newPrice;
+                    menuBook.books[tokenSymbol].lastTradePrice = newPrice;
                     await menuBook.saveOrders(tokenSymbol);
 
-                    matchResult.trades.push({ buyer: uid, seller: 'system', amountSyr: tradeAmount, amountUsd: stepTradeUsd, price: currentPrice, tokenSymbol });
+                    matchResult.trades.push({ buyer: uid, seller: 'system', amountSyr: tradeAmount, amountUsd: stepTradeUsd, price: newPrice, tokenSymbol, _recorded: true });
                     matchResult.executedSyr  = fixDust(matchResult.executedSyr  + tradeAmount);
                     matchResult.remaining    = fixDust(matchResult.remaining    - tradeAmount);
                     matchResult.totalUsdCost = fixDust(matchResult.totalUsdCost + stepTradeUsd);
@@ -1932,11 +2009,45 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
             }
         }
 
+        // ── SYR SELL-side AMM — allows users to sell SYR back to the system pool ──
+        if (side === 'SELL' && matchResult.remaining > 1e-8 && tokenSymbol === 'SYR') {
+            nexusChain.state.initPool('SYR');
+            const lp = nexusChain.state.liquidityPools['SYR'];
+
+            if (lp.tokenReserve > 0 && lp.usdReserve > 0) {
+                const preTradePrice = lp.usdReserve / lp.tokenReserve;
+                let fillAmount = fixDust(Math.min(matchResult.remaining, lp.usdReserve / preTradePrice * 0.95));
+                const fillUsd  = fixDust(fillAmount * preTradePrice);
+
+                if (fillAmount > 1e-8 && fillUsd > 1e-8) {
+                    await mempool.addTransaction({
+                        from: uid, to: 'system',
+                        amount: fillAmount, amountUsd: fillUsd,
+                        type: 'MARKET_TRADE', tokenSymbol: 'SYR',
+                        timestamp: Date.now(), isSystemGenerated: true
+                    });
+
+                    lp.tokenReserve = fixDust(lp.tokenReserve + fillAmount);
+                    lp.usdReserve   = fixDust(lp.usdReserve - fillUsd);
+                    const newPrice   = fixDust(lp.usdReserve / lp.tokenReserve);
+
+                    currentPrice = newPrice;
+                    menuBook.books['SYR'].lastTradePrice = newPrice;
+
+                    matchResult.trades.push({ buyer: 'system', seller: uid, amountSyr: fillAmount, amountUsd: fillUsd, price: newPrice, tokenSymbol: 'SYR', _recorded: true });
+                    matchResult.executedSyr  = fixDust(matchResult.executedSyr  + fillAmount);
+                    matchResult.remaining    = fixDust(matchResult.remaining    - fillAmount);
+                    matchResult.totalUsdCost = fixDust(matchResult.totalUsdCost + fillUsd);
+                }
+            }
+        }
+
         if (matchResult.trades.length === 0)
             return res.status(400).json({ error: 'No liquidity available in Menu Book to match order.' });
 
+        // Record order-book matches to mempool (skip AMM fills already recorded)
         for (const trade of matchResult.trades) {
-            if (trade.seller !== 'system') {
+            if (!trade._recorded && trade.seller !== 'system') {
                 await mempool.addTransaction({
                     from: trade.seller, to: trade.buyer,
                     amount: trade.amountSyr, amountUsd: trade.amountUsd,
@@ -1961,11 +2072,28 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
         // Issue 4 Fix: Invalidate per-token stats cache so price refreshes immediately
         apiCache.tokenStats.delete(tokenSymbol);
 
+        // ── Trading Fee Collection ─────────────────────────────────────────────
+        const feeRate = getCurrentFeeRate();
+        const feeUsd  = fixDust(matchResult.totalUsdCost * feeRate);
+
+        if (feeUsd > 1e-8) {
+            await mempool.addTransaction({
+                from: uid, to: 'system',
+                amount: feeUsd, type: 'USD_WITHDRAWAL',
+                timestamp: Date.now(), isSystemGenerated: true,
+                description: `Trading fee (${(feeRate * 100).toFixed(2)}%)`
+            });
+        }
+
         res.status(201).json({
             message: 'Market order executed',
             executedSyr:       matchResult.executedSyr,
             remainingUnfilled: matchResult.remaining,
             totalUsdCost:      matchResult.totalUsdCost,
+            feeAmount:         feeUsd,
+            feeRate:           feeRate,
+            feePercentage:     (feeRate * 100).toFixed(2) + '%',
+            netUsdCost:        fixDust(matchResult.totalUsdCost + feeUsd),
             slippagePercentage: (matchResult.slippage * 100).toFixed(2) + '%',
             trades: matchResult.trades
         });

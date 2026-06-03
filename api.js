@@ -701,6 +701,16 @@ async function refreshAllPoolOrders() {
         }
     } catch(e) { /* table may not exist on first boot */ }
 
+    // UPGRADE: Include OpenChain tokens (nx_open_*) in AMM market-making.
+    // Previously only DelChain tokens (nx_sys_*) from system_handlers were included.
+    // OpenChain tokens store their system address in the open_token_supply table.
+    try {
+        const openRows = await pool.query('SELECT ticker, system_address FROM open_token_supply');
+        for (const row of openRows.rows) {
+            tickersToProcess.add(row.ticker);
+        }
+    } catch(e) { /* table may not exist on first boot */ }
+
             for (const ticker of tickersToProcess) {
             // Skip standard AMM for native and stablecoins
             if (ticker === 'SYR' || ticker === 'SDX' || ticker === 'SDTX') continue; 
@@ -713,11 +723,12 @@ async function refreshAllPoolOrders() {
             book[side] = book[side].filter(o => o.uid !== 'system');
         });
 
-        // FIX: aggregate tokens from BOTH 'system' address AND any nx_sys_ handler for this ticker.
-        // The creator sends tokens to nx_sys_... but the system needs to use them for market-making.
+        // FIX: aggregate tokens from BOTH 'system' address AND any nx_sys_/nx_open_ handler for this ticker.
+        // The creator sends tokens to nx_sys_/nx_open_... but the system needs to use them for market-making.
         let combinedTokenBal = nexusChain.state.getBalance('system', ticker);
         let handlerAddress   = null;
         try {
+            // Check DelChain system handlers (nx_sys_*)
             const hRow = await pool.query(
                 'SELECT system_address FROM system_handlers WHERE token_symbol = $1 LIMIT 1',
                 [ticker]
@@ -727,6 +738,19 @@ async function refreshAllPoolOrders() {
                 combinedTokenBal += nexusChain.state.getBalance(handlerAddress, ticker);
             }
         } catch(e) {}
+        // UPGRADE: Also check OpenChain system addresses (nx_open_*)
+        if (!handlerAddress) {
+            try {
+                const oRow = await pool.query(
+                    'SELECT system_address FROM open_token_supply WHERE ticker = $1 LIMIT 1',
+                    [ticker]
+                );
+                if (oRow.rows.length > 0) {
+                    handlerAddress = oRow.rows[0].system_address;
+                    combinedTokenBal += nexusChain.state.getBalance(handlerAddress, ticker);
+                }
+            } catch(e) {}
+        }
 
                 // Determine pool price: use liquidityPool if available, else derive from menubook last price
         const hardPeg = await getHardPeg(ticker);
@@ -755,8 +779,10 @@ async function refreshAllPoolOrders() {
             }
         }
 
-        // Order size: 1% of combined available tokens, capped at 10,000 per side
-        const rawOrderSize = Math.min(parseFloat((combinedTokenBal * 0.01).toFixed(8)), 10_000);
+        // UPGRADE: Dynamic order size — 5% of combined pool tokens, NO fixed upper limit.
+        // Previously capped at 10,000 per side which artificially restricted large pools.
+        // Now large pools naturally offer larger orders, matching real DeFi market-making.
+        const rawOrderSize = parseFloat((combinedTokenBal * 0.05).toFixed(8));
         if (rawOrderSize < 1e-6) continue;
 
         // ±2.5% spread for free-floating tokens; exact peg for SDX/SDTX
@@ -1775,7 +1801,7 @@ app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
 // ─── Market Orders ────────────────────────────────────────────────────────────
 app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
-        const { side, amountSyr, tokenSymbol = 'SYR' } = req.body;
+        const { side, amountSyr, tokenSymbol = 'SYR', maxSlippage } = req.body;
         const uid          = req.user.uid;
 
         // KYC gate removed — identity verification no longer required to trade.
@@ -1789,6 +1815,16 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
 
         if (!['BUY', 'SELL'].includes(side) || isNaN(parsedAmount) || parsedAmount <= 0)
             return res.status(400).json({ error: 'Invalid market order parameters.' });
+
+        // UPGRADE: Minimum trade value enforcement — reject dust trades worth < $0.01
+        const seedPrice = menuBook.books[tokenSymbol]?.lastTradePrice || await getSeedPrice(tokenSymbol);
+        if (seedPrice > 0 && parsedAmount * seedPrice < 0.01 && tokenSymbol !== 'SYR') {
+            return res.status(400).json({ error: 'Trade too small. Minimum trade value is $0.01.' });
+        }
+
+        // UPGRADE: User-configurable slippage tolerance (default 5%, max 50%)
+        const userMaxSlippage = Math.min(parseFloat(maxSlippage) || 0.05, 0.50);
+        const preTradePrice   = menuBook.books[tokenSymbol]?.lastTradePrice || seedPrice || 0;
 
         const availableUsd   = nexusChain.state.getUsd(uid) - menuBook.getLockedUsd(uid, tokenSymbol) - mempool.getPendingUsdSpend(uid);
         const availableToken = nexusChain.getBalance(uid, tokenSymbol) - menuBook.getLockedToken(uid, tokenSymbol) - mempool.getPendingTokenSpend(uid, tokenSymbol);
@@ -1837,117 +1873,236 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
             }
         }
 
-        // ── FIX Issue 4: AMM fallback for custom tokens ────────────────────────────
-        // For custom tokens with a system handler (nx_sys_ address), if the orderbook
-        // has no matching sell orders, fill from the system handler's token balance at
-        // the current pool price. This makes the "Remaining Supply" (tokens sent to the
-        // system handler) actually serve as automated market-maker liquidity.
+        // ── UPGRADE: Chunked BUY-Side AMM for Custom Tokens (x×y=k) ────────────
+        // Real DeFi constant-product AMM: large buys cause exponential price increase.
+        // Each chunk recalculates pool price before the next fill, so buying 100K tokens
+        // at $0.01 doesn't stay at $0.01 — it climbs to $0.012, $0.015, $0.02, etc.
+        // Also supports OpenChain tokens (nx_open_*) alongside DelChain (nx_sys_*).
         if (side === 'BUY' && matchResult.remaining > 1e-8 && tokenSymbol !== 'SYR') {
             try {
-                // Find the system handler address for this token
+                // Find system handler: check DelChain (nx_sys_*) first, then OpenChain (nx_open_*)
+                let handlerAddr = null;
                 const hRow = await pool.query(
                     'SELECT system_address FROM system_handlers WHERE token_symbol = $1 LIMIT 1',
                     [tokenSymbol]
                 );
-                                if (hRow.rows.length > 0) {
-                                        const handlerAddr = hRow.rows[0].system_address;
+                if (hRow.rows.length > 0) {
+                    handlerAddr = hRow.rows[0].system_address;
+                } else {
+                    // UPGRADE: Also check OpenChain system addresses
+                    const oRow = await pool.query(
+                        'SELECT system_address FROM open_token_supply WHERE ticker = $1 LIMIT 1',
+                        [tokenSymbol]
+                    );
+                    if (oRow.rows.length > 0) handlerAddr = oRow.rows[0].system_address;
+                }
+
+                if (handlerAddr) {
                     const handlerBal  = nexusChain.state.getBalance(handlerAddr, tokenSymbol)
                                       - mempool.getPendingTokenSpend(handlerAddr, tokenSymbol);
                     
-                    // PHASE 2 FIX: Force the pool price to the rigid FDX peg
                     const hardPeg     = await getHardPeg(tokenSymbol);
-                    const poolPrice   = hardPeg || nexusChain.state.getPoolPrice(tokenSymbol) || (menuBook.books[tokenSymbol]?.lastTradePrice || 0);
-
-                    if (handlerBal > 1e-8 && poolPrice > 0) {
-                        let fillAmount  = fixDust(Math.min(matchResult.remaining, handlerBal));
-                        const fillUsd   = fixDust(fillAmount * poolPrice);
-                        const remaining = fundsToCheck - matchResult.totalUsdCost;
-
-                        // Respect buyer's USD budget
-                        if (fillUsd > remaining) {
-                            fillAmount = fixDust(remaining / poolPrice);
+                    
+                    // Initialize pool state
+                    nexusChain.state.initPool(tokenSymbol);
+                    const lp = nexusChain.state.liquidityPools[tokenSymbol];
+                    
+                    // Bootstrap pool reserves if empty
+                    if (lp.tokenReserve <= 0 || lp.usdReserve <= 0) {
+                        const initialPrice = hardPeg || menuBook.books[tokenSymbol]?.lastTradePrice || await getSeedPrice(tokenSymbol);
+                        if (initialPrice > 0 && handlerBal > 0) {
+                            lp.tokenReserve = handlerBal;
+                            lp.usdReserve   = fixDust(handlerBal * initialPrice);
                         }
+                    }
 
-                        if (fillAmount > 1e-8) {
-                            // Record the AMM fill as a MARKET_TRADE from the handler address
+                    if (handlerBal > 1e-8 && lp.tokenReserve > 0 && lp.usdReserve > 0) {
+                        // CHUNKED EXECUTION: Break large orders into small fills
+                        // Chunk size = max(100 tokens, 0.1% of pool token reserve)
+                        const chunkSize      = Math.max(100, fixDust(lp.tokenReserve * 0.001));
+                        let   totalRemaining = matchResult.remaining;
+                        let   totalHandlerBal = handlerBal;
+                        let   budgetRemaining = fundsToCheck - matchResult.totalUsdCost;
+                        let   slippageExceeded = false;
+                        const ammStartPrice   = hardPeg || fixDust(lp.usdReserve / lp.tokenReserve);
+                        let   chunkCount       = 0;
+                        const MAX_CHUNKS       = 500; // Safety cap to prevent infinite loops
+
+                        while (totalRemaining > 1e-8 && totalHandlerBal > 1e-8 && budgetRemaining > 1e-8 && chunkCount < MAX_CHUNKS) {
+                            chunkCount++;
+                            const currentPoolPrice = hardPeg || fixDust(lp.usdReserve / lp.tokenReserve);
+
+                            // SLIPPAGE CHECK: Stop if price has moved beyond user's tolerance
+                            if (!hardPeg && ammStartPrice > 0) {
+                                const currentSlippage = (currentPoolPrice - ammStartPrice) / ammStartPrice;
+                                if (currentSlippage > userMaxSlippage) {
+                                    slippageExceeded = true;
+                                    break;
+                                }
+                            }
+
+                            // Determine chunk fill amount
+                            let chunkFill = fixDust(Math.min(totalRemaining, chunkSize, totalHandlerBal));
+                            const chunkUsd = fixDust(chunkFill * currentPoolPrice);
+
+                            // Respect buyer's USD budget
+                            if (chunkUsd > budgetRemaining) {
+                                chunkFill = fixDust(budgetRemaining / currentPoolPrice);
+                            }
+                            if (chunkFill < 1e-8) break;
+
+                            const actualChunkUsd = fixDust(chunkFill * currentPoolPrice);
+
+                            // Record the AMM fill
                             await mempool.addTransaction({
                                 from: handlerAddr, to: uid,
-                                amount: fillAmount, amountUsd: fixDust(fillAmount * poolPrice),
+                                amount: chunkFill, amountUsd: actualChunkUsd,
                                 type: 'MARKET_TRADE', tokenSymbol,
                                 timestamp: Date.now(), isSystemGenerated: true
                             });
 
-                            // Update pool state: usdReserve increases, tokenReserve decreases
-                            nexusChain.state.initPool(tokenSymbol);
-                            const lp = nexusChain.state.liquidityPools[tokenSymbol];
-                            lp.tokenReserve = fixDust(lp.tokenReserve - fillAmount);
-                            lp.usdReserve   = fixDust(lp.usdReserve   + fixDust(fillAmount * poolPrice));
-                            // Compute new price from UPDATED reserves (x*y=k constant-product).
-                            const newAmmPrice = lp.tokenReserve > 0 ? fixDust(lp.usdReserve / lp.tokenReserve) : poolPrice;
-                            menuBook.books[tokenSymbol].lastTradePrice = newAmmPrice;
-                            // Invalidate per-token stats cache so next /stats returns the updated price
-                            apiCache.tokenStats.delete(tokenSymbol);
+                            // Update pool reserves (x×y=k constant-product)
+                            lp.tokenReserve = fixDust(lp.tokenReserve - chunkFill);
+                            lp.usdReserve   = fixDust(lp.usdReserve   + actualChunkUsd);
+                            const newChunkPrice = lp.tokenReserve > 0 ? fixDust(lp.usdReserve / lp.tokenReserve) : currentPoolPrice;
 
-                            const fillExecUsd = fixDust(fillAmount * newAmmPrice);
-                            matchResult.trades.push({ buyer: uid, seller: handlerAddr, amountSyr: fillAmount, amountUsd: fillExecUsd, price: newAmmPrice, tokenSymbol, _recorded: true });
-                            matchResult.executedSyr  = fixDust(matchResult.executedSyr  + fillAmount);
-                            matchResult.remaining    = fixDust(matchResult.remaining    - fillAmount);
-                            matchResult.totalUsdCost = fixDust(matchResult.totalUsdCost + fillExecUsd);
+                            matchResult.trades.push({
+                                buyer: uid, seller: handlerAddr,
+                                amountSyr: chunkFill, amountUsd: actualChunkUsd,
+                                price: newChunkPrice, tokenSymbol, _recorded: true
+                            });
+                            matchResult.executedSyr  = fixDust(matchResult.executedSyr  + chunkFill);
+                            matchResult.remaining    = fixDust(matchResult.remaining    - chunkFill);
+                            matchResult.totalUsdCost = fixDust(matchResult.totalUsdCost + actualChunkUsd);
+
+                            totalRemaining   = fixDust(totalRemaining - chunkFill);
+                            totalHandlerBal  = fixDust(totalHandlerBal - chunkFill);
+                            budgetRemaining  = fixDust(budgetRemaining - actualChunkUsd);
                         }
+
+                        // Update menubook last trade price with final pool price
+                        const finalPoolPrice = lp.tokenReserve > 0 ? fixDust(lp.usdReserve / lp.tokenReserve) : ammStartPrice;
+                        menuBook.books[tokenSymbol].lastTradePrice = finalPoolPrice;
+                        apiCache.tokenStats.delete(tokenSymbol);
+
+                        // Record slippage info for response
+                        if (slippageExceeded) {
+                            matchResult.slippageExceeded = true;
+                            matchResult.maxSlippageHit   = userMaxSlippage;
+                        }
+
+                        console.log(chalk.cyan(`[AMM BUY] ${tokenSymbol}: ${chunkCount} chunks, price $${ammStartPrice.toFixed(6)} → $${finalPoolPrice.toFixed(6)} (${((finalPoolPrice-ammStartPrice)/ammStartPrice*100).toFixed(2)}% impact)`));
                     }
                 }
             } catch (ammErr) {
-                console.warn(chalk.yellow(`[AMM] Custom token fallback error for ${tokenSymbol}:`), ammErr.message);
+                console.warn(chalk.yellow(`[AMM] Custom token BUY fallback error for ${tokenSymbol}:`), ammErr.message);
             }
         }
 
-        // ── FIX A3: SELL-Side AMM fallback for custom tokens ────────────────────────────
-        // If a user wants to sell an FDX token and no buyers exist, the System Handler
-        // will buy it from them using its USD reserve at the current pool price.
+        // ── UPGRADE: Chunked SELL-Side AMM for Custom Tokens (x×y=k) ───────────
+        // Large sells cause exponential price decrease per chunk, matching real DeFi.
+        // Also supports OpenChain tokens (nx_open_*) alongside DelChain (nx_sys_*).
         if (side === 'SELL' && matchResult.remaining > 1e-8 && tokenSymbol !== 'SYR' && !['SDX', 'SDTX'].includes(tokenSymbol)) {
             try {
+                // Find system handler: check DelChain first, then OpenChain
+                let handlerAddr = null;
                 const hRow = await pool.query('SELECT system_address FROM system_handlers WHERE token_symbol = $1 LIMIT 1', [tokenSymbol]);
                 if (hRow.rows.length > 0) {
-                    const handlerAddr = hRow.rows[0].system_address;
-                    
-                    // Force pool price to the rigid FDX peg
-                    const hardPeg     = await getHardPeg(tokenSymbol);
-                    const poolPrice   = hardPeg || nexusChain.state.getPoolPrice(tokenSymbol) || (menuBook.books[tokenSymbol]?.lastTradePrice || 0);
+                    handlerAddr = hRow.rows[0].system_address;
+                } else {
+                    const oRow = await pool.query('SELECT system_address FROM open_token_supply WHERE ticker = $1 LIMIT 1', [tokenSymbol]);
+                    if (oRow.rows.length > 0) handlerAddr = oRow.rows[0].system_address;
+                }
 
-                    // Check if handler has enough USD to buy
+                if (handlerAddr) {
+                    const hardPeg = await getHardPeg(tokenSymbol);
+
+                    // Initialize pool state
+                    nexusChain.state.initPool(tokenSymbol);
+                    const lp = nexusChain.state.liquidityPools[tokenSymbol];
+
+                    // Bootstrap pool reserves if empty
+                    if (lp.tokenReserve <= 0 || lp.usdReserve <= 0) {
+                        const initPrice = hardPeg || menuBook.books[tokenSymbol]?.lastTradePrice || await getSeedPrice(tokenSymbol);
+                        const handlerBal = nexusChain.state.getBalance(handlerAddr, tokenSymbol);
+                        if (initPrice > 0 && handlerBal > 0) {
+                            lp.tokenReserve = handlerBal;
+                            lp.usdReserve   = fixDust(handlerBal * initPrice);
+                        }
+                    }
+
                     const handlerUsdBal = nexusChain.state.getUsd(handlerAddr) - mempool.getPendingUsdSpend(handlerAddr);
-                    
-                    if (handlerUsdBal > 1e-8 && poolPrice > 0) {
-                        // Max amount of tokens the handler can afford
-                        const maxAffordableTokens = fixDust(handlerUsdBal / poolPrice);
-                        let fillAmount = fixDust(Math.min(matchResult.remaining, maxAffordableTokens));
-                        
-                        if (fillAmount > 1e-8) {
-                            const fillUsd = fixDust(fillAmount * poolPrice);
 
-                            // The user sells tokens to the handler
+                    if (handlerUsdBal > 1e-8 && lp.tokenReserve > 0 && lp.usdReserve > 0) {
+                        // CHUNKED EXECUTION for sells
+                        const chunkSize       = Math.max(100, fixDust(lp.tokenReserve * 0.001));
+                        let   totalRemaining  = matchResult.remaining;
+                        let   usdBudget       = handlerUsdBal;
+                        let   slippageExceeded = false;
+                        const ammStartPrice   = hardPeg || fixDust(lp.usdReserve / lp.tokenReserve);
+                        let   chunkCount       = 0;
+                        const MAX_CHUNKS       = 500;
+
+                        while (totalRemaining > 1e-8 && usdBudget > 1e-8 && chunkCount < MAX_CHUNKS) {
+                            chunkCount++;
+                            const currentPoolPrice = hardPeg || fixDust(lp.usdReserve / lp.tokenReserve);
+
+                            // SLIPPAGE CHECK: Stop if price has dropped beyond tolerance
+                            if (!hardPeg && ammStartPrice > 0) {
+                                const currentSlippage = (ammStartPrice - currentPoolPrice) / ammStartPrice;
+                                if (currentSlippage > userMaxSlippage) {
+                                    slippageExceeded = true;
+                                    break;
+                                }
+                            }
+
+                            let chunkFill = fixDust(Math.min(totalRemaining, chunkSize));
+                            const chunkUsd = fixDust(chunkFill * currentPoolPrice);
+
+                            // Respect handler's USD budget
+                            if (chunkUsd > usdBudget) {
+                                chunkFill = fixDust(usdBudget / currentPoolPrice);
+                            }
+                            if (chunkFill < 1e-8) break;
+
+                            const actualChunkUsd = fixDust(chunkFill * currentPoolPrice);
+
+                            // User sells tokens to the handler
                             await mempool.addTransaction({
                                 from: uid, to: handlerAddr,
-                                amount: fillAmount, amountUsd: fillUsd,
+                                amount: chunkFill, amountUsd: actualChunkUsd,
                                 type: 'MARKET_TRADE', tokenSymbol,
                                 timestamp: Date.now(), isSystemGenerated: true
                             });
 
-                            // Update pool state: usdReserve decreases, tokenReserve increases
-                            nexusChain.state.initPool(tokenSymbol);
-                            const lp = nexusChain.state.liquidityPools[tokenSymbol];
-                            lp.tokenReserve = fixDust(lp.tokenReserve + fillAmount);
-                            lp.usdReserve   = fixDust(lp.usdReserve   - fillUsd);
-                            // Post-trade pool price — price DECREASES on sells (no Math.max guard)
-                            const newAmmSellPrice = lp.tokenReserve > 0 ? fixDust(lp.usdReserve / lp.tokenReserve) : poolPrice;
-                            menuBook.books[tokenSymbol].lastTradePrice = newAmmSellPrice;
-                            apiCache.tokenStats.delete(tokenSymbol);
+                            // Update pool reserves — price DECREASES on sells
+                            lp.tokenReserve = fixDust(lp.tokenReserve + chunkFill);
+                            lp.usdReserve   = fixDust(lp.usdReserve   - actualChunkUsd);
+                            const newChunkPrice = lp.tokenReserve > 0 ? fixDust(lp.usdReserve / lp.tokenReserve) : currentPoolPrice;
 
-                            matchResult.trades.push({ buyer: handlerAddr, seller: uid, amountSyr: fillAmount, amountUsd: fillUsd, price: newAmmSellPrice, tokenSymbol, _recorded: true });
-                            matchResult.executedSyr  = fixDust(matchResult.executedSyr  + fillAmount);
-                            matchResult.remaining    = fixDust(matchResult.remaining    - fillAmount);
-                            matchResult.totalUsdCost = fixDust(matchResult.totalUsdCost + fillUsd);
+                            matchResult.trades.push({
+                                buyer: handlerAddr, seller: uid,
+                                amountSyr: chunkFill, amountUsd: actualChunkUsd,
+                                price: newChunkPrice, tokenSymbol, _recorded: true
+                            });
+                            matchResult.executedSyr  = fixDust(matchResult.executedSyr  + chunkFill);
+                            matchResult.remaining    = fixDust(matchResult.remaining    - chunkFill);
+                            matchResult.totalUsdCost = fixDust(matchResult.totalUsdCost + actualChunkUsd);
+
+                            totalRemaining = fixDust(totalRemaining - chunkFill);
+                            usdBudget      = fixDust(usdBudget - actualChunkUsd);
                         }
+
+                        const finalPoolPrice = lp.tokenReserve > 0 ? fixDust(lp.usdReserve / lp.tokenReserve) : ammStartPrice;
+                        menuBook.books[tokenSymbol].lastTradePrice = finalPoolPrice;
+                        apiCache.tokenStats.delete(tokenSymbol);
+
+                        if (slippageExceeded) {
+                            matchResult.slippageExceeded = true;
+                            matchResult.maxSlippageHit   = userMaxSlippage;
+                        }
+
+                        console.log(chalk.cyan(`[AMM SELL] ${tokenSymbol}: ${chunkCount} chunks, price $${ammStartPrice.toFixed(6)} → $${finalPoolPrice.toFixed(6)} (${((ammStartPrice-finalPoolPrice)/ammStartPrice*100).toFixed(2)}% impact)`));
                     }
                 }
             } catch (ammErr) {
@@ -1955,15 +2110,14 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
             }
         }
 
-        // ── SYR BUY-side AMM fallback — Persistent constant-product pool (x*y=k) ──
-        // Uses 5% of circulating supply as virtual reserve for lower volatility.
+        // ── UPGRADE: Chunked SYR BUY-side AMM (x×y=k) ──────────────────────────
+        // Large SYR buys now cause exponential price increase per chunk.
         if (side === 'BUY' && matchResult.remaining > 1e-8 && tokenSymbol === 'SYR') {
             const systemBalance = nexusChain.getBalance('system', tokenSymbol) - mempool.getPendingTokenSpend('system', tokenSymbol);
             const SYR_SYSTEM_MINT_CAP = MAX_SUPPLY * 0.02;
             const cappedSystemBalance = Math.min(systemBalance, SYR_SYSTEM_MINT_CAP);
 
             if (cappedSystemBalance > 0) {
-                // Use persistent pool state (same x*y=k as custom tokens)
                 nexusChain.state.initPool('SYR');
                 const lp = nexusChain.state.liquidityPools['SYR'];
 
@@ -1974,71 +2128,134 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                     lp.usdReserve = lp.tokenReserve * currentPrice;
                 }
 
-                let tradeAmount = Math.min(matchResult.remaining, cappedSystemBalance);
-                const preTradePrice = lp.usdReserve / lp.tokenReserve;
-                let stepTradeUsd    = fixDust(tradeAmount * preTradePrice);
-                let maxAffordableUsd = fundsToCheck - matchResult.totalUsdCost;
+                // CHUNKED EXECUTION for SYR buys
+                const chunkSize       = Math.max(500, fixDust(lp.tokenReserve * 0.001));
+                let   totalRemaining  = Math.min(matchResult.remaining, cappedSystemBalance);
+                let   budgetRemaining = fundsToCheck - matchResult.totalUsdCost;
+                const ammStartPrice   = fixDust(lp.usdReserve / lp.tokenReserve);
+                let   slippageExceeded = false;
+                let   chunkCount       = 0;
+                const MAX_CHUNKS       = 500;
 
-                if (maxAffordableUsd < stepTradeUsd) {
-                    tradeAmount  = fixDust(maxAffordableUsd / preTradePrice);
-                    stepTradeUsd = maxAffordableUsd;
-                }
+                while (totalRemaining > 1e-8 && budgetRemaining > 1e-8 && chunkCount < MAX_CHUNKS) {
+                    chunkCount++;
+                    const currentPoolPrice = fixDust(lp.usdReserve / lp.tokenReserve);
 
-                if (tradeAmount > 1e-8) {
+                    // Slippage check
+                    if (ammStartPrice > 0) {
+                        const currentSlippage = (currentPoolPrice - ammStartPrice) / ammStartPrice;
+                        if (currentSlippage > userMaxSlippage) { slippageExceeded = true; break; }
+                    }
+
+                    let chunkFill = fixDust(Math.min(totalRemaining, chunkSize));
+                    let chunkUsd  = fixDust(chunkFill * currentPoolPrice);
+
+                    if (chunkUsd > budgetRemaining) {
+                        chunkFill = fixDust(budgetRemaining / currentPoolPrice);
+                        chunkUsd  = budgetRemaining;
+                    }
+                    if (chunkFill < 1e-8) break;
+
+                    const actualChunkUsd = fixDust(chunkFill * currentPoolPrice);
+
                     await mempool.addTransaction({
                         from: 'system', to: uid,
-                        amount: tradeAmount, amountUsd: stepTradeUsd,
+                        amount: chunkFill, amountUsd: actualChunkUsd,
                         type: 'MARKET_TRADE', tokenSymbol,
                         timestamp: Date.now(), isSystemGenerated: true
                     });
 
-                    // Update persistent pool reserves (x*y=k)
-                    lp.tokenReserve = fixDust(lp.tokenReserve - tradeAmount);
-                    lp.usdReserve   = fixDust(lp.usdReserve + stepTradeUsd);
-                    const newPrice   = fixDust(lp.usdReserve / lp.tokenReserve);
+                    lp.tokenReserve = fixDust(lp.tokenReserve - chunkFill);
+                    lp.usdReserve   = fixDust(lp.usdReserve + actualChunkUsd);
+                    const newChunkPrice = fixDust(lp.usdReserve / lp.tokenReserve);
 
-                    currentPrice = newPrice;
-                    menuBook.books[tokenSymbol].lastTradePrice = newPrice;
-                    await menuBook.saveOrders(tokenSymbol);
+                    matchResult.trades.push({ buyer: uid, seller: 'system', amountSyr: chunkFill, amountUsd: actualChunkUsd, price: newChunkPrice, tokenSymbol, _recorded: true });
+                    matchResult.executedSyr  = fixDust(matchResult.executedSyr  + chunkFill);
+                    matchResult.remaining    = fixDust(matchResult.remaining    - chunkFill);
+                    matchResult.totalUsdCost = fixDust(matchResult.totalUsdCost + actualChunkUsd);
 
-                    matchResult.trades.push({ buyer: uid, seller: 'system', amountSyr: tradeAmount, amountUsd: stepTradeUsd, price: newPrice, tokenSymbol, _recorded: true });
-                    matchResult.executedSyr  = fixDust(matchResult.executedSyr  + tradeAmount);
-                    matchResult.remaining    = fixDust(matchResult.remaining    - tradeAmount);
-                    matchResult.totalUsdCost = fixDust(matchResult.totalUsdCost + stepTradeUsd);
+                    totalRemaining  = fixDust(totalRemaining - chunkFill);
+                    budgetRemaining = fixDust(budgetRemaining - actualChunkUsd);
                 }
+
+                const finalPrice = fixDust(lp.usdReserve / lp.tokenReserve);
+                currentPrice = finalPrice;
+                menuBook.books[tokenSymbol].lastTradePrice = finalPrice;
+                await menuBook.saveOrders(tokenSymbol);
+
+                if (slippageExceeded) {
+                    matchResult.slippageExceeded = true;
+                    matchResult.maxSlippageHit   = userMaxSlippage;
+                }
+                if (chunkCount > 0) console.log(chalk.cyan(`[AMM SYR BUY] ${chunkCount} chunks, price $${ammStartPrice.toFixed(6)} → $${finalPrice.toFixed(6)}`));
             }
         }
 
-        // ── SYR SELL-side AMM — allows users to sell SYR back to the system pool ──
+        // ── UPGRADE: Chunked SYR SELL-side AMM (x×y=k) ─────────────────────────
+        // Large SYR sells now cause exponential price decrease per chunk.
         if (side === 'SELL' && matchResult.remaining > 1e-8 && tokenSymbol === 'SYR') {
             nexusChain.state.initPool('SYR');
             const lp = nexusChain.state.liquidityPools['SYR'];
 
             if (lp.tokenReserve > 0 && lp.usdReserve > 0) {
-                const preTradePrice = lp.usdReserve / lp.tokenReserve;
-                let fillAmount = fixDust(Math.min(matchResult.remaining, lp.usdReserve / preTradePrice * 0.95));
-                const fillUsd  = fixDust(fillAmount * preTradePrice);
+                const chunkSize       = Math.max(500, fixDust(lp.tokenReserve * 0.001));
+                let   totalRemaining  = matchResult.remaining;
+                // Cap sells at 95% of USD reserve to prevent pool drain
+                let   usdBudget       = fixDust(lp.usdReserve * 0.95);
+                const ammStartPrice   = fixDust(lp.usdReserve / lp.tokenReserve);
+                let   slippageExceeded = false;
+                let   chunkCount       = 0;
+                const MAX_CHUNKS       = 500;
 
-                if (fillAmount > 1e-8 && fillUsd > 1e-8) {
+                while (totalRemaining > 1e-8 && usdBudget > 1e-8 && chunkCount < MAX_CHUNKS) {
+                    chunkCount++;
+                    const currentPoolPrice = fixDust(lp.usdReserve / lp.tokenReserve);
+
+                    // Slippage check
+                    if (ammStartPrice > 0) {
+                        const currentSlippage = (ammStartPrice - currentPoolPrice) / ammStartPrice;
+                        if (currentSlippage > userMaxSlippage) { slippageExceeded = true; break; }
+                    }
+
+                    let chunkFill = fixDust(Math.min(totalRemaining, chunkSize));
+                    const chunkUsd = fixDust(chunkFill * currentPoolPrice);
+
+                    if (chunkUsd > usdBudget) {
+                        chunkFill = fixDust(usdBudget / currentPoolPrice);
+                    }
+                    if (chunkFill < 1e-8) break;
+
+                    const actualChunkUsd = fixDust(chunkFill * currentPoolPrice);
+
                     await mempool.addTransaction({
                         from: uid, to: 'system',
-                        amount: fillAmount, amountUsd: fillUsd,
+                        amount: chunkFill, amountUsd: actualChunkUsd,
                         type: 'MARKET_TRADE', tokenSymbol: 'SYR',
                         timestamp: Date.now(), isSystemGenerated: true
                     });
 
-                    lp.tokenReserve = fixDust(lp.tokenReserve + fillAmount);
-                    lp.usdReserve   = fixDust(lp.usdReserve - fillUsd);
-                    const newPrice   = fixDust(lp.usdReserve / lp.tokenReserve);
+                    lp.tokenReserve = fixDust(lp.tokenReserve + chunkFill);
+                    lp.usdReserve   = fixDust(lp.usdReserve - actualChunkUsd);
+                    const newChunkPrice = fixDust(lp.usdReserve / lp.tokenReserve);
 
-                    currentPrice = newPrice;
-                    menuBook.books['SYR'].lastTradePrice = newPrice;
+                    matchResult.trades.push({ buyer: 'system', seller: uid, amountSyr: chunkFill, amountUsd: actualChunkUsd, price: newChunkPrice, tokenSymbol: 'SYR', _recorded: true });
+                    matchResult.executedSyr  = fixDust(matchResult.executedSyr  + chunkFill);
+                    matchResult.remaining    = fixDust(matchResult.remaining    - chunkFill);
+                    matchResult.totalUsdCost = fixDust(matchResult.totalUsdCost + actualChunkUsd);
 
-                    matchResult.trades.push({ buyer: 'system', seller: uid, amountSyr: fillAmount, amountUsd: fillUsd, price: newPrice, tokenSymbol: 'SYR', _recorded: true });
-                    matchResult.executedSyr  = fixDust(matchResult.executedSyr  + fillAmount);
-                    matchResult.remaining    = fixDust(matchResult.remaining    - fillAmount);
-                    matchResult.totalUsdCost = fixDust(matchResult.totalUsdCost + fillUsd);
+                    totalRemaining = fixDust(totalRemaining - chunkFill);
+                    usdBudget      = fixDust(usdBudget - actualChunkUsd);
                 }
+
+                const finalPrice = lp.tokenReserve > 0 ? fixDust(lp.usdReserve / lp.tokenReserve) : ammStartPrice;
+                currentPrice = finalPrice;
+                menuBook.books['SYR'].lastTradePrice = finalPrice;
+
+                if (slippageExceeded) {
+                    matchResult.slippageExceeded = true;
+                    matchResult.maxSlippageHit   = userMaxSlippage;
+                }
+                if (chunkCount > 0) console.log(chalk.cyan(`[AMM SYR SELL] ${chunkCount} chunks, price $${ammStartPrice.toFixed(6)} → $${finalPrice.toFixed(6)}`));
             }
         }
 
@@ -2085,6 +2302,24 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
             });
         }
 
+        // UPGRADE: Broadcast TRADE_EXECUTED for real-time trade activity feed
+        if (global.broadcastWS) {
+            for (const trade of matchResult.trades) {
+                global.broadcastWS('TRADE_EXECUTED', {
+                    token: tokenSymbol,
+                    side: trade.buyer === uid ? 'BUY' : 'SELL',
+                    amount: trade.amountSyr,
+                    price: trade.price,
+                    amountUsd: trade.amountUsd,
+                    timestamp: Date.now()
+                });
+            }
+        }
+
+        // UPGRADE: Calculate price impact for response
+        const postTradePrice = menuBook.books[tokenSymbol]?.lastTradePrice || 0;
+        const priceImpact = preTradePrice > 0 ? Math.abs((postTradePrice - preTradePrice) / preTradePrice) : 0;
+
         res.status(201).json({
             message: 'Market order executed',
             executedSyr:       matchResult.executedSyr,
@@ -2095,6 +2330,13 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
             feePercentage:     (feeRate * 100).toFixed(2) + '%',
             netUsdCost:        fixDust(matchResult.totalUsdCost + feeUsd),
             slippagePercentage: (matchResult.slippage * 100).toFixed(2) + '%',
+            // UPGRADE: New fields for partial fill notifications and slippage
+            partialFill:       matchResult.remaining > 1e-8,
+            fillPercentage:    parsedAmount > 0 ? parseFloat(((matchResult.executedSyr / parsedAmount) * 100).toFixed(2)) : 100,
+            slippageExceeded:  matchResult.slippageExceeded || false,
+            priceImpact:       parseFloat((priceImpact * 100).toFixed(4)),
+            preTradePrice,
+            postTradePrice,
             trades: matchResult.trades
         });
     } catch (error) {
@@ -2248,27 +2490,57 @@ app.get('/balance/:address', (req, res) => {
 app.get('/stats', async (req, res) => {
     const token = (req.query.token || 'SYR').toUpperCase();
 
+    // UPGRADE: Compute 24h volume and price change for any token
+    let volume24h = 0, priceChange24h = 0, price24hAgo = 0;
+    try {
+        const twentyFourHoursAgo = Date.now() - 86400000;
+        const volRes = await pool.query(
+            `SELECT COALESCE(SUM(amount_usd), 0) as vol FROM transactions
+             WHERE token_symbol = $1 AND type = 'MARKET_TRADE' AND timestamp_ms > $2`,
+            [token, twentyFourHoursAgo]
+        );
+        volume24h = parseFloat(volRes.rows[0].vol) || 0;
+
+        const oldPriceRes = await pool.query(
+            `SELECT price_usd FROM transactions
+             WHERE token_symbol = $1 AND type = 'MARKET_TRADE' AND price_usd > 0
+               AND timestamp_ms <= $2
+             ORDER BY timestamp_ms DESC LIMIT 1`,
+            [token, twentyFourHoursAgo]
+        );
+        if (oldPriceRes.rows.length > 0) {
+            price24hAgo = parseFloat(oldPriceRes.rows[0].price_usd) || 0;
+        }
+    } catch(e) { /* silent */ }
+
     // For SYR, use cached stats
     if (token === 'SYR') {
-        if (Date.now() - apiCache.stats.time < CACHE_TTL && apiCache.stats.data) return res.json(apiCache.stats.data);
+        if (Date.now() - apiCache.stats.time < CACHE_TTL && apiCache.stats.data) {
+            // Inject volume/price change into cached data
+            apiCache.stats.data.volume24h = volume24h;
+            apiCache.stats.data.priceChange24h = price24hAgo > 0 ? parseFloat((((currentPrice - price24hAgo) / price24hAgo) * 100).toFixed(2)) : 0;
+            return res.json(apiCache.stats.data);
+        }
         const remaining = nexusChain.getRemainingSupply('SYR');
+        priceChange24h = price24hAgo > 0 ? parseFloat((((currentPrice - price24hAgo) / price24hAgo) * 100).toFixed(2)) : 0;
         apiCache.stats.data = {
             maxSupply: MAX_SUPPLY,
             remainingSupply: remaining,
             circulatingSupply: MAX_SUPPLY - remaining,
             currentPrice,
-            marketCap: (MAX_SUPPLY - remaining) * currentPrice
+            marketCap: (MAX_SUPPLY - remaining) * currentPrice,
+            volume24h,
+            priceChange24h
         };
         apiCache.stats.time = Date.now();
         return res.json(apiCache.stats.data);
     }
 
     // ── Layer 1: Check per-token cache first ─────────────────────────────────
-    // Custom token stats are cached for 30s. This means after the first cold-start
-    // request wakes Railway and populates the cache, all subsequent requests within
-    // 30s return instantly from memory — no DB queries, no timeout possible.
     const cachedToken = apiCache.tokenStats.get(token);
     if (cachedToken && (Date.now() - cachedToken.time < TOKEN_STATS_TTL)) {
+        // Inject fresh volume data into cached response
+        cachedToken.data.volume24h = volume24h;
         return res.json(cachedToken.data);
     }
 
@@ -2312,13 +2584,17 @@ app.get('/stats', async (req, res) => {
         } catch(e) { /* silent */ }
     }
 
+    priceChange24h = price24hAgo > 0 ? parseFloat((((tokenPrice - price24hAgo) / price24hAgo) * 100).toFixed(2)) : 0;
+
     const statsPayload = {
         token,
         circulatingSupply: circulating,
         handlerSupply,
         remainingSupply:   handlerSupply,
         currentPrice:      tokenPrice,
-        marketCap:         circulating * tokenPrice
+        marketCap:         circulating * tokenPrice,
+        volume24h,
+        priceChange24h
     };
 
     // Write to cache so next request within 30s is instant
@@ -3118,6 +3394,142 @@ app.post('/api/admin/withdrawal-address/pending', readLimiter, requireWeb3Auth, 
     }
 });
 
+// ── UPGRADE: Price Impact Estimation Endpoint ─────────────────────────────────
+// GET /api/price-impact?token=TICKER&side=BUY&amount=100000
+// Returns estimated price impact before a trade is placed.
+app.get('/api/price-impact', readLimiter, async (req, res) => {
+    try {
+        const token  = (req.query.token || 'SYR').toUpperCase();
+        const side   = (req.query.side || 'BUY').toUpperCase();
+        const amount = parseFloat(req.query.amount) || 0;
+        if (amount <= 0) return res.status(400).json({ error: 'Amount must be > 0' });
+
+        const currentPoolPrice = menuBook.books[token]?.lastTradePrice || nexusChain.state.getPoolPrice(token) || 0;
+        if (currentPoolPrice <= 0) return res.json({ estimatedImpact: 0, currentPrice: 0, newPrice: 0 });
+
+        nexusChain.state.initPool(token);
+        const lp = nexusChain.state.liquidityPools[token];
+        if (!lp || lp.tokenReserve <= 0 || lp.usdReserve <= 0) {
+            return res.json({ estimatedImpact: 0, currentPrice: currentPoolPrice, newPrice: currentPoolPrice });
+        }
+
+        // Simulate chunked execution without modifying state
+        let simTokenReserve = lp.tokenReserve;
+        let simUsdReserve   = lp.usdReserve;
+        let remaining = amount;
+        const chunkSize = Math.max(100, simTokenReserve * 0.001);
+
+        while (remaining > 1e-8) {
+            const chunk = Math.min(remaining, chunkSize);
+            if (side === 'BUY') {
+                simTokenReserve -= chunk;
+                simUsdReserve   += chunk * (simUsdReserve / simTokenReserve);
+            } else {
+                simTokenReserve += chunk;
+                simUsdReserve   -= chunk * (simUsdReserve / simTokenReserve);
+            }
+            remaining -= chunk;
+            if (simTokenReserve <= 0 || simUsdReserve <= 0) break;
+        }
+
+        const newPrice = simTokenReserve > 0 ? simUsdReserve / simTokenReserve : currentPoolPrice;
+        const impact   = Math.abs((newPrice - currentPoolPrice) / currentPoolPrice) * 100;
+
+        res.json({
+            estimatedImpact: parseFloat(impact.toFixed(4)),
+            currentPrice:    parseFloat(currentPoolPrice.toFixed(8)),
+            newPrice:        parseFloat(newPrice.toFixed(8)),
+            warningLevel:    impact < 2 ? 'low' : impact < 10 ? 'medium' : 'high'
+        });
+    } catch(e) {
+        res.status(500).json({ error: 'Price impact estimation failed.' });
+    }
+});
+
+// ── UPGRADE: Recent Trades Feed Endpoint ──────────────────────────────────────
+// GET /api/recent-trades?limit=50&token=SYR (optional token filter)
+app.get('/api/recent-trades', readLimiter, async (req, res) => {
+    try {
+        const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+        const token = req.query.token ? req.query.token.toUpperCase() : null;
+
+        let query, params;
+        if (token) {
+            query = `SELECT from_address, to_address, amount, amount_usd, price_usd, token_symbol, timestamp_ms
+                     FROM transactions WHERE type = 'MARKET_TRADE' AND token_symbol = $1
+                     ORDER BY timestamp_ms DESC LIMIT $2`;
+            params = [token, limit];
+        } else {
+            query = `SELECT from_address, to_address, amount, amount_usd, price_usd, token_symbol, timestamp_ms
+                     FROM transactions WHERE type = 'MARKET_TRADE'
+                     ORDER BY timestamp_ms DESC LIMIT $1`;
+            params = [limit];
+        }
+
+        const result = await pool.query(query, params);
+        const trades = result.rows.map(tx => ({
+            from: tx.from_address,
+            to: tx.to_address,
+            amount: parseFloat(tx.amount),
+            amountUsd: parseFloat(tx.amount_usd),
+            price: parseFloat(tx.price_usd),
+            token: tx.token_symbol,
+            timestamp: parseInt(tx.timestamp_ms),
+            side: tx.from_address.startsWith('nx_') || tx.from_address === 'system' ? 'BUY' : 'SELL'
+        }));
+
+        res.json({ trades, count: trades.length });
+    } catch(e) {
+        res.status(500).json({ error: 'Failed to fetch recent trades.' });
+    }
+});
+
+// ── UPGRADE: All-Tokens Price Ticker Data ─────────────────────────────────────
+// GET /api/ticker — Returns price, 24h change, and volume for all active tokens
+app.get('/api/ticker', readLimiter, async (req, res) => {
+    try {
+        const tickers = [];
+        // Add SYR first
+        tickers.push({
+            token: 'SYR',
+            price: currentPrice,
+            change24h: 0 // Will be computed below
+        });
+
+        // Collect all active token prices from menuBook
+        for (const ticker in menuBook.books) {
+            if (ticker === 'SYR' || ticker === 'SDX' || ticker === 'SDTX') continue;
+            const book = menuBook.books[ticker];
+            const price = book?.lastTradePrice || book?.asks?.[0]?.priceUsd || 0;
+            if (price > 0) {
+                tickers.push({ token: ticker, price, change24h: 0 });
+            }
+        }
+
+        // Batch compute 24h changes
+        const twentyFourHoursAgo = Date.now() - 86400000;
+        for (const t of tickers) {
+            try {
+                const oldPriceRes = await pool.query(
+                    `SELECT price_usd FROM transactions
+                     WHERE token_symbol = $1 AND type = 'MARKET_TRADE' AND price_usd > 0
+                       AND timestamp_ms <= $2
+                     ORDER BY timestamp_ms DESC LIMIT 1`,
+                    [t.token, twentyFourHoursAgo]
+                );
+                if (oldPriceRes.rows.length > 0) {
+                    const oldP = parseFloat(oldPriceRes.rows[0].price_usd);
+                    if (oldP > 0) t.change24h = parseFloat((((t.price - oldP) / oldP) * 100).toFixed(2));
+                }
+            } catch(e) {}
+        }
+
+        res.json({ tickers });
+    } catch(e) {
+        res.status(500).json({ error: 'Failed to fetch ticker data.' });
+    }
+});
+
 // ─── OPENCHAIN TERMINAL ENDPOINTS ────────────────────────────────────────────
 // Open token deployment — no KYC, no domain verification required.
 
@@ -3129,12 +3541,22 @@ const DELCHAIN_CREATOR_UID = 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE5z7IyY';
 
 app.get('/api/notifications', readLimiter, async (req, res) => {
     try {
+        // UPGRADE: 10-day auto-expire — only return notifications from the last 10 days
+        const tenDaysAgo = Date.now() - (10 * 86400000);
         const result = await pool.query(
             `SELECT id, uid, message, type, created_at
              FROM broadcast_notifications
-             ORDER BY created_at DESC LIMIT 50`
+             WHERE created_at > $1
+             ORDER BY created_at DESC LIMIT 50`,
+            [tenDaysAgo]
         );
-        res.json(result.rows);
+        // Add daysLeft field for countdown badge
+        const notifications = result.rows.map(n => {
+            const ageMs = Date.now() - parseInt(n.created_at);
+            const daysLeft = Math.max(0, Math.ceil((10 * 86400000 - ageMs) / 86400000));
+            return { ...n, daysLeft };
+        });
+        res.json(notifications);
     } catch(e) {
         res.status(500).json({ error: 'Failed to fetch notifications.' });
     }
@@ -5302,6 +5724,24 @@ app.use((req, res) => { res.status(404).json({ error: 'API Node Endpoint Not Fou
     await processPendingBurns();
     // Run every hour to catch upcoming deletions and send day-before warnings
     setInterval(processPendingBurns, 60 * 60 * 1000);
+
+    // UPGRADE: Clean up expired notifications (10-day lifetime)
+    async function cleanupOldNotifications() {
+        try {
+            const tenDaysAgo = Date.now() - (10 * 86400000);
+            const result = await pool.query(
+                `DELETE FROM broadcast_notifications WHERE created_at < $1`,
+                [tenDaysAgo]
+            );
+            if (result.rowCount > 0) {
+                console.log(chalk.green(`[NOTIF CLEANUP] Removed ${result.rowCount} expired notification(s) older than 10 days.`));
+            }
+        } catch(e) {
+            console.warn(chalk.yellow('[NOTIF CLEANUP] Error:', e.message));
+        }
+    }
+    await cleanupOldNotifications();
+    setInterval(cleanupOldNotifications, 6 * 60 * 60 * 1000); // Every 6 hours
 
     // Issue 4: Auto-migrate legacy OpenChain tokens that have no system address.
     // Tokens deployed BEFORE the nx_open_ system address feature (like DORANT) have

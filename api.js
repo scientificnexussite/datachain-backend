@@ -2513,6 +2513,16 @@ app.get('/stats', async (req, res) => {
         }
     } catch(e) { /* silent */ }
 
+    // UPGRADE: Get last trade timestamp for this token
+    let lastTradeTimestamp = 0;
+    try {
+        const ltRes = await pool.query(
+            `SELECT timestamp_ms FROM transactions WHERE token_symbol = $1 AND type = 'MARKET_TRADE'
+             ORDER BY timestamp_ms DESC LIMIT 1`, [token]
+        );
+        if (ltRes.rows.length > 0) lastTradeTimestamp = parseInt(ltRes.rows[0].timestamp_ms) || 0;
+    } catch(e) { /* silent */ }
+
     // For SYR, use cached stats
     if (token === 'SYR') {
         if (Date.now() - apiCache.stats.time < CACHE_TTL && apiCache.stats.data) {
@@ -2530,7 +2540,8 @@ app.get('/stats', async (req, res) => {
             currentPrice,
             marketCap: (MAX_SUPPLY - remaining) * currentPrice,
             volume24h,
-            priceChange24h
+            priceChange24h,
+            lastTradeTimestamp
         };
         apiCache.stats.time = Date.now();
         return res.json(apiCache.stats.data);
@@ -2594,7 +2605,8 @@ app.get('/stats', async (req, res) => {
         currentPrice:      tokenPrice,
         marketCap:         circulating * tokenPrice,
         volume24h,
-        priceChange24h
+        priceChange24h,
+        lastTradeTimestamp
     };
 
     // Write to cache so next request within 30s is instant
@@ -3596,16 +3608,57 @@ app.get('/api/open-tokens', readLimiter, async (req, res) => {
              LEFT JOIN open_token_supply ots ON ots.ticker = ot.ticker
              WHERE ot.status = 'active' ORDER BY ot.created_at DESC LIMIT 200`
         );
-        // Augment with live remaining_supply from in-memory ledger
+
+        // Batch-query analytics for all tickers
+        const tickers = rows.rows.map(r => r.ticker);
+        const now24h = Date.now() - 86400000;
+
+        // Volume + holder count + last trade in parallel
+        const [volRes, holderRes, lastTradeRes] = await Promise.all([
+            tickers.length > 0 ? pool.query(
+                `SELECT token_symbol, SUM(amount_usd) AS vol, COUNT(*) AS trade_count
+                 FROM transactions WHERE type = 'MARKET_TRADE' AND token_symbol = ANY($1)
+                 AND timestamp_ms >= $2 GROUP BY token_symbol`, [tickers, now24h]
+            ) : { rows: [] },
+            tickers.length > 0 ? pool.query(
+                `SELECT token_symbol, COUNT(DISTINCT address) AS holders
+                 FROM state_balances WHERE token_symbol = ANY($1) AND balance > 0
+                 GROUP BY token_symbol`, [tickers]
+            ) : { rows: [] },
+            tickers.length > 0 ? pool.query(
+                `SELECT DISTINCT ON (token_symbol) token_symbol, timestamp_ms, (amount_usd / NULLIF(amount, 0)) AS price
+                 FROM transactions WHERE type = 'MARKET_TRADE' AND token_symbol = ANY($1) AND amount > 0
+                 ORDER BY token_symbol, timestamp_ms DESC`, [tickers]
+            ) : { rows: [] }
+        ]);
+
+        // Build lookup maps
+        const volMap = {}; volRes.rows.forEach(r => { volMap[r.token_symbol] = parseFloat(r.vol || 0); });
+        const holderMap = {}; holderRes.rows.forEach(r => { holderMap[r.token_symbol] = parseInt(r.holders || 0); });
+        const lastTradeMap = {}; lastTradeRes.rows.forEach(r => {
+            lastTradeMap[r.token_symbol] = { price: parseFloat(r.price || 0), ts: parseInt(r.timestamp_ms || 0) };
+        });
+
+        // Augment each token with live data
         const result = rows.rows.map(r => {
             let remainingSupply = r.total_supply;
+            let poolBalance = 0;
             if (r.system_address) {
-                const sysAddr = r.system_address;
-                const ticker  = r.ticker;
                 try {
-                    remainingSupply = nexusChain.state.getBalance(sysAddr, ticker) || 0;
+                    remainingSupply = nexusChain.state.getBalance(r.system_address, r.ticker) || 0;
+                    poolBalance = remainingSupply;
                 } catch(e) {}
             }
+
+            // Price from AMM pool or last trade
+            let currentPrice = 0;
+            const lp = nexusChain.liquidityPools?.[r.ticker];
+            if (lp && lp.tokenReserve > 0) {
+                currentPrice = lp.usdReserve / lp.tokenReserve;
+            } else if (lastTradeMap[r.ticker]) {
+                currentPrice = lastTradeMap[r.ticker].price;
+            }
+
             return {
                 ticker:          r.ticker,
                 name:            r.name,
@@ -3614,22 +3667,78 @@ app.get('/api/open-tokens', readLimiter, async (req, res) => {
                 parentTicker:    r.parent_ticker,
                 totalSupply:     r.total_supply,
                 remainingSupply,
-                createdAt:       r.created_at
+                createdAt:       r.created_at,
+                currentPrice:    parseFloat(currentPrice.toFixed(8)),
+                priceChange24h:  0, // simplified — no historical comparison needed for MVP
+                holderCount:     holderMap[r.ticker] || 0,
+                totalVolume:     volMap[r.ticker] || 0,
+                poolBalance:     poolBalance,
+                lastTradeTimestamp: lastTradeMap[r.ticker]?.ts || 0
             };
         });
         res.json(result);
     } catch(err) { res.status(500).json({ error: 'Failed to load tokens.' }); }
 });
 
-// 2. User's deployed open tokens
+// 2. User's deployed open tokens (with live analytics)
 app.post('/api/open-token/my-tokens', readLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const uid = req.user.uid;
         const rows = await pool.query(
-            `SELECT ticker, name, description, logo_url, parent_ticker, total_supply, created_at
-             FROM open_tokens WHERE uid = $1 ORDER BY created_at DESC`, [uid]
+            `SELECT ot.ticker, ot.name, ot.description, ot.logo_url, ot.parent_ticker,
+                    ot.total_supply, ot.created_at, ots.system_address
+             FROM open_tokens ot
+             LEFT JOIN open_token_supply ots ON ots.ticker = ot.ticker
+             WHERE ot.uid = $1 ORDER BY ot.created_at DESC`, [uid]
         );
-        res.json({ tokens: rows.rows });
+        const tickers = rows.rows.map(r => r.ticker);
+        const now24h = Date.now() - 86400000;
+
+        const [volRes, holderRes, lastTradeRes] = await Promise.all([
+            tickers.length > 0 ? pool.query(
+                `SELECT token_symbol, SUM(amount_usd) AS vol FROM transactions
+                 WHERE type = 'MARKET_TRADE' AND token_symbol = ANY($1) AND timestamp_ms >= $2
+                 GROUP BY token_symbol`, [tickers, now24h]
+            ) : { rows: [] },
+            tickers.length > 0 ? pool.query(
+                `SELECT token_symbol, COUNT(DISTINCT address) AS holders FROM state_balances
+                 WHERE token_symbol = ANY($1) AND balance > 0 GROUP BY token_symbol`, [tickers]
+            ) : { rows: [] },
+            tickers.length > 0 ? pool.query(
+                `SELECT DISTINCT ON (token_symbol) token_symbol, timestamp_ms, (amount_usd / NULLIF(amount, 0)) AS price
+                 FROM transactions WHERE type = 'MARKET_TRADE' AND token_symbol = ANY($1) AND amount > 0
+                 ORDER BY token_symbol, timestamp_ms DESC`, [tickers]
+            ) : { rows: [] }
+        ]);
+
+        const volMap = {}; volRes.rows.forEach(r => { volMap[r.token_symbol] = parseFloat(r.vol || 0); });
+        const holderMap = {}; holderRes.rows.forEach(r => { holderMap[r.token_symbol] = parseInt(r.holders || 0); });
+        const lastTradeMap = {}; lastTradeRes.rows.forEach(r => {
+            lastTradeMap[r.token_symbol] = { price: parseFloat(r.price || 0), ts: parseInt(r.timestamp_ms || 0) };
+        });
+
+        const tokens = rows.rows.map(r => {
+            let poolBalance = 0;
+            if (r.system_address) {
+                try { poolBalance = nexusChain.state.getBalance(r.system_address, r.ticker) || 0; } catch(e) {}
+            }
+            let currentPrice = 0;
+            const lp = nexusChain.liquidityPools?.[r.ticker];
+            if (lp && lp.tokenReserve > 0) currentPrice = lp.usdReserve / lp.tokenReserve;
+            else if (lastTradeMap[r.ticker]) currentPrice = lastTradeMap[r.ticker].price;
+
+            return {
+                ticker: r.ticker, name: r.name, description: r.description,
+                logo_url: r.logo_url, parent_ticker: r.parent_ticker,
+                total_supply: r.total_supply, created_at: r.created_at,
+                currentPrice: parseFloat(currentPrice.toFixed(8)),
+                priceChange24h: 0,
+                holderCount: holderMap[r.ticker] || 0,
+                totalVolume: volMap[r.ticker] || 0,
+                poolBalance, lastTradeTimestamp: lastTradeMap[r.ticker]?.ts || 0
+            };
+        });
+        res.json({ tokens });
     } catch(err) { res.status(500).json({ error: 'Failed to load your tokens.' }); }
 });
 
@@ -3873,6 +3982,182 @@ app.post('/api/admin/migrate-open-supply', async (req, res) => {
     }
 });
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// OPENCHAIN TERMINAL — New Endpoints (Plan Components 2,6,7,8,9)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Component 2: Network Stats Overview ──────────────────────────────────────
+app.get('/api/open-tokens/stats', readLimiter, async (req, res) => {
+    try {
+        const now24h = Date.now() - 86400000;
+        const [countRes, volRes] = await Promise.all([
+            pool.query(`SELECT COUNT(*) AS cnt FROM open_tokens WHERE status = 'active'`),
+            pool.query(
+                `SELECT token_symbol, SUM(amount_usd) AS vol
+                 FROM transactions WHERE type = 'MARKET_TRADE' AND timestamp_ms >= $1
+                 AND token_symbol IN (SELECT ticker FROM open_tokens WHERE status = 'active')
+                 GROUP BY token_symbol ORDER BY vol DESC`, [now24h]
+            )
+        ]);
+
+        const totalTokens = parseInt(countRes.rows[0]?.cnt || 0);
+        let totalVolume24h = 0;
+        let mostActiveToken = '—';
+        if (volRes.rows.length > 0) {
+            mostActiveToken = volRes.rows[0].token_symbol;
+            volRes.rows.forEach(r => { totalVolume24h += parseFloat(r.vol || 0); });
+        }
+
+        // Combined market cap: sum of (currentPrice * totalSupply) for all active tokens
+        let combinedMarketCap = 0;
+        const activeTokens = await pool.query(
+            `SELECT ot.ticker, ot.total_supply, ots.system_address
+             FROM open_tokens ot LEFT JOIN open_token_supply ots ON ots.ticker = ot.ticker
+             WHERE ot.status = 'active'`
+        );
+        for (const t of activeTokens.rows) {
+            let price = 0;
+            const lp = nexusChain.liquidityPools?.[t.ticker];
+            if (lp && lp.tokenReserve > 0) price = lp.usdReserve / lp.tokenReserve;
+            combinedMarketCap += price * parseInt(t.total_supply || 0);
+        }
+
+        res.json({ totalTokens, combinedMarketCap, totalVolume24h, mostActiveToken });
+    } catch(e) {
+        res.json({ totalTokens: 0, combinedMarketCap: 0, totalVolume24h: 0, mostActiveToken: '—' });
+    }
+});
+
+// ── Component 6: Token Edit (creator-only) ──────────────────────────────────
+app.post('/api/open-token/edit', txLimiter, requireWeb3Auth, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const ticker = (req.body.ticker || '').toUpperCase();
+        const description = req.body.description || '';
+        const logoUrl = req.body.logoUrl || '';
+        if (!ticker) return res.status(400).json({ error: 'Ticker required.' });
+
+        // Verify creator ownership
+        const ownerCheck = await pool.query(
+            'SELECT uid FROM open_tokens WHERE ticker = $1 LIMIT 1', [ticker]
+        );
+        if (ownerCheck.rows.length === 0) return res.status(404).json({ error: 'Token not found.' });
+        if (ownerCheck.rows[0].uid !== uid) return res.status(403).json({ error: 'Only the token creator can edit.' });
+
+        await pool.query(
+            `UPDATE open_tokens SET description = $1, logo_url = $2 WHERE ticker = $3`,
+            [description.substring(0, 2000), logoUrl.substring(0, 500), ticker]
+        );
+        res.json({ success: true });
+    } catch(e) { res.status(500).json({ error: 'Edit failed.' }); }
+});
+
+// ── Component 7: Airdrop (creator-only, max 50) ─────────────────────────────
+app.post('/api/open-token/airdrop', txLimiter, requireWeb3Auth, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const ticker = (req.body.ticker || '').toUpperCase();
+        const recipients = req.body.recipients || [];
+        if (!ticker) return res.status(400).json({ error: 'Ticker required.' });
+        if (!Array.isArray(recipients) || recipients.length === 0) return res.status(400).json({ error: 'No recipients.' });
+        if (recipients.length > 50) return res.status(400).json({ error: 'Max 50 recipients per batch.' });
+
+        // Verify creator ownership
+        const ownerCheck = await pool.query('SELECT uid FROM open_tokens WHERE ticker = $1 LIMIT 1', [ticker]);
+        if (ownerCheck.rows.length === 0) return res.status(404).json({ error: 'Token not found.' });
+        if (ownerCheck.rows[0].uid !== uid) return res.status(403).json({ error: 'Only the token creator can airdrop.' });
+
+        // Check total amount
+        let totalAmount = 0;
+        for (const r of recipients) {
+            const amt = parseFloat(r.amount);
+            if (isNaN(amt) || amt <= 0) return res.status(400).json({ error: `Invalid amount for ${r.address}` });
+            totalAmount += amt;
+        }
+
+        // Check creator balance
+        const creatorBal = nexusChain.getBalance(uid, ticker) - menuBook.getLockedToken(uid, ticker) - mempool.getPendingTokenSpend(uid, ticker);
+        if (creatorBal < totalAmount) return res.status(400).json({ error: `Insufficient ${ticker}. Need ${totalAmount}, have ${creatorBal.toFixed(4)}.` });
+
+        // Execute transfers
+        let sent = 0;
+        for (const r of recipients) {
+            await mempool.addTransaction({
+                from: uid, to: r.address.trim(), amount: parseFloat(r.amount),
+                type: 'TOKEN_TRANSFER', tokenSymbol: ticker,
+                timestamp: Date.now() + sent, isSystemGenerated: true,
+                description: `Airdrop: ${ticker}`
+            });
+            sent++;
+        }
+        res.json({ success: true, sent });
+    } catch(e) { res.status(500).json({ error: e.message || 'Airdrop failed.' }); }
+});
+
+// ── Component 8: Revenue Dashboard (creator-only) ───────────────────────────
+app.post('/api/open-token/revenue', txLimiter, requireWeb3Auth, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const ticker = (req.body.ticker || '').toUpperCase();
+        if (!ticker) return res.status(400).json({ error: 'Ticker required.' });
+
+        // Verify creator
+        const ownerCheck = await pool.query('SELECT uid FROM open_tokens WHERE ticker = $1 LIMIT 1', [ticker]);
+        if (ownerCheck.rows.length === 0) return res.status(404).json({ error: 'Token not found.' });
+        if (ownerCheck.rows[0].uid !== uid) return res.status(403).json({ error: 'Not the creator.' });
+
+        // Count deployments under this network + fee income
+        const [deployRes, feeRes] = await Promise.all([
+            pool.query(`SELECT COUNT(*) AS cnt FROM open_tokens WHERE parent_ticker = $1`, [ticker]),
+            pool.query(
+                `SELECT COALESCE(SUM(amount), 0) AS total_fee FROM transactions
+                 WHERE type = 'SYR_TRANSFER' AND to_address = $1
+                 AND description LIKE '%Network deploy fee%'`, [uid]
+            )
+        ]);
+        res.json({
+            deployCount: parseInt(deployRes.rows[0]?.cnt || 0),
+            totalFeeSyr: parseFloat(feeRes.rows[0]?.total_fee || 0)
+        });
+    } catch(e) { res.status(500).json({ error: 'Revenue fetch failed.' }); }
+});
+
+// ── Component 9b: Supply Stats (public) ─────────────────────────────────────
+app.get('/api/open-token/supply-stats/:ticker', readLimiter, async (req, res) => {
+    try {
+        const ticker = req.params.ticker.toUpperCase();
+        const tokenRow = await pool.query(
+            `SELECT ot.total_supply, ots.system_address FROM open_tokens ot
+             LEFT JOIN open_token_supply ots ON ots.ticker = ot.ticker
+             WHERE ot.ticker = $1 LIMIT 1`, [ticker]
+        );
+        if (tokenRow.rows.length === 0) return res.status(404).json({ error: 'Token not found.' });
+
+        const totalSupply = parseInt(tokenRow.rows[0].total_supply || 0);
+        const sysAddr = tokenRow.rows[0].system_address;
+
+        let poolSupply = 0;
+        if (sysAddr) {
+            try { poolSupply = nexusChain.state.getBalance(sysAddr, ticker) || 0; } catch(e) {}
+        }
+
+        // Burned = sent to system or 0x0 addresses
+        let burnedSupply = 0;
+        try {
+            const burnRes = await pool.query(
+                `SELECT COALESCE(SUM(amount), 0) AS burned FROM transactions
+                 WHERE token_symbol = $1 AND type = 'TOKEN_TRANSFER'
+                 AND (to_address = 'system' OR to_address LIKE '0x000%')`, [ticker]
+            );
+            burnedSupply = parseInt(burnRes.rows[0]?.burned || 0);
+        } catch(e) {}
+
+        const circulatingSupply = Math.max(0, totalSupply - poolSupply - burnedSupply);
+
+        res.json({ totalSupply, circulatingSupply, poolSupply, burnedSupply });
+    } catch(e) { res.status(500).json({ error: 'Supply stats failed.' }); }
+});
 
 // GET /api/token/creator/:ticker?uid=WALLET_ADDRESS
 // Returns { isCreator: true/false } — used by frontend to show creator badge/settings

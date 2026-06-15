@@ -23,7 +23,9 @@ pool.query(`
     CREATE TABLE IF NOT EXISTS state_liquidity_pools (
         token_symbol  VARCHAR(20) PRIMARY KEY,
         token_reserve DOUBLE PRECISION DEFAULT 0,
-        usd_reserve   DOUBLE PRECISION DEFAULT 0
+        usd_reserve   DOUBLE PRECISION DEFAULT 0,
+        virtual_token_reserve DOUBLE PRECISION DEFAULT 0,
+        virtual_usd_reserve   DOUBLE PRECISION DEFAULT 0
     );
 `).catch(err => console.error(chalk.red("[DB] Failed to initialize state tables"), err));
 
@@ -69,16 +71,24 @@ class State {
   initPool(tokenSymbol) {
     const t = tokenSymbol.toUpperCase();
     if (!this.liquidityPools[t]) {
-      this.liquidityPools[t] = { tokenReserve: 0, usdReserve: 0 };
+      this.liquidityPools[t] = { tokenReserve: 0, usdReserve: 0, virtualTokenReserve: 0, virtualUsdReserve: 0 };
     }
-    return this.liquidityPools[t];
+    // Ensure virtual fields exist on legacy pools loaded from snapshot
+    const lp = this.liquidityPools[t];
+    if (lp.virtualTokenReserve === undefined) lp.virtualTokenReserve = 0;
+    if (lp.virtualUsdReserve   === undefined) lp.virtualUsdReserve   = 0;
+    return lp;
   }
 
   // Task B — Current pool spot price for a token (0 if pool inactive).
+  // Uses effective reserves (real + virtual) for price calculation.
   getPoolPrice(tokenSymbol) {
     const p = this.liquidityPools[tokenSymbol];
-    if (!p || p.tokenReserve <= 0 || p.usdReserve <= 0) return 0;
-    return fixDust(p.usdReserve / p.tokenReserve);
+    if (!p) return 0;
+    const effToken = p.tokenReserve + (p.virtualTokenReserve || 0);
+    const effUsd   = p.usdReserve   + (p.virtualUsdReserve   || 0);
+    if (effToken <= 0 || effUsd <= 0) return 0;
+    return fixDust(effUsd / effToken);
   }
 
     applyTransaction(tx, currentPrice = 0, isReplay = false) {
@@ -127,6 +137,16 @@ class State {
       const lp = this.initPool(tokenSymbol);
       lp.tokenReserve = fixDust(amount);
       lp.usdReserve   = fixDust(parseFloat(tx.amountUsd) || 0);
+
+      // AMM Upgrade: Initialize virtual reserves for $10K depth cushion.
+      // This makes the bonding curve dramatically flatter at launch.
+      const seedPrice = lp.usdReserve > 0 && lp.tokenReserve > 0
+          ? lp.usdReserve / lp.tokenReserve
+          : 0.01;
+      const VIRTUAL_USD = 10_000;
+      lp.virtualUsdReserve   = VIRTUAL_USD;
+      lp.virtualTokenReserve = fixDust(VIRTUAL_USD / seedPrice);
+
       // Credit the system address so it has tokens to fill market-make orders
       this.balances[tokenSymbol]['system'] = fixDust(
         (this.balances[tokenSymbol]['system'] || 0) + amount
@@ -238,11 +258,13 @@ class State {
 
         // Task B — Load persisted liquidity pool reserves from DB.
         try {
-            const lpRes = await pool.query('SELECT token_symbol, token_reserve, usd_reserve FROM state_liquidity_pools');
+            const lpRes = await pool.query('SELECT token_symbol, token_reserve, usd_reserve, COALESCE(virtual_token_reserve, 0) as virtual_token_reserve, COALESCE(virtual_usd_reserve, 0) as virtual_usd_reserve FROM state_liquidity_pools');
             for (const row of lpRes.rows) {
                 this.liquidityPools[row.token_symbol] = {
-                    tokenReserve: parseFloat(row.token_reserve) || 0,
-                    usdReserve:   parseFloat(row.usd_reserve)   || 0
+                    tokenReserve:        parseFloat(row.token_reserve) || 0,
+                    usdReserve:          parseFloat(row.usd_reserve)   || 0,
+                    virtualTokenReserve: parseFloat(row.virtual_token_reserve) || 0,
+                    virtualUsdReserve:   parseFloat(row.virtual_usd_reserve)   || 0
                 };
             }
             if (Object.keys(this.liquidityPools).length > 0) {
@@ -355,15 +377,23 @@ class State {
           const lpTickers       = Object.keys(this.liquidityPools);
           const lpTokenReserves = lpTickers.map(t => this.liquidityPools[t].tokenReserve);
           const lpUsdReserves   = lpTickers.map(t => this.liquidityPools[t].usdReserve);
+          const lpVirtualTokens = lpTickers.map(t => this.liquidityPools[t].virtualTokenReserve || 0);
+          const lpVirtualUsd    = lpTickers.map(t => this.liquidityPools[t].virtualUsdReserve || 0);
 
           if (lpTickers.length > 0) {
+              // Ensure virtual reserve columns exist
+              await client.query(`ALTER TABLE state_liquidity_pools ADD COLUMN IF NOT EXISTS virtual_token_reserve DOUBLE PRECISION DEFAULT 0`).catch(() => {});
+              await client.query(`ALTER TABLE state_liquidity_pools ADD COLUMN IF NOT EXISTS virtual_usd_reserve DOUBLE PRECISION DEFAULT 0`).catch(() => {});
+
               await client.query(
-                  `INSERT INTO state_liquidity_pools (token_symbol, token_reserve, usd_reserve)
-                   SELECT * FROM UNNEST($1::varchar[], $2::float8[], $3::float8[])
+                  `INSERT INTO state_liquidity_pools (token_symbol, token_reserve, usd_reserve, virtual_token_reserve, virtual_usd_reserve)
+                   SELECT * FROM UNNEST($1::varchar[], $2::float8[], $3::float8[], $4::float8[], $5::float8[])
                    ON CONFLICT (token_symbol) DO UPDATE
                        SET token_reserve = EXCLUDED.token_reserve,
-                           usd_reserve   = EXCLUDED.usd_reserve`,
-                  [lpTickers, lpTokenReserves, lpUsdReserves]
+                           usd_reserve   = EXCLUDED.usd_reserve,
+                           virtual_token_reserve = EXCLUDED.virtual_token_reserve,
+                           virtual_usd_reserve   = EXCLUDED.virtual_usd_reserve`,
+                  [lpTickers, lpTokenReserves, lpUsdReserves, lpVirtualTokens, lpVirtualUsd]
               );
           }
           

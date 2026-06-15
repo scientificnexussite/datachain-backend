@@ -17,6 +17,7 @@ import validator from './validator.js';
 import menuBook, { processReferralBonus } from './menubook.js'; // IMPROVEMENT 4 — static import
 import { initP2P, broadcastP2P } from './p2p.js';
 import config from './config.json' with { type: 'json' };
+import { autoban, sanitize, anomalyDetect, bruteForceGuard, guardWebSocket, logSecurityEvent } from './security.js';
 // Stripe removed — KYC verification system disabled. No USA address/number required.
 
 // ─── PayPal Configuration ─────────────────────────────────────────────────────
@@ -318,6 +319,10 @@ let positionsCache = new Map();
 
 app.use(helmet());
 
+// ─── Security Layers (Phase 4) ────────────────────────────────────────────────
+// Layer 6: DDoS auto-ban — fastest rejection path, runs before everything
+app.use(autoban);
+
 // ─── CORS ─────────────────────────────────────────────────────────────────────
 const allowedOrigins = [
     'https://scientificnexus.net',
@@ -344,6 +349,11 @@ app.use(cors({
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ limit: '10mb', extended: true }));
 
+// Layer 3 + Layer 1 + Layer 4: Sanitize input, detect anomalies, guard brute-force
+app.use(sanitize);
+app.use(anomalyDetect);
+app.use(bruteForceGuard);
+
 // ─── WebSocket Server ─────────────────────────────────────────────────────────
 const server = createServer(app);
 const wss    = new WebSocketServer({ server });
@@ -361,6 +371,9 @@ global.broadcastWS = (event, data) => {
 // proxy (and any other load balancer) that would otherwise silently close idle
 // WebSocket connections without triggering onclose on the client.
 wss.on('connection', (ws) => {
+    // Layer 2: WebSocket rate limiting + message size validation (Phase 4)
+    guardWebSocket(ws);
+
     ws.on('message', (raw) => {
         try {
             const msg = JSON.parse(raw.toString());

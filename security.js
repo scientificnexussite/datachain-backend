@@ -407,6 +407,11 @@ export function bruteForceGuard(req, res, next) {
     const ip = req.ip || 'unknown';
     const now = Date.now();
 
+    // Trusted IPs (Railway infra 152.233.x.x, localhost) skip ALL brute-force tracking.
+    // This was the missed fix from round 1 — autoban had this bypass but bruteForceGuard didn't,
+    // causing Railway's own egress IPs to accumulate auth failures and get blocked.
+    if (isTrustedIP(ip)) return next();
+
     const data = authFailures.get(ip);
     if (data && data.blockedUntil && now < data.blockedUntil) {
         const retryAfter = Math.ceil((data.blockedUntil - now) / 1000);
@@ -433,6 +438,7 @@ export function bruteForceGuard(req, res, next) {
 
     next();
 }
+
 
 function recordAuthFailure(ip) {
     const now = Date.now();

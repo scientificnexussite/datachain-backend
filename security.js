@@ -44,22 +44,38 @@ const ipPatterns = new Map();
 const authFailures = new Map();
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const BAN_THRESHOLD       = 5;       // rejections before ban
+const BAN_THRESHOLD       = 20;      // rejections before ban (raised from 5 — active sessions easily hit 5)
 const BAN_WINDOW_MS       = 60000;   // 1 minute window
 const BAN_DURATION_MS     = 900000;  // 15 minutes ban
 
-const ANOMALY_AUTH_MAX    = 5;       // max auth attempts per window
+const ANOMALY_AUTH_MAX    = 30;      // max auth attempts per 30s window (raised from 5 — normal page load makes 10-20 signed requests)
 const ANOMALY_AUTH_WINDOW = 30000;   // 30 seconds
-const ANOMALY_WALLET_MAX  = 3;       // max different wallets per window
+const ANOMALY_WALLET_MAX  = 10;      // max different wallets per window (raised from 3)
 const ANOMALY_WALLET_WINDOW = 60000; // 1 minute
 
-const BRUTE_MAX_FAILURES  = 5;       // max failed auths
+const BRUTE_MAX_FAILURES  = 5;       // max failed auths (keep tight — wrong password is always suspicious)
 const BRUTE_WINDOW_MS     = 300000;  // 5 minute window
 const BRUTE_BLOCK_MS      = 600000;  // 10 minute block
 
 const WS_MAX_MSGS_PER_MIN = 30;
 const WS_MAX_MSG_SIZE     = 1048576; // 1MB
 const WS_MAX_VIOLATIONS   = 3;
+
+// ─── Trusted IP Subnets ───────────────────────────────────────────────────────
+// Railway's own egress IPs (P2P peer nodes, internal infra) share the 152.233.x.x
+// subnet. These are NOT real attackers — exclude them from ban tracking.
+// Real attackers are still caught by BRUTE_FORCE (wrong password) and SQL_INJECTION.
+const TRUSTED_IP_PREFIXES = [
+    '127.0.0.1',
+    '::1',
+    '::ffff:127.0.0.1',
+    '152.233.',   // Railway internal egress subnet
+];
+
+function isTrustedIP(ip) {
+    if (!ip) return false;
+    return TRUSTED_IP_PREFIXES.some(prefix => ip.startsWith(prefix));
+}
 
 // SQL injection patterns (case insensitive)
 const SQL_INJECTION_PATTERNS = [
@@ -139,10 +155,16 @@ export function autoban(req, res, next) {
         logSecurityEvent('IP_UNBANNED', ip, 'Ban expired, access restored.', 'info');
     }
 
-    // Hook into response to track rejections (4xx/5xx responses)
+    // Skip ban tracking entirely for trusted IPs (Railway infra, localhost)
+    if (isTrustedIP(ip)) return next();
+
+    // Hook into response to track rejections (4xx/5xx responses).
+    // IMPORTANT: res.skipBanTracking = true is set by security middlewares (anomalyDetect,
+    // bruteForceGuard) before returning their own 403s. This prevents a cascade where a
+    // security block (403) itself feeds back into the ban counter, instantly banning the user.
     const originalEnd = res.end;
     res.end = function (...args) {
-        if (res.statusCode >= 400 && res.statusCode < 500) {
+        if (res.statusCode >= 400 && res.statusCode < 500 && !res.skipBanTracking) {
             trackRejection(ip);
         }
         return originalEnd.apply(this, args);
@@ -316,6 +338,8 @@ export function anomalyDetect(req, res, next) {
             `Credential stuffing: ${pattern.authAttempts.length} auth attempts in ${ANOMALY_AUTH_WINDOW / 1000}s`,
             'critical'
         );
+        // Mark as security-generated 403 so trackRejection doesn't cascade into an IP ban
+        res.skipBanTracking = true;
         return res.status(403).json({
             error: 'Security Alert: Unusual authentication pattern detected. Please slow down.'
         });
@@ -327,6 +351,8 @@ export function anomalyDetect(req, res, next) {
             `Wallet enumeration: ${pattern.walletSet.size} different wallets from single IP in ${ANOMALY_WALLET_WINDOW / 1000}s`,
             'warn'
         );
+        // Mark as security-generated 403 so trackRejection doesn't cascade into an IP ban
+        res.skipBanTracking = true;
         return res.status(403).json({
             error: 'Security Alert: Too many wallet addresses from your IP. Please try again later.'
         });
@@ -388,6 +414,8 @@ export function bruteForceGuard(req, res, next) {
             `Blocked auth attempt (still blocked for ${retryAfter}s)`,
             'warn'
         );
+        // Mark as security-generated 403 so it doesn't cascade into an IP ban
+        res.skipBanTracking = true;
         return res.status(403).json({
             error: 'Too many failed authentication attempts. Please wait before trying again.',
             retryAfter

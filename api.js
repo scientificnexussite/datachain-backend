@@ -1799,12 +1799,23 @@ app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
             const totalUsdCost = matchResult.trades.reduce((sum, t) => sum + (t.amountUsd || 0), 0);
             limitFeeUsd = fixDust(totalUsdCost * feeRate);
             if (limitFeeUsd > 1e-8) {
+                // 75% → platform revenue (system), 25% → staking yield pool (fee_pool)
+                const feeToSystem = fixDust(limitFeeUsd * 0.75);
+                const feeToPool   = fixDust(limitFeeUsd * 0.25);
                 await mempool.addTransaction({
                     from: uid, to: 'system',
-                    amount: limitFeeUsd, type: 'USD_WITHDRAWAL',
+                    amount: feeToSystem, type: 'USD_WITHDRAWAL',
                     timestamp: Date.now(), isSystemGenerated: true,
                     description: `Trading fee (${(feeRate * 100).toFixed(2)}%)`
                 });
+                if (feeToPool > 1e-8) {
+                    await mempool.addTransaction({
+                        from: uid, to: 'fee_pool',
+                        amount: feeToPool, type: 'USD_WITHDRAWAL',
+                        timestamp: Date.now() + 1, isSystemGenerated: true,
+                        description: `Yield pool contribution (${(feeRate * 100).toFixed(2)}%)`
+                    });
+                }
             }
         }
 
@@ -2357,12 +2368,23 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
         const feeUsd  = fixDust(matchResult.totalUsdCost * feeRate);
 
         if (feeUsd > 1e-8) {
+            // 75% → platform revenue (system), 25% → staking yield pool (fee_pool)
+            const feeToSystem = fixDust(feeUsd * 0.75);
+            const feeToPool   = fixDust(feeUsd * 0.25);
             await mempool.addTransaction({
                 from: uid, to: 'system',
-                amount: feeUsd, type: 'USD_WITHDRAWAL',
+                amount: feeToSystem, type: 'USD_WITHDRAWAL',
                 timestamp: Date.now(), isSystemGenerated: true,
                 description: `Trading fee (${(feeRate * 100).toFixed(2)}%)`
             });
+            if (feeToPool > 1e-8) {
+                await mempool.addTransaction({
+                    from: uid, to: 'fee_pool',
+                    amount: feeToPool, type: 'USD_WITHDRAWAL',
+                    timestamp: Date.now() + 1, isSystemGenerated: true,
+                    description: `Yield pool contribution (${(feeRate * 100).toFixed(2)}%)`
+                });
+            }
         }
 
         // UPGRADE: Broadcast TRADE_EXECUTED for real-time trade activity feed
@@ -4958,17 +4980,26 @@ app.post('/stake/claim', txLimiter, requireWeb3Auth, async (req, res) => {
             timestamp: Date.now(), isSystemGenerated: true, description: `Stake Claim (Principal Return)`
         };
 
+        // Sustainable yield: paid from fee_pool USD balance (not minted from thin air)
+        const poolUsdBalance = nexusChain.state.getUsd('fee_pool');
+        if (poolUsdBalance < yieldAmount) {
+            return res.status(400).json({
+                error: `Yield pool temporarily low. Available: $${poolUsdBalance.toFixed(4)}, needed: $${yieldAmount.toFixed(4)}. Try again when more trading activity has refilled the pool.`
+            });
+        }
+
         const yieldTx = {
-            from: 'system', to: uid, amount: yieldAmount,
-            type: 'MINT', tokenSymbol: 'SYR',
-            timestamp: Date.now() + 1, isSystemGenerated: true, description: `Stake Yield (${(apy*100)}% APY)`
+            from: 'fee_pool', to: uid, amount: yieldAmount,
+            type: 'USD_TRANSFER',
+            timestamp: Date.now() + 1, isSystemGenerated: true,
+            description: `Stake Yield (${(apy * 100)}% APY) — paid from yield pool`
         };
 
         if (await mempool.addTransactionBatch([principalTx, yieldTx])) {
             broadcastP2P({ type: 'BROADCAST_TX', data: principalTx });
             broadcastP2P({ type: 'BROADCAST_TX', data: yieldTx });
             await pool.query('UPDATE staking_positions SET status = $1 WHERE id = $2', ['CLAIMED', stakeId]);
-            res.json({ success: true, message: `Successfully claimed ${parseFloat(stake.amount)} SYR + ${yieldAmount.toFixed(4)} SYR yield.` });
+            res.json({ success: true, message: `Successfully claimed ${parseFloat(stake.amount)} SYR principal + $${yieldAmount.toFixed(4)} USD yield from pool.` });
         } else {
             res.status(400).json({ error: 'Failed to process claim. Mempool full.' });
         }
@@ -5812,14 +5843,16 @@ app.post('/api/kyc/create-session', txLimiter, requireWeb3Auth, (req, res) => {
     res.json({ status: 'verified', message: 'Verification not required.' });
 });
 app.get('/api/kyc/return', (req, res) => {
-    res.redirect(303, 'https://syrpts-terminal.vercel.app');
+    // Bug #1 Fix: redirect to live domain, not old Vercel URL
+    res.redirect(303, 'https://scientificnexus.net');
 });
 
 // POST /p2p/admin-resolve - Limitation 7 FIX: Force resolve a disputed P2P trade
 app.post('/p2p/admin-resolve', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const uid = req.user.uid;
-        if (uid !== config.blockchain.miner_address) return res.status(403).json({ error: 'Admin only.' });
+        // Bug #2 Fix: check ADMIN_WALLET env var, not the miner address from config
+        if (uid.toLowerCase() !== ADMIN_WALLET) return res.status(403).json({ error: 'Admin only.' });
         const { tradeId, resolution } = req.body; 
         const tRes = await pool.query("SELECT * FROM p2p_trades WHERE id = $1 AND status = 'DISPUTED'", [tradeId]);
         if (tRes.rows.length === 0) return res.status(404).json({ error: 'Disputed trade not found.' });
@@ -6140,6 +6173,182 @@ app.use((req, res) => { res.status(404).json({ error: 'API Node Endpoint Not Fou
     } catch(e) {
         console.warn(chalk.yellow('[AUTO-MIGRATE] Legacy token scan failed:', e.message));
     }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ADMIN ENDPOINTS — Protected by ECDSA requireWeb3Auth + ADMIN_WALLET check
+    // Only the ADMIN_WALLET can call these. Rate limited to 5/min.
+    // ═══════════════════════════════════════════════════════════════════════════
+    const adminLimiter = rateLimit({ windowMs: 60 * 1000, max: 5, standardHeaders: true, legacyHeaders: false });
+
+    // GET /admin/stats — full platform analytics for admin dashboard
+    app.get('/admin/stats', adminLimiter, requireWeb3Auth, async (req, res) => {
+        if (req.user.uid.toLowerCase() !== ADMIN_WALLET) return res.status(403).json({ error: 'Forbidden: admin only' });
+        try {
+            const now = Date.now();
+            const oneDay   = 86400000;
+            const thirtyDays = 30 * oneDay;
+
+            // System + fee_pool balances
+            const systemUsd = nexusChain.state.getUsd('system');
+            const systemSyr = nexusChain.state.getBalance('system', 'SYR');
+            const systemSdx = nexusChain.state.getBalance('system', 'SDX');
+            const feePoolUsd = nexusChain.state.getUsd('fee_pool');
+
+            // All-time revenue from system (USD fees)
+            const allTimeRes = await pool.query(
+                `SELECT COALESCE(SUM(amount),0) as total FROM transactions
+                 WHERE to_address='system' AND type='USD_WITHDRAWAL' AND is_system_generated=TRUE`
+            );
+            // This month revenue
+            const thisMonthStart = new Date(); thisMonthStart.setDate(1); thisMonthStart.setHours(0,0,0,0);
+            const monthRes = await pool.query(
+                `SELECT COALESCE(SUM(amount),0) as total FROM transactions
+                 WHERE to_address='system' AND type='USD_WITHDRAWAL' AND is_system_generated=TRUE
+                 AND timestamp_ms >= $1`, [thisMonthStart.getTime()]
+            );
+            // All-time SYR fees to system
+            const syrFeesRes = await pool.query(
+                `SELECT COALESCE(SUM(amount),0) as total FROM transactions
+                 WHERE to_address='system' AND token_symbol='SYR' AND type='TRANSFER' AND is_system_generated=TRUE`
+            );
+            // Active users (wallets with at least 1 trade in last 30 days)
+            const activeUsersRes = await pool.query(
+                `SELECT COUNT(DISTINCT from_address) as cnt FROM transactions
+                 WHERE type IN ('USD_WITHDRAWAL','TRANSFER') AND timestamp_ms >= $1
+                 AND from_address NOT IN ('system','fee_pool','staking_pool')`, [now - thirtyDays]
+            );
+            // Trades today
+            const tradesTodayRes = await pool.query(
+                `SELECT COUNT(*) as cnt FROM transactions WHERE type='USD_WITHDRAWAL'
+                 AND timestamp_ms >= $1 AND is_system_generated=TRUE`, [now - oneDay]
+            );
+            // Trades this week
+            const tradesWeekRes = await pool.query(
+                `SELECT COUNT(*) as cnt FROM transactions WHERE type='USD_WITHDRAWAL'
+                 AND timestamp_ms >= $1 AND is_system_generated=TRUE`, [now - 7 * oneDay]
+            );
+            // Top 5 fee-generating tokens
+            const topTokensRes = await pool.query(
+                `SELECT token_symbol, COALESCE(SUM(amount),0) as fee_usd FROM transactions
+                 WHERE to_address='system' AND type='USD_WITHDRAWAL' AND is_system_generated=TRUE
+                 AND token_symbol IS NOT NULL
+                 GROUP BY token_symbol ORDER BY fee_usd DESC LIMIT 5`
+            );
+            // Total staked SYR
+            const totalStakedRes = await pool.query(
+                `SELECT COALESCE(SUM(amount),0) as total FROM staking_positions WHERE status='LOCKED'`
+            );
+            // Total staking positions active
+            const stakingCountRes = await pool.query(
+                `SELECT COUNT(*) as cnt FROM staking_positions WHERE status='LOCKED'`
+            );
+            // Total yield paid from fee_pool
+            const yieldPaidRes = await pool.query(
+                `SELECT COALESCE(SUM(amount),0) as total FROM transactions
+                 WHERE from_address='fee_pool' AND is_system_generated=TRUE`
+            );
+            // Mempool load
+            const mempoolCount = mempool.getPendingCount ? mempool.getPendingCount() : 0;
+            const mempoolLoad = mempoolCount / 5000;
+
+            res.json({
+                systemBalance:    { usd: systemUsd, syr: systemSyr, sdx: systemSdx },
+                feePoolBalance:   { usd: feePoolUsd },
+                revenueAllTime:   { usd: parseFloat(allTimeRes.rows[0].total), syr: parseFloat(syrFeesRes.rows[0].total) },
+                revenueThisMonth: { usd: parseFloat(monthRes.rows[0].total) },
+                activeUsers30d:   parseInt(activeUsersRes.rows[0].cnt),
+                totalTradesToday: parseInt(tradesTodayRes.rows[0].cnt),
+                totalTradesWeek:  parseInt(tradesWeekRes.rows[0].cnt),
+                topTokensByFee:   topTokensRes.rows.map(r => ({ ticker: r.token_symbol, feeUsd: parseFloat(r.fee_usd) })),
+                totalStaked:      parseFloat(totalStakedRes.rows[0].total),
+                stakingPositions: parseInt(stakingCountRes.rows[0].cnt),
+                totalYieldPaid:   parseFloat(yieldPaidRes.rows[0].total),
+                mempoolLoad:      parseFloat(mempoolLoad.toFixed(4)),
+                mempoolCount
+            });
+        } catch(e) {
+            console.error('[ADMIN/STATS]', e.message);
+            res.status(500).json({ error: 'Stats query failed.' });
+        }
+    });
+
+    // POST /admin/sweep-fees — transfer system/fee_pool balance to ADMIN_WALLET
+    app.post('/admin/sweep-fees', adminLimiter, requireWeb3Auth, async (req, res) => {
+        if (req.user.uid.toLowerCase() !== ADMIN_WALLET) return res.status(403).json({ error: 'Forbidden: admin only' });
+        const { asset, source } = req.body; // asset: 'USD'|'SYR'|'SDX', source: 'system'|'fee_pool'
+        if (!['USD','SYR','SDX'].includes(asset)) return res.status(400).json({ error: 'Invalid asset. Use USD, SYR, or SDX.' });
+        const srcAddr = source === 'fee_pool' ? 'fee_pool' : 'system';
+        try {
+            let amount, type;
+            if (asset === 'USD') {
+                amount = nexusChain.state.getUsd(srcAddr);
+                type = 'USD_TRANSFER';
+            } else {
+                amount = nexusChain.state.getBalance(srcAddr, asset);
+                type = 'TRANSFER';
+            }
+            if (!amount || amount < 1e-8) return res.status(400).json({ error: `No ${asset} balance to sweep from ${srcAddr}.` });
+            const tx = {
+                from: srcAddr, to: ADMIN_WALLET,
+                amount, type,
+                ...(asset !== 'USD' ? { tokenSymbol: asset } : {}),
+                timestamp: Date.now(), isSystemGenerated: true,
+                description: `Admin fee sweep: ${asset} from ${srcAddr}`
+            };
+            await mempool.addTransaction(tx);
+            console.log(chalk.magenta(`[ADMIN SWEEP] ${amount} ${asset} from ${srcAddr} → ADMIN_WALLET`));
+            res.json({ success: true, asset, source: srcAddr, amount, message: `Sweeping ${amount.toFixed(6)} ${asset} to your wallet. Will settle in next block.` });
+        } catch(e) {
+            console.error('[ADMIN/SWEEP]', e.message);
+            res.status(500).json({ error: 'Sweep failed.' });
+        }
+    });
+
+    // GET /admin/revenue-chart — 30-day daily fee breakdown
+    app.get('/admin/revenue-chart', adminLimiter, requireWeb3Auth, async (req, res) => {
+        if (req.user.uid.toLowerCase() !== ADMIN_WALLET) return res.status(403).json({ error: 'Forbidden: admin only' });
+        try {
+            const thirtyDaysAgo = Date.now() - 30 * 86400000;
+            const rows = await pool.query(
+                `SELECT DATE(to_timestamp(timestamp_ms/1000)) as day,
+                        COALESCE(SUM(CASE WHEN to_address='system' THEN amount ELSE 0 END),0) as system_usd,
+                        COALESCE(SUM(CASE WHEN to_address='fee_pool' THEN amount ELSE 0 END),0) as pool_usd
+                 FROM transactions
+                 WHERE type='USD_WITHDRAWAL' AND is_system_generated=TRUE AND timestamp_ms >= $1
+                 GROUP BY day ORDER BY day ASC`, [thirtyDaysAgo]
+            );
+            res.json({ days: rows.rows.map(r => ({
+                date: r.day,
+                systemFeeUsd: parseFloat(r.system_usd),
+                poolFeeUsd: parseFloat(r.pool_usd),
+                totalFeeUsd: parseFloat(r.system_usd) + parseFloat(r.pool_usd)
+            }))});
+        } catch(e) {
+            console.error('[ADMIN/REVENUE-CHART]', e.message);
+            res.status(500).json({ error: 'Chart query failed.' });
+        }
+    });
+
+    // GET /admin/p2p-disputes — list all disputed P2P trades for admin resolution
+    app.get('/admin/p2p-disputes', adminLimiter, requireWeb3Auth, async (req, res) => {
+        if (req.user.uid.toLowerCase() !== ADMIN_WALLET) return res.status(403).json({ error: 'Forbidden: admin only' });
+        try {
+            const result = await pool.query(
+                `SELECT t.id, t.offer_id, t.asset_symbol, t.amount, t.status,
+                        t.merchant_address, t.buyer_address, t.created_at, t.updated_at,
+                        o.pay_method, o.price_per_unit
+                 FROM p2p_trades t
+                 LEFT JOIN p2p_offers o ON o.id = t.offer_id
+                 WHERE t.status = 'DISPUTED'
+                 ORDER BY t.created_at DESC
+                 LIMIT 50`
+            );
+            res.json({ disputes: result.rows, count: result.rows.length });
+        } catch(e) {
+            console.error('[ADMIN/P2P-DISPUTES]', e.message);
+            res.status(500).json({ error: 'Failed to fetch disputes.' });
+        }
+    });
 
     server.listen(port, '0.0.0.0', () => {
         console.log(chalk.blue.bold(`--- SCIENTIFIC NEXUS API RUNNING ON PORT ${port} ---`));

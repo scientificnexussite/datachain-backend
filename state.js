@@ -61,7 +61,10 @@ class State {
     const parsedAmount = parseFloat(amount);
     if (isNaN(parsedAmount) || parsedAmount <= 0) return false;
     const current = this.getUsd(address);
-    if (address !== 'system' && current < parsedAmount) return false;
+    // 'system' and 'fee_pool' are trusted virtual addresses — they can spend their
+    // real balance. All other addresses must have sufficient funds first.
+    const isTrustedVirtual = address === 'system' || address === 'fee_pool';
+    if (!isTrustedVirtual && current < parsedAmount) return false;
     this.usd_balances[address] = fixDust(current - parsedAmount);
     return true;
   }

@@ -1,4 +1,4 @@
-import express from 'express';
+﻿import express from 'express';
 import bodyParser from 'body-parser';
 import cors from 'cors';
 import chalk from 'chalk';
@@ -14,35 +14,35 @@ import pool from './db.js';
 import mempool from './mempool.js';
 import { DataChain } from './datachain.js';
 import validator from './validator.js';
-import menuBook, { processReferralBonus } from './menubook.js'; // IMPROVEMENT 4 — static import
+import menuBook, { processReferralBonus } from './menubook.js'; // IMPROVEMENT 4 Ã¢â‚¬â€ static import
 import { initP2P, broadcastP2P } from './p2p.js';
 import config from './config.json' with { type: 'json' };
 import { autoban, sanitize, anomalyDetect, bruteForceGuard, guardWebSocket, logSecurityEvent } from './security.js';
 import { acquireTradeLock, releaseTradeLock, checkAntiSandwich, initVirtualReserves, getEffectivePrice, checkGraduation } from './amm.js';
 import { startNoiseTrader, recordHumanTrade } from './noise-trader.js';
 import { updateTWAP, getTWAP } from './twap.js';
-// Stripe removed — KYC verification system disabled. No USA address/number required.
+// Stripe removed Ã¢â‚¬â€ KYC verification system disabled. No USA address/number required.
 
-// ─── PayPal Configuration ─────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ PayPal Configuration Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 const PAYPAL_CLIENT_ID     = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET;
 const PAYPAL_API_BASE      = process.env.PAYPAL_MODE === 'live'
     ? 'https://api-m.paypal.com'
     : 'https://api-m.sandbox.paypal.com';
     
-// ─── NowPayments Configuration ────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ NowPayments Configuration Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 const NOWPAYMENTS_API_KEY  = process.env.NOWPAYMENTS_API_KEY || '';
 // NowPayments Mass Payout requires JWT auth in addition to the API key.
 // Set NOWPAYMENTS_EMAIL and NOWPAYMENTS_PASSWORD in Railway environment variables.
 const NOWPAYMENTS_EMAIL    = process.env.NOWPAYMENTS_EMAIL    || '';
 const NOWPAYMENTS_PASSWORD = process.env.NOWPAYMENTS_PASSWORD || '';
-// Admin wallet address — the only wallet that can instantly approve withdrawal addresses.
+// Admin wallet address Ã¢â‚¬â€ the only wallet that can instantly approve withdrawal addresses.
 // Set ADMIN_WALLET in Railway environment variables to your Syrpts wallet address.
 const ADMIN_WALLET         = (process.env.ADMIN_WALLET || '').toLowerCase();
 const NOWPAYMENTS_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET || '';
 const NOWPAYMENTS_API_BASE = 'https://api.nowpayments.io/v1';
 
-// ── NowPayments JWT Helper ────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ NowPayments JWT Helper Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // The NowPayments Mass Payout API (/payout) requires Bearer JWT authentication
 // IN ADDITION to the x-api-key header. Without this, the API returns:
 // "Authorization header is empty (Bearer JWTtoken is required)"
@@ -63,7 +63,7 @@ async function getNowPaymentsJWT() {
     return authData.token;
 }
 
-// ── tryAutoWhitelistNowPayments ───────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ tryAutoWhitelistNowPayments Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // NowPayments DOES NOT have a public API for payout address whitelist management.
 // All three known endpoint formats returned 404 "Endpoint not found" in testing.
 // The whitelist is designed for businesses with fixed recipients, not public platforms.
@@ -76,10 +76,10 @@ async function tryAutoWhitelistNowPayments(address, currency, label) {
     // NowPayments whitelist API confirmed non-existent (404 on all endpoints).
     // Address security is handled by: KYC gate + ECDSA signature + JWT auth + IP whitelist.
     // Addresses in our own withdrawal_addresses table are the security layer.
-    console.log(chalk.green(`[ADDRESS BOOK] Auto-approved: ${address} (${currency}) — whitelist managed by address book`));
+    console.log(chalk.green(`[ADDRESS BOOK] Auto-approved: ${address} (${currency}) Ã¢â‚¬â€ whitelist managed by address book`));
     return { success: true };
 }
-// ─── Database Schema Init ─────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Database Schema Init Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 pool.query(`
     CREATE TABLE IF NOT EXISTS api_state (
         id VARCHAR(50) PRIMARY KEY,
@@ -99,7 +99,7 @@ pool.query(`
         type       VARCHAR(20)  NOT NULL DEFAULT 'info',
         created_at BIGINT       NOT NULL DEFAULT 0
     );
-    -- Issue 1/3: Token burn/deletion system — 7-day countdown before permanent removal
+    -- Issue 1/3: Token burn/deletion system Ã¢â‚¬â€ 7-day countdown before permanent removal
     CREATE TABLE IF NOT EXISTS token_burn_requests (
         id           SERIAL       PRIMARY KEY,
         ticker       VARCHAR(20)  NOT NULL UNIQUE,
@@ -139,7 +139,7 @@ pool.query(`
         created_at BIGINT
     );
     -- Task 1: Persistent domain ownership verification records.
-    -- Each row represents one verification attempt (pending → verified → used).
+    -- Each row represents one verification attempt (pending Ã¢â€ â€™ verified Ã¢â€ â€™ used).
     -- A 'verified' row is required before /mint-new-cash will proceed.
     -- After a successful deploy the row is marked 'used' so it cannot be reused
     -- for a second ticker (preventing domain squatting abuse).
@@ -257,7 +257,7 @@ pool.query(`
     );
 
     -- Users pre-register withdrawal addresses before use. Each address must be
-    -- reviewed and added to NowPayments whitelist by admin before status → approved.
+    -- reviewed and added to NowPayments whitelist by admin before status Ã¢â€ â€™ approved.
     -- This keeps NowPayments security enabled while supporting a public platform.
     CREATE TABLE IF NOT EXISTS withdrawal_addresses (
         id           SERIAL PRIMARY KEY,
@@ -312,7 +312,7 @@ pool.query(`
 // SECURITY UPDATE: Safely add referral code column to existing database without crashing
 pool.query(`ALTER TABLE public_keys ADD COLUMN IF NOT EXISTS referral_code VARCHAR(5) UNIQUE;`).catch(() => {});
 
-// ─── Express App ──────────────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Express App Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 const app  = express();
 app.set('trust proxy', 1);
 const port = process.env.PORT || config.network.api_port;
@@ -322,11 +322,11 @@ let positionsCache = new Map();
 
 app.use(helmet());
 
-// ─── Security Layers (Phase 4) ────────────────────────────────────────────────
-// Layer 6: DDoS auto-ban — fastest rejection path, runs before everything
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Security Layers (Phase 4) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// Layer 6: DDoS auto-ban Ã¢â‚¬â€ fastest rejection path, runs before everything
 app.use(autoban);
 
-// ─── CORS ─────────────────────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ CORS Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 const allowedOrigins = [
     'https://scientificnexus.net',
     'https://www.scientificnexus.net',
@@ -346,8 +346,8 @@ app.use(cors({
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Origin', 'X-Requested-With', 'Content-Type', 'Accept', 'Authorization']
 }));
-// ─── Stripe Identity & Payments Webhook (Must be before bodyParser) ───────────
-// KYC webhook removed — Stripe verification system disabled.
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Stripe Identity & Payments Webhook (Must be before bodyParser) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// KYC webhook removed Ã¢â‚¬â€ Stripe verification system disabled.
 
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ limit: '10mb', extended: true }));
@@ -357,7 +357,7 @@ app.use(sanitize);
 app.use(anomalyDetect);
 app.use(bruteForceGuard);
 
-// ─── WebSocket Server ─────────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ WebSocket Server Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 const server = createServer(app);
 const wss    = new WebSocketServer({ server });
 initP2P(wss, nexusChain);
@@ -368,7 +368,7 @@ global.broadcastWS = (event, data) => {
     });
 };
 
-// IMPROVEMENT 1 — WebSocket PING/PONG heartbeat handler.
+// IMPROVEMENT 1 Ã¢â‚¬â€ WebSocket PING/PONG heartbeat handler.
 // The client sends { event: 'PING' } every 30 seconds; the server replies with
 // { event: 'PONG' }.  This keeps connections alive through Railway's reverse
 // proxy (and any other load balancer) that would otherwise silently close idle
@@ -384,13 +384,13 @@ wss.on('connection', (ws) => {
                 ws.send(JSON.stringify({ event: 'PONG' }));
             }
         } catch (e) {
-            // Malformed message — ignore silently
+            // Malformed message Ã¢â‚¬â€ ignore silently
         }
     });
 });
 
-// ─── Rate Limiters ────────────────────────────────────────────────────────────
-// Write limiter — kept as-is on all mutation endpoints
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Rate Limiters Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// Write limiter Ã¢â‚¬â€ kept as-is on all mutation endpoints
 const txLimiter = rateLimit({
     windowMs: 60 * 1000,
     max: 50,
@@ -398,7 +398,7 @@ const txLimiter = rateLimit({
     message: { error: 'Too many transactions submitted. Please try again later.' }
 });
 
-// IMPROVEMENT 5 — Read limiter applied to public data endpoints.
+// IMPROVEMENT 5 Ã¢â‚¬â€ Read limiter applied to public data endpoints.
 // 200 req/min per IP is generous for legitimate use (charts, explorers, bots)
 // while blocking the unthrottled hammering of PostgreSQL-backed read routes.
 const readLimiter = rateLimit({
@@ -408,7 +408,7 @@ const readLimiter = rateLimit({
     message: { error: 'Too many read requests. Please slow down.' }
 });
 
-// ─── DER Signature Helper ─────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ DER Signature Helper Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 const rawToDer = (rawSigHex) => {
     const toStrictHexInt = (hex) => {
         while (hex.length > 2 && hex.startsWith('00')) hex = hex.substring(2);
@@ -424,7 +424,7 @@ const rawToDer = (rawSigHex) => {
     return '30' + seqLen + seq;
 };
 
-// ─── ECDSA Auth Middleware ─────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ ECDSA Auth Middleware (body-based Ã¢â‚¬â€ for POST endpoints) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 const requireWeb3Auth = async (req, res, next) => {
     const { signature, publicKey, uid, ...payloadData } = req.body;
     if (!signature || !publicKey || !uid)
@@ -467,7 +467,55 @@ const requireWeb3Auth = async (req, res, next) => {
     }
 };
 
-// ─── PayPal Token Helper ──────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ ECDSA Auth Middleware (header-based Ã¢â‚¬â€ for GET admin endpoints) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// GET requests have no body, so auth credentials are passed as HTTP headers.
+// Headers: X-Public-Key, X-Signature (hex), X-Timestamp (epoch ms)
+
+// --- ECDSA Auth Middleware (header-based - for GET admin endpoints) ------------------
+// GET requests have no body. Auth credentials are sent as HTTP headers.
+// The signed payload object is {method, url, timestamp} - same format as signPayload().
+// Headers: X-Public-Key (PEM), X-UID (wallet address), X-Signature (hex DER), X-Timestamp (ms)
+const requireHeaderAuth = async (req, res, next) => {
+    const publicKey = req.headers['x-public-key'];
+    const signature  = req.headers['x-signature'];
+    const timestamp  = req.headers['x-timestamp'];
+    const uid        = req.headers['x-uid'];
+
+    if (!publicKey || !signature || !timestamp || !uid)
+        return res.status(401).json({ error: 'Unauthorized: Missing admin auth headers.' });
+
+    try {
+        // 1. Replay protection: timestamp must be within 90 seconds
+        const timeDiff = Math.abs(Date.now() - parseInt(timestamp));
+        if (timeDiff > 90000)
+            return res.status(401).json({ error: 'Unauthorized: Request expired (90s limit).' });
+
+        // 2. Reconstruct the payload object the frontend signed via signPayload()
+        const method  = req.method.toUpperCase();
+        const fullUrl = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+        const payloadStr = JSON.stringify({ method, url: fullUrl, timestamp: parseInt(timestamp) });
+
+        // 3. Verify ECDSA signature
+        const verify = crypto.createVerify('SHA256');
+        verify.update(payloadStr);
+        let derSignature = signature.length === 128 ? rawToDer(signature) : signature;
+        if (!verify.verify(publicKey, derSignature, 'hex'))
+            return res.status(401).json({ error: 'Unauthorized: Invalid admin signature.' });
+
+        req.user = { uid };
+        next();
+    } catch (e) {
+        return res.status(401).json({ error: 'Unauthorized: Malformed admin auth headers.' });
+    }
+};
+
+        next();
+    } catch (e) {
+        return res.status(401).json({ error: 'Unauthorized: Malformed admin auth headers.' });
+    }
+};
+
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ PayPal Token Helper Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 async function getPayPalAccessToken() {
     if (!PAYPAL_CLIENT_ID || !PAYPAL_CLIENT_SECRET)
         throw new Error('PayPal credentials not configured on server.');
@@ -482,10 +530,10 @@ async function getPayPalAccessToken() {
     return data.access_token;
 }
 
-// ─── Utilities ────────────────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Utilities Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 const fixDust = (num) => Number(Number(num).toFixed(8));
 
-// ─── Dynamic Trading Fee ──────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Dynamic Trading Fee Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // Base fee: 0.15% (cheaper than Binance VIP0). Scales up to 0.30% during congestion.
 const BASE_FEE_RATE = 0.0015; // 0.15%
 const MAX_FEE_RATE  = 0.003;  // 0.30%
@@ -493,7 +541,7 @@ const MEMPOOL_MAX   = 5000;
 
 function getCurrentFeeRate() {
     const count = mempool.getPendingCount();
-    const load  = count / MEMPOOL_MAX; // 0.0 → 1.0
+    const load  = count / MEMPOOL_MAX; // 0.0 Ã¢â€ â€™ 1.0
     if (load < 0.5) return BASE_FEE_RATE;                                    // Normal
     if (load < 0.8) return parseFloat((BASE_FEE_RATE * (1 + (load - 0.5) / 0.3)).toFixed(6)); // Linear ramp
     return MAX_FEE_RATE;                                                     // Congested
@@ -509,14 +557,14 @@ function getNetworkStatus() {
     return { mempoolCount: count, mempoolLoad: parseFloat(load.toFixed(3)), feeRate, status };
 }
 
-// ─── Hard Peg — ONLY SDX/SDTX ($1.00 stablecoins) ────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Hard Peg Ã¢â‚¬â€ ONLY SDX/SDTX ($1.00 stablecoins) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // Custom FDX/OpenChain tokens float freely via AMM + order book.
 async function getHardPeg(tokenSymbol) {
     if (['SDX', 'SDTX'].includes(tokenSymbol)) return 1.00;
     return null; // SYR and all custom tokens float freely
 }
 
-// ─── Seed Price — Used for initial price discovery only, NOT enforcement ──────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Seed Price Ã¢â‚¬â€ Used for initial price discovery only, NOT enforcement Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // Returns the pegPrice stored in the MINT description, or $0.00000001 as default.
 async function getSeedPrice(tokenSymbol) {
     try {
@@ -542,15 +590,15 @@ const apiCache = {
     menubook:   new Map(),
     tokenStats: new Map()  // Layer 1: per-custom-token stats cache (key = ticker)
 };
-const CACHE_TTL       = 10000; // 10s — general purpose
-const TOKEN_STATS_TTL = 30000; // 30s — custom token stats (price, supply, holders)
+const CACHE_TTL       = 10000; // 10s Ã¢â‚¬â€ general purpose
+const TOKEN_STATS_TTL = 30000; // 30s Ã¢â‚¬â€ custom token stats (price, supply, holders)
 
-// ── Token owner cache — populated at startup, zero DB cost on every request ──
+// Ã¢â€â‚¬Ã¢â€â‚¬ Token owner cache Ã¢â‚¬â€ populated at startup, zero DB cost on every request Ã¢â€â‚¬Ã¢â€â‚¬
 // During Railway cold start, ALL API calls that hit the DB time out simultaneously.
 // Pre-loading owner addresses once at startup (a single fast query after blockchain
 // loads) means /quick-stats/:ticker and /api/token/creator never need to query
-// the DB per-request — they use this in-memory Map instead.
-let tokenOwnerCache = new Map(); // ticker → to_address (deployer wallet)
+// the DB per-request Ã¢â‚¬â€ they use this in-memory Map instead.
+let tokenOwnerCache = new Map(); // ticker Ã¢â€ â€™ to_address (deployer wallet)
 async function preloadTokenOwners() {
     try {
         const res = await pool.query(
@@ -573,7 +621,7 @@ async function preloadTokenOwners() {
 let pendingPayPalOrders  = new Map();
 let pendingVerifications = new Map();
 
-// ─── Persisted API State ──────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Persisted API State Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 async function loadApiState() {
     try {
         const pRes = await pool.query("SELECT data FROM api_state WHERE id = 'paypal_orders'");
@@ -601,7 +649,7 @@ async function saveApiState() {
     } catch (e) { console.error('[API] DB state save failed.', e); }
 }
 
-// ─── Market Economics ─────────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Market Economics Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 async function updateMarketEconomics() {
     try {
         await menuBook.ensureLoaded();
@@ -615,7 +663,7 @@ async function updateMarketEconomics() {
         menuBook.books['SYR'].asks = menuBook.books['SYR'].asks.filter(a => a.uid !== 'system');
         menuBook.books['SYR'].bids = menuBook.books['SYR'].bids.filter(a => a.uid !== 'system');
 
-        // IMPROVEMENT 2 — only broadcast SYR's MENUBOOK_UPDATE here
+        // IMPROVEMENT 2 Ã¢â‚¬â€ only broadcast SYR's MENUBOOK_UPDATE here
         await menuBook.saveOrders('SYR');
 
         apiCache.stats.time   = 0;
@@ -631,7 +679,7 @@ async function updateMarketEconomics() {
     }
 }
 
-// IMPROVEMENT 6 — Server-side price alert checker.
+// IMPROVEMENT 6 Ã¢â‚¬â€ Server-side price alert checker.
 // Runs after every updateMarketEconomics() call so alerts fire 24/7 even when
 // the user's browser tab is closed.
 async function checkServerAlerts(token, newPrice) {
@@ -666,7 +714,7 @@ async function checkServerAlerts(token, newPrice) {
                         method: 'POST', headers: {'Content-Type': 'application/json'},
                         body: JSON.stringify({
                             chat_id: alert.email,
-                            text: `🚨 Syrpts Alert: ${token} price ${alert.condition} $${alert.target_value}!\nCurrent Price: $${newPrice}\nTerminal: https://syrpts-terminal.vercel.app`
+                            text: `Ã°Å¸Å¡Â¨ Syrpts Alert: ${token} price ${alert.condition} $${alert.target_value}!\nCurrent Price: $${newPrice}\nTerminal: https://syrpts-terminal.vercel.app`
                         })
                     });
                     console.log(chalk.cyan(`[ALERT] Telegram sent for ${token}`));
@@ -695,8 +743,8 @@ async function checkServerAlerts(token, newPrice) {
     }
 }
 
-// ─── AUTO-MINER ───────────────────────────────────────────────────────────────
-// ─── Task B: System Liquidity Pool ──────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ AUTO-MINER Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Task B: System Liquidity Pool Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // refreshAllPoolOrders() runs after every successful block and maintains one
 // bid and one ask per custom token with an active pool.  The 'system' address
 // always has virtual balance to fill these orders (credited by LIQUIDITY_INIT).
@@ -704,7 +752,7 @@ async function refreshAllPoolOrders() {
     if (!nexusChain || !nexusChain.state) return;
     await menuBook.ensureLoaded();
 
-    // FIX — Also run market-making for tokens with system handler addresses,
+    // FIX Ã¢â‚¬â€ Also run market-making for tokens with system handler addresses,
     // even if they don't have a formal liquidityPool entry yet.
     // When the creator sends tokens to nx_sys_... those tokens are held there,
     // but refreshAllPoolOrders previously only iterated liquidityPools tickers.
@@ -795,13 +843,13 @@ async function refreshAllPoolOrders() {
             }
         }
 
-        // UPGRADE: Dynamic order size — 5% of combined pool tokens, NO fixed upper limit.
+        // UPGRADE: Dynamic order size Ã¢â‚¬â€ 5% of combined pool tokens, NO fixed upper limit.
         // Previously capped at 10,000 per side which artificially restricted large pools.
         // Now large pools naturally offer larger orders, matching real DeFi market-making.
         const rawOrderSize = parseFloat((combinedTokenBal * 0.05).toFixed(8));
         if (rawOrderSize < 1e-6) continue;
 
-        // ±2.5% spread for free-floating tokens; exact peg for SDX/SDTX
+        // Ã‚Â±2.5% spread for free-floating tokens; exact peg for SDX/SDTX
         const bidPrice   = hardPeg ? hardPeg : parseFloat((poolPrice * 0.975).toFixed(8));
         const askPrice   = hardPeg ? hardPeg : parseFloat((poolPrice * 1.025).toFixed(8));
         
@@ -830,12 +878,12 @@ async function refreshAllPoolOrders() {
     }
 }
 
-// FIX 1 — The entire auto-miner body is now wrapped in try/catch/finally.
+// FIX 1 Ã¢â‚¬â€ The entire auto-miner body is now wrapped in try/catch/finally.
 //          The finally block unconditionally resets isMining = false so that a
 //          crash inside addBlock() (DB timeout, Worker Thread exit, etc.) can
 //          never permanently lock the miner.
 //
-// FIX 2 — Transactions are NOT permanently cleared from the mempool until
+// FIX 2 Ã¢â‚¬â€ Transactions are NOT permanently cleared from the mempool until
 //          addBlock() returns true.  If addBlock() returns false or throws,
 //          mempool.restoreTransactions() puts them back so they are retried
 //          on the next 5-second tick instead of being silently lost forever.
@@ -846,7 +894,7 @@ setInterval(async () => {
     if (pendingCount === 0) return;
 
     isMining = true;
-    // FIX 2 — Snapshot the pending batch but keep it recoverable
+    // FIX 2 Ã¢â‚¬â€ Snapshot the pending batch but keep it recoverable
     const pendingTxs = mempool.getAndClear();
 
     try {
@@ -859,11 +907,11 @@ setInterval(async () => {
             // Run server-side price alert check after every successful block
             await checkServerAlerts('SYR', currentPrice);
 
-            // Task B — Refresh system market-making orders for every custom token
+            // Task B Ã¢â‚¬â€ Refresh system market-making orders for every custom token
             // that has an active liquidity pool.  After each block, we clear the old
             // system bid/ask and re-place them at the current pool price so the spread
             // always reflects the true pool ratio. This runs silently after the block
-            // commit — errors here never affect block validity.
+            // commit Ã¢â‚¬â€ errors here never affect block validity.
             try {
                 await refreshAllPoolOrders();
             } catch (poolErr) {
@@ -885,7 +933,7 @@ setInterval(async () => {
                 }
             });
 
-                        // FIX 3 — Seed initial liquidity for newly minted custom tokens.
+                        // FIX 3 Ã¢â‚¬â€ Seed initial liquidity for newly minted custom tokens.
             // Without this, custom tokens have no ask orders in the book so
             // nobody can buy them, no MARKET_TRADE records are ever created,
             // and both charts stay blank forever.
@@ -925,7 +973,7 @@ setInterval(async () => {
                         }
                     }
 
-                    // Task B — Initialise the system liquidity pool for this token.
+                    // Task B Ã¢â‚¬â€ Initialise the system liquidity pool for this token.
                     // Pool starts with 5% of total supply (capped at 1M) and a matching
                     // virtual USD reserve at the seed price. These are system-virtual reserves
                     // (no tokens taken from deployer), enabling the system to market-make
@@ -952,22 +1000,22 @@ setInterval(async () => {
                 }
             }
         } else {
-            // FIX 2 — Block validation failed; put the transactions back
+            // FIX 2 Ã¢â‚¬â€ Block validation failed; put the transactions back
             console.log(chalk.red('[AUTO-MINER] Block validation failed. Restoring transactions to mempool.'));
             mempool.restoreTransactions(pendingTxs);
         }
     } catch (err) {
-        // FIX 1 — Unhandled exception caught; restore transactions so they
+        // FIX 1 Ã¢â‚¬â€ Unhandled exception caught; restore transactions so they
         // are not permanently lost, then let the next tick try again.
         console.error(chalk.red('[AUTO-MINER] Exception during mining:'), err.message);
         mempool.restoreTransactions(pendingTxs);
     } finally {
-        // FIX 1 — Always release the mining lock, even on exception
+        // FIX 1 Ã¢â‚¬â€ Always release the mining lock, even on exception
         isMining = false;
     }
 }, 5000);
 
-// ─── Keep-alive Ping ──────────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Keep-alive Ping Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 const BACKEND_URL = process.env.RAILWAY_PUBLIC_DOMAIN
     ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
     : `http://localhost:${port}`;
@@ -975,7 +1023,7 @@ setInterval(async () => {
     try { await fetch(`${BACKEND_URL}/health`); } catch (e) {}
 }, 4 * 60 * 1000);
 
-// ─── Stale State Cleanup ──────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Stale State Cleanup Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 setInterval(async () => {
     const now = Date.now();
     let updated = false;
@@ -996,9 +1044,9 @@ setInterval(async () => {
     }
 }, 15 * 60 * 1000);
 
-// ════════════════════════════════════════════════════════════════════════════════
+// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 // ROUTES
-// ════════════════════════════════════════════════════════════════════════════════
+// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 
 app.get('/health', (req, res) => {
     res.json({ status: 'alive', chainLength: nexusChain.blockCount, timestamp: Date.now() });
@@ -1008,9 +1056,9 @@ app.get('/config', (req, res) => {
     res.json({ paypalClientId: PAYPAL_CLIENT_ID, sandboxMode: process.env.PAYPAL_MODE !== 'live' });
 });
 
-// ─── Price Alert Endpoints (IMPROVEMENT 6) ────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Price Alert Endpoints (IMPROVEMENT 6) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
-// POST /alerts/set — store a server-side price alert (persisted in PostgreSQL)
+// POST /alerts/set Ã¢â‚¬â€ store a server-side price alert (persisted in PostgreSQL)
 app.post('/alerts/set', requireWeb3Auth, async (req, res) => {
     try {
         const { uid, token, condition, targetValue, email } = req.body;
@@ -1018,7 +1066,7 @@ app.post('/alerts/set', requireWeb3Auth, async (req, res) => {
             return res.status(400).json({ error: 'Missing required alert fields.' });
         if (!['above', 'below'].includes(condition))
             return res.status(400).json({ error: "Condition must be 'above' or 'below'." });
-        // Limitation 7 FIX — validate email format before persisting
+        // Limitation 7 FIX Ã¢â‚¬â€ validate email format before persisting
         const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
         if (!emailRegex.test(email) || email.length > 200)
             return res.status(400).json({ error: 'Invalid email address format.' });
@@ -1034,7 +1082,7 @@ app.post('/alerts/set', requireWeb3Auth, async (req, res) => {
     }
 });
 
-// POST /alerts/clear — deactivate all server-side alerts for a uid + token
+// POST /alerts/clear Ã¢â‚¬â€ deactivate all server-side alerts for a uid + token
 app.post('/alerts/clear', requireWeb3Auth, async (req, res) => {
     try {
         const { uid, token } = req.body;
@@ -1049,7 +1097,7 @@ app.post('/alerts/clear', requireWeb3Auth, async (req, res) => {
     }
 });
 
-// POST /alert/email — legacy immediate email trigger (kept for backwards compat)
+// POST /alert/email Ã¢â‚¬â€ legacy immediate email trigger (kept for backwards compat)
 app.post('/alert/email', async (req, res) => {
     const { uid, email, token, condition, targetValue, currentPrice: alertPrice } = req.body;
     const recipient = email || process.env.GMAIL_USER;
@@ -1073,7 +1121,7 @@ app.post('/alert/email', async (req, res) => {
     }
 });
 
-// ─── Menu Book ────────────────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Menu Book Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.get('/menubook', async (req, res) => {
     const token = req.query.token || 'SYR';
     await menuBook.ensureLoaded();
@@ -1091,7 +1139,7 @@ app.get('/menubook', async (req, res) => {
     res.json(data);
 });
 
-// ─── Network Stats ────────────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Network Stats Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.get('/network', (req, res) => {
     if (Date.now() - apiCache.network.time < CACHE_TTL && apiCache.network.data)
         return res.json(apiCache.network.data);
@@ -1108,7 +1156,7 @@ app.get('/network', (req, res) => {
     res.json(apiCache.network.data);
 });
 
-// ─── Fee Estimate ─────────────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Fee Estimate Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.get('/api/fee-estimate', (req, res) => {
     const amount = parseFloat(req.query.amount) || 0;
     const ns = getNetworkStatus();
@@ -1121,7 +1169,7 @@ app.get('/api/fee-estimate', (req, res) => {
     });
 });
 
-// ─── Price History (IMPROVEMENT 5 — readLimiter applied) ─────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Price History (IMPROVEMENT 5 Ã¢â‚¬â€ readLimiter applied) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.get('/pricehistory', readLimiter, async (req, res) => {
     const limit  = parseInt(req.query.limit)  || 500;
     const offset = parseInt(req.query.offset) || 0;
@@ -1154,7 +1202,7 @@ app.get('/pricehistory', readLimiter, async (req, res) => {
     }
 });
 
-// ─── Candlestick / OHLCV with timeframe support ──────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Candlestick / OHLCV with timeframe support Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // Supported timeframes: 1H (default), 4H, 1D, 1W
 // Returns OHLCV candles for any token from the DB.
 // Falls back to pricehistory line data as {timestamp,price} when no MARKET_TRADE
@@ -1259,7 +1307,7 @@ app.get('/api/chart/kline', async (req, res) => {
             volume: parseFloat(r.volume)
         }));
 
-        // ── SYR CACHE FALLBACK ────────────────────────────────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ SYR CACHE FALLBACK Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         // SYR trades before April 29 2026 have amount_usd = NULL so the OHLCV
         // query above always returns 0 rows for SYR. Use the in-memory
         // priceHistoryCache (always populated on startup) to build pseudo-candles
@@ -1321,7 +1369,7 @@ app.get('/api/chart/kline', async (req, res) => {
         }
 
         // If no OHLCV rows yet, fall back to pricehistory line data so the chart
-        // is never completely blank — "Awaiting First Trade" only shows when there
+        // is never completely blank Ã¢â‚¬â€ "Awaiting First Trade" only shows when there
         // is truly zero price data in the entire DB for this token.
         if (formatted.length === 0) {
             const lineRes = await pool.query(
@@ -1360,7 +1408,7 @@ app.get('/api/chart/kline', async (req, res) => {
             }
         }
 
-        // ── Ultra-fallback: menubook lastTradePrice / lowest ask ──────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ Ultra-fallback: menubook lastTradePrice / lowest ask Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         // If no MARKET_TRADE records exist in the DB at all for this token, but the
         // menubook has a live price (e.g. the seed SELL order was partially filled or
         // the deployer set an initial ask), synthesise a single candle from that price.
@@ -1399,7 +1447,7 @@ app.get('/api/chart/kline', async (req, res) => {
     }
 });
 
-// ─── Trending (IMPROVEMENT 5 — readLimiter applied) ──────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Trending (IMPROVEMENT 5 Ã¢â‚¬â€ readLimiter applied) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.get('/trending', readLimiter, async (req, res) => {
     try {
         const oneDayAgo = Date.now() - 24 * 60 * 60 * 1000;
@@ -1418,8 +1466,8 @@ app.get('/trending', readLimiter, async (req, res) => {
     }
 });
 
-// ─── Referral Sign-up (TASK 1: Now requireWeb3Auth-secured) ──────────────────
-// uid is taken from req.user.uid (the authenticated wallet) — NOT the request body —
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Referral Sign-up (TASK 1: Now requireWeb3Auth-secured) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// uid is taken from req.user.uid (the authenticated wallet) Ã¢â‚¬â€ NOT the request body Ã¢â‚¬â€
 // so a user cannot falsely assign a referrer to someone else's wallet.
 app.post('/referral/signup', txLimiter, requireWeb3Auth, async (req, res) => {
     const uid = req.user.uid;
@@ -1456,7 +1504,7 @@ app.post('/referral/signup', txLimiter, requireWeb3Auth, async (req, res) => {
     }
 });
 
-// ─── Token List (IMPROVEMENT 5 readLimiter; FEATURE: logoUrl) ────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Token List (IMPROVEMENT 5 readLimiter; FEATURE: logoUrl) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.get('/tokens', readLimiter, async (req, res) => {
     try {
         const tokensObj = Object.keys(nexusChain.state.balances);
@@ -1487,7 +1535,7 @@ app.get('/tokens', readLimiter, async (req, res) => {
             );
             const extraMetaMap = new Map(metaRes.rows.map(r => [r.ticker, r]));
                         dbRes.rows.forEach(row => {
-                // FEATURE — Parse logoUrl from the description JSON field.
+                // FEATURE Ã¢â‚¬â€ Parse logoUrl from the description JSON field.
                 // No schema change needed: logoUrl is stored inside the existing
                 // description JSONB alongside name, desc, and url.
                 let parsedDesc = {};
@@ -1518,7 +1566,7 @@ app.get('/tokens', readLimiter, async (req, res) => {
 
         // ISSUE FIX 3: Classify OpenTerminal tokens correctly even when their MINT
         // is not in the transactions table (e.g. blockchain only has 3 blocks loaded).
-        // Without this: OpenTerminal tokens fallthrough as platformType:'' → shown in
+        // Without this: OpenTerminal tokens fallthrough as platformType:'' Ã¢â€ â€™ shown in
         // DelChain portfolio instead of being filtered out.
         try {
             const openRes = await pool.query(
@@ -1539,11 +1587,11 @@ app.get('/tokens', readLimiter, async (req, res) => {
                     });
                 }
             });
-        } catch(e) { /* silent — openchain classification may be incomplete */ }
+        } catch(e) { /* silent Ã¢â‚¬â€ openchain classification may be incomplete */ }
 
         const tokens = tokensObj.map(ticker => {
             let totalCirculating = 0;
-            let totalHolders     = 0;   // FIX — count holders in the same loop, no extra DB query
+            let totalHolders     = 0;   // FIX Ã¢â‚¬â€ count holders in the same loop, no extra DB query
             for (const address in nexusChain.state.balances[ticker]) {
                 const bal = nexusChain.state.balances[ticker][address];
                 if (address !== 'system') {
@@ -1558,7 +1606,7 @@ app.get('/tokens', readLimiter, async (req, res) => {
             return {
                 ticker,
                 supply,
-                totalHolders,   // FIX — now included so Global Chains can display holder count
+                totalHolders,   // FIX Ã¢â‚¬â€ now included so Global Chains can display holder count
                 lastPrice,
                 description:  meta.description,
                 platformType: meta.platformType,
@@ -1568,8 +1616,8 @@ app.get('/tokens', readLimiter, async (req, res) => {
                 owner:        meta.owner,
                 initialPrice: meta.initialPrice,
                 isVerified:   meta.isVerified,
-                logoUrl:      meta.logoUrl,       // FEATURE — included in API response
-                publicUrl:    meta.publicUrl      // PHASE 8 — Public Visit URL
+                logoUrl:      meta.logoUrl,       // FEATURE Ã¢â‚¬â€ included in API response
+                publicUrl:    meta.publicUrl      // PHASE 8 Ã¢â‚¬â€ Public Visit URL
             };
         });
 
@@ -1579,7 +1627,7 @@ app.get('/tokens', readLimiter, async (req, res) => {
     }
 });
 
-// ─── Holders (IMPROVEMENT 5 — readLimiter applied) ────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Holders (IMPROVEMENT 5 Ã¢â‚¬â€ readLimiter applied) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.get('/holders/:ticker', readLimiter, async (req, res) => {
     try {
         const ticker       = req.params.ticker;
@@ -1598,18 +1646,18 @@ app.get('/holders/:ticker', readLimiter, async (req, res) => {
     }
 });
 
-// ─── Positions ────────────────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Positions Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/positions/:uid', requireWeb3Auth, async (req, res) => {
     const uid = req.params.uid;
     if (req.user.uid !== uid) return res.status(403).json({ error: 'Forbidden' });
 
-    // Limitation 9 FIX — time-based TTL (30 s) so stale entries don't live forever
+    // Limitation 9 FIX Ã¢â‚¬â€ time-based TTL (30 s) so stale entries don't live forever
     const POSITIONS_TTL = 30000;
     const cachedPos = positionsCache.get(uid);
     if (cachedPos && (Date.now() - cachedPos.time) < POSITIONS_TTL)
         return res.json({ positions: cachedPos.data });
 
-    // Limitation 1 FIX — Single batch query replaces the N+1 loop-per-token pattern.
+    // Limitation 1 FIX Ã¢â‚¬â€ Single batch query replaces the N+1 loop-per-token pattern.
     // Previously fired one DB round-trip per token the user holds; now one query
     // for all cost-basis data across every token simultaneously.
     let positionsArr = [];
@@ -1650,12 +1698,12 @@ app.post('/positions/:uid', requireWeb3Auth, async (req, res) => {
     } catch (e) {
         console.error(chalk.red('[API] Positions batch query failed'), e);
     }
-    // Limitation 9 FIX — add a timestamp so stale per-user entries can be TTL-expired
+    // Limitation 9 FIX Ã¢â‚¬â€ add a timestamp so stale per-user entries can be TTL-expired
     positionsCache.set(uid, { data: positionsArr, time: Date.now() });
     res.json({ positions: positionsArr });
 });
 
-// ─── Order Management ─────────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Order Management Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/api/orders/cancel', requireWeb3Auth, async (req, res) => {
     try {
         const { orderId, tokenSymbol = 'SYR' } = req.body;
@@ -1718,13 +1766,13 @@ app.post('/api/orders/:uid', requireWeb3Auth, (req, res) => {
     res.json(allOrders);
 });
 
-// ─── Limit Orders ─────────────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Limit Orders Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const { side, amountSyr, priceUsd, tokenSymbol = 'SYR' } = req.body;
         const uid = req.user.uid;
 
-        // KYC gate removed — identity verification no longer required to trade.
+        // KYC gate removed Ã¢â‚¬â€ identity verification no longer required to trade.
 
         // Fix 3: SDX and SDTX are non-tradeable stablecoins. They have dedicated
         // deposit/withdrawal endpoints and must NOT go through the order book.
@@ -1775,12 +1823,12 @@ app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
 
         await updateMarketEconomics();
 
-        // IMPROVEMENT 4 — Referral bonus called here, after trade is done, once per execution
+        // IMPROVEMENT 4 Ã¢â‚¬â€ Referral bonus called here, after trade is done, once per execution
         if (matchResult.trades.length > 0) {
             await processReferralBonus(uid, matchResult.trades, tokenSymbol);
         }
 
-        // IMPROVEMENT 6 — Check server-side price alerts after every trade
+        // IMPROVEMENT 6 Ã¢â‚¬â€ Check server-side price alerts after every trade
         if (matchResult.trades.length > 0) {
             const lastTradePrice = matchResult.trades[matchResult.trades.length - 1].price;
             await checkServerAlerts(tokenSymbol, lastTradePrice);
@@ -1792,14 +1840,14 @@ app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
             apiCache.tokenStats.delete(tokenSymbol);
         }
 
-        // ── Trading Fee Collection (same as market orders) ──────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ Trading Fee Collection (same as market orders) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         let limitFeeUsd = 0;
         if (matchResult.trades.length > 0) {
             const feeRate = getCurrentFeeRate();
             const totalUsdCost = matchResult.trades.reduce((sum, t) => sum + (t.amountUsd || 0), 0);
             limitFeeUsd = fixDust(totalUsdCost * feeRate);
             if (limitFeeUsd > 1e-8) {
-                // 75% → platform revenue (system), 25% → staking yield pool (fee_pool)
+                // 75% Ã¢â€ â€™ platform revenue (system), 25% Ã¢â€ â€™ staking yield pool (fee_pool)
                 const feeToSystem = fixDust(limitFeeUsd * 0.75);
                 const feeToPool   = fixDust(limitFeeUsd * 0.25);
                 await mempool.addTransaction({
@@ -1825,13 +1873,13 @@ app.post('/menubook/limit', txLimiter, requireWeb3Auth, async (req, res) => {
     }
 });
 
-// ─── Market Orders ────────────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Market Orders Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const { side, amountSyr, tokenSymbol = 'SYR', maxSlippage } = req.body;
         const uid          = req.user.uid;
 
-        // KYC gate removed — identity verification no longer required to trade.
+        // KYC gate removed Ã¢â‚¬â€ identity verification no longer required to trade.
 
         // Fix 3: SDX and SDTX are non-tradeable stablecoins.
         if (['SDX', 'SDTX'].includes(tokenSymbol)) {
@@ -1843,11 +1891,11 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
         if (!['BUY', 'SELL'].includes(side) || isNaN(parsedAmount) || parsedAmount <= 0)
             return res.status(400).json({ error: 'Invalid market order parameters.' });
 
-        // ── AMM UPGRADE: Trade Mutex Lock ─────────────────────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ AMM UPGRADE: Trade Mutex Lock Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         // Prevents double-spend race conditions from concurrent requests.
         await acquireTradeLock(uid);
 
-        // ── AMM UPGRADE: Anti-Sandwich Protection ────────────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ AMM UPGRADE: Anti-Sandwich Protection Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         // Block if same address does buy+sell of same token within 3 seconds.
         if (tokenSymbol !== 'SYR') {
             const sandwich = checkAntiSandwich(uid, tokenSymbol, side);
@@ -1857,7 +1905,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
             }
         }
 
-        // UPGRADE: Minimum trade value enforcement — reject dust trades worth < $0.01
+        // UPGRADE: Minimum trade value enforcement Ã¢â‚¬â€ reject dust trades worth < $0.01
         const seedPrice = menuBook.books[tokenSymbol]?.lastTradePrice || await getSeedPrice(tokenSymbol);
         if (seedPrice > 0 && parsedAmount * seedPrice < 0.01 && tokenSymbol !== 'SYR') {
             return res.status(400).json({ error: 'Trade too small. Minimum trade value is $0.01.' });
@@ -1880,7 +1928,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                 const fundsToCheck = side === 'BUY' ? availableUsd : availableToken;
         const matchResult  = await menuBook.matchMarketOrder(uid, side, parsedAmount, fundsToCheck, null, tokenSymbol);
 
-        // ── PHASE 1 FIX: System-Backed Stablecoin Liquidity ──────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ PHASE 1 FIX: System-Backed Stablecoin Liquidity Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         // The system acts as an infinite liquidity provider for SDX/SDTX at exactly $1.00.
         // This allows users to instantly swap SDX for internal trading USD (and vice versa).
         if (['SDX', 'SDTX'].includes(tokenSymbol) && matchResult.remaining > 1e-8) {
@@ -1914,10 +1962,10 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
             }
         }
 
-        // ── UPGRADE: Chunked BUY-Side AMM for Custom Tokens (x×y=k) ────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ UPGRADE: Chunked BUY-Side AMM for Custom Tokens (xÃƒâ€”y=k) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         // Real DeFi constant-product AMM: large buys cause exponential price increase.
         // Each chunk recalculates pool price before the next fill, so buying 100K tokens
-        // at $0.01 doesn't stay at $0.01 — it climbs to $0.012, $0.015, $0.02, etc.
+        // at $0.01 doesn't stay at $0.01 Ã¢â‚¬â€ it climbs to $0.012, $0.015, $0.02, etc.
         // Also supports OpenChain tokens (nx_open_*) alongside DelChain (nx_sys_*).
         if (side === 'BUY' && matchResult.remaining > 1e-8 && tokenSymbol !== 'SYR') {
             try {
@@ -2010,7 +2058,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                                 timestamp: Date.now(), isSystemGenerated: true
                             });
 
-                            // Update pool reserves (x×y=k constant-product)
+                            // Update pool reserves (xÃƒâ€”y=k constant-product)
                             lp.tokenReserve = fixDust(lp.tokenReserve - chunkFill);
                             lp.usdReserve   = fixDust(lp.usdReserve   + actualChunkUsd);
                             const effAfterT = lp.tokenReserve + (lp.virtualTokenReserve || 0);
@@ -2049,7 +2097,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                             matchResult.maxSlippageHit   = userMaxSlippage;
                         }
 
-                        console.log(chalk.cyan(`[AMM BUY] ${tokenSymbol}: ${chunkCount} chunks, price $${ammStartPrice.toFixed(6)} → $${finalPoolPrice.toFixed(6)} (${((finalPoolPrice-ammStartPrice)/ammStartPrice*100).toFixed(2)}% impact)`));
+                        console.log(chalk.cyan(`[AMM BUY] ${tokenSymbol}: ${chunkCount} chunks, price $${ammStartPrice.toFixed(6)} Ã¢â€ â€™ $${finalPoolPrice.toFixed(6)} (${((finalPoolPrice-ammStartPrice)/ammStartPrice*100).toFixed(2)}% impact)`));
                     }
                 }
             } catch (ammErr) {
@@ -2057,7 +2105,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
             }
         }
 
-        // ── UPGRADE: Chunked SELL-Side AMM for Custom Tokens (x×y=k) ───────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ UPGRADE: Chunked SELL-Side AMM for Custom Tokens (xÃƒâ€”y=k) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         // Large sells cause exponential price decrease per chunk, matching real DeFi.
         // Also supports OpenChain tokens (nx_open_*) alongside DelChain (nx_sys_*).
         if (side === 'SELL' && matchResult.remaining > 1e-8 && tokenSymbol !== 'SYR' && !['SDX', 'SDTX'].includes(tokenSymbol)) {
@@ -2140,7 +2188,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                                 timestamp: Date.now(), isSystemGenerated: true
                             });
 
-                            // Update pool reserves — price DECREASES on sells
+                            // Update pool reserves Ã¢â‚¬â€ price DECREASES on sells
                             lp.tokenReserve = fixDust(lp.tokenReserve + chunkFill);
                             lp.usdReserve   = fixDust(lp.usdReserve   - actualChunkUsd);
                             const sAfterT = lp.tokenReserve + (lp.virtualTokenReserve || 0);
@@ -2176,7 +2224,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                             matchResult.maxSlippageHit   = userMaxSlippage;
                         }
 
-                        console.log(chalk.cyan(`[AMM SELL] ${tokenSymbol}: ${chunkCount} chunks, price $${ammStartPrice.toFixed(6)} → $${finalPoolPrice.toFixed(6)} (${((ammStartPrice-finalPoolPrice)/ammStartPrice*100).toFixed(2)}% impact)`));
+                        console.log(chalk.cyan(`[AMM SELL] ${tokenSymbol}: ${chunkCount} chunks, price $${ammStartPrice.toFixed(6)} Ã¢â€ â€™ $${finalPoolPrice.toFixed(6)} (${((ammStartPrice-finalPoolPrice)/ammStartPrice*100).toFixed(2)}% impact)`));
                     }
                 }
             } catch (ammErr) {
@@ -2184,7 +2232,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
             }
         }
 
-        // ── UPGRADE: Chunked SYR BUY-side AMM (x×y=k) ──────────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ UPGRADE: Chunked SYR BUY-side AMM (xÃƒâ€”y=k) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         // Large SYR buys now cause exponential price increase per chunk.
         if (side === 'BUY' && matchResult.remaining > 1e-8 && tokenSymbol === 'SYR') {
             const systemBalance = nexusChain.getBalance('system', tokenSymbol) - mempool.getPendingTokenSpend('system', tokenSymbol);
@@ -2261,11 +2309,11 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                     matchResult.slippageExceeded = true;
                     matchResult.maxSlippageHit   = userMaxSlippage;
                 }
-                if (chunkCount > 0) console.log(chalk.cyan(`[AMM SYR BUY] ${chunkCount} chunks, price $${ammStartPrice.toFixed(6)} → $${finalPrice.toFixed(6)}`));
+                if (chunkCount > 0) console.log(chalk.cyan(`[AMM SYR BUY] ${chunkCount} chunks, price $${ammStartPrice.toFixed(6)} Ã¢â€ â€™ $${finalPrice.toFixed(6)}`));
             }
         }
 
-        // ── UPGRADE: Chunked SYR SELL-side AMM (x×y=k) ─────────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ UPGRADE: Chunked SYR SELL-side AMM (xÃƒâ€”y=k) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         // Large SYR sells now cause exponential price decrease per chunk.
         if (side === 'SELL' && matchResult.remaining > 1e-8 && tokenSymbol === 'SYR') {
             nexusChain.state.initPool('SYR');
@@ -2329,7 +2377,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
                     matchResult.slippageExceeded = true;
                     matchResult.maxSlippageHit   = userMaxSlippage;
                 }
-                if (chunkCount > 0) console.log(chalk.cyan(`[AMM SYR SELL] ${chunkCount} chunks, price $${ammStartPrice.toFixed(6)} → $${finalPrice.toFixed(6)}`));
+                if (chunkCount > 0) console.log(chalk.cyan(`[AMM SYR SELL] ${chunkCount} chunks, price $${ammStartPrice.toFixed(6)} Ã¢â€ â€™ $${finalPrice.toFixed(6)}`));
             }
         }
 
@@ -2350,10 +2398,10 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
 
         await updateMarketEconomics();
 
-        // IMPROVEMENT 4 — Referral bonus called once per execution, not per fill
+        // IMPROVEMENT 4 Ã¢â‚¬â€ Referral bonus called once per execution, not per fill
         await processReferralBonus(uid, matchResult.trades, tokenSymbol);
 
-        // IMPROVEMENT 6 — Trigger server-side alert check after every market trade
+        // IMPROVEMENT 6 Ã¢â‚¬â€ Trigger server-side alert check after every market trade
         const lastTradePrice = matchResult.trades[matchResult.trades.length - 1].price;
         await checkServerAlerts(tokenSymbol, lastTradePrice);
         // Issue 4 Fix: Broadcast PRICE_UPDATE for ALL tokens so chart updates live
@@ -2363,12 +2411,12 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
         // Issue 4 Fix: Invalidate per-token stats cache so price refreshes immediately
         apiCache.tokenStats.delete(tokenSymbol);
 
-        // ── Trading Fee Collection ─────────────────────────────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ Trading Fee Collection Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         const feeRate = getCurrentFeeRate();
         const feeUsd  = fixDust(matchResult.totalUsdCost * feeRate);
 
         if (feeUsd > 1e-8) {
-            // 75% → platform revenue (system), 25% → staking yield pool (fee_pool)
+            // 75% Ã¢â€ â€™ platform revenue (system), 25% Ã¢â€ â€™ staking yield pool (fee_pool)
             const feeToSystem = fixDust(feeUsd * 0.75);
             const feeToPool   = fixDust(feeUsd * 0.25);
             await mempool.addTransaction({
@@ -2433,7 +2481,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
     }
 });
 
-// ─── Block Explorer (IMPROVEMENT 5 — readLimiter applied) ────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Block Explorer (IMPROVEMENT 5 Ã¢â‚¬â€ readLimiter applied) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.get('/blocks', readLimiter, async (req, res) => {
     try {
         const totalRes = await pool.query('SELECT COUNT(*) FROM blocks');
@@ -2480,7 +2528,7 @@ app.get('/blocks', readLimiter, async (req, res) => {
     }
 });
 
-// ─── Transaction History (IMPROVEMENT 5 — readLimiter applied) ───────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Transaction History (IMPROVEMENT 5 Ã¢â‚¬â€ readLimiter applied) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.get('/txhistory/token/:ticker', readLimiter, async (req, res) => {
     try {
         const ticker = req.params.ticker;
@@ -2568,7 +2616,7 @@ app.get('/txhistory/:address/export.csv', readLimiter, async (req, res) => {
     }
 });
 
-// ─── Balances ─────────────────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Balances Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.get('/balance/:address', (req, res) => {
     const token    = req.query.token || 'SYR';
     const totalSyr = nexusChain.getBalance(req.params.address, token);
@@ -2636,7 +2684,7 @@ app.get('/stats', async (req, res) => {
         return res.json(apiCache.stats.data);
     }
 
-    // ── Layer 1: Check per-token cache first ─────────────────────────────────
+    // Ã¢â€â‚¬Ã¢â€â‚¬ Layer 1: Check per-token cache first Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     const cachedToken = apiCache.tokenStats.get(token);
     if (cachedToken && (Date.now() - cachedToken.time < TOKEN_STATS_TTL)) {
         // Inject fresh volume data into cached response
@@ -2647,7 +2695,7 @@ app.get('/stats', async (req, res) => {
     // FIX: For custom tokens, return token-specific stats including:
     //   - circulatingSupply: tokens held by real users (not system/handler addresses)
     //   - handlerSupply: tokens sent to the system handler address (this is what
-    //     the UI shows as "Remaining Supply" for custom tokens — it's the amount
+    //     the UI shows as "Remaining Supply" for custom tokens Ã¢â‚¬â€ it's the amount
     //     the creator has deposited for automated market-making)
     const tokenBals = nexusChain.state.balances[token] || {};
     let circulating = 0;
@@ -2656,7 +2704,7 @@ app.get('/stats', async (req, res) => {
         const bal = tokenBals[addr] || 0;
         if (addr.startsWith('nx_sys_') || addr.startsWith('nx_open_')) {
             // Issue 4 Fix: OpenChain tokens use nx_open_ addresses (not nx_sys_).
-            // Previously only nx_sys_ was counted → OpenChain System Pool always showed 0.
+            // Previously only nx_sys_ was counted Ã¢â€ â€™ OpenChain System Pool always showed 0.
             handlerSupply += bal;
         } else if (addr !== 'system' && addr !== 'liquidity-pool') {
             circulating += bal;
@@ -2704,10 +2752,10 @@ app.get('/stats', async (req, res) => {
     res.json(statsPayload);
 });
 
-// ── /quick-stats/:ticker — Zero-DB instant stats endpoint ────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ /quick-stats/:ticker Ã¢â‚¬â€ Zero-DB instant stats endpoint Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // The regular /stats endpoint does a DB query for price if menuBook is empty.
 // During Railway cold-start (~15-30s), this times out and stats stay "Loading...".
-// /quick-stats reads ONLY from in-memory blockchain state — available within
+// /quick-stats reads ONLY from in-memory blockchain state Ã¢â‚¬â€ available within
 // ~2 seconds of server start (after blocks load from DB, before API calls come in).
 // Response time: < 5ms even on first request. Never times out.
 app.get('/quick-stats/:ticker', readLimiter, (req, res) => {
@@ -2724,7 +2772,7 @@ app.get('/quick-stats/:ticker', readLimiter, (req, res) => {
         }
     }
     const lastPrice = menuBook.books[ticker]?.lastTradePrice || nexusChain.state.getPoolPrice(ticker) || menuBook.books[ticker]?.asks?.[0]?.priceUsd || 0;
-    // Use preloaded cache — no DB query needed
+    // Use preloaded cache Ã¢â‚¬â€ no DB query needed
     const ownerAddress = tokenOwnerCache.get(ticker) || '';
     res.json({ ticker, supply, handlerSupply, holders, lastPrice, ownerAddress });
 });
@@ -2732,7 +2780,7 @@ app.get('/quick-stats/:ticker', readLimiter, (req, res) => {
 app.get('/supply',        (req, res) => res.json({ remainingSupply: nexusChain.getRemainingSupply('SYR') }));
 app.get('/miner-balance', (req, res) => res.json({ address: config.blockchain.miner_address, balance: nexusChain.getBalance(config.blockchain.miner_address, 'SYR') }));
 
-// ─── Transaction Submission ───────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Transaction Submission Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/tx/new', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const { signature, publicKey, uid, ...payloadData } = req.body;
@@ -2787,7 +2835,7 @@ app.post('/tx/new', txLimiter, requireWeb3Auth, async (req, res) => {
                 });
             }
 
-            // Feature A — Smart Token Validation for system handler addresses.
+            // Feature A Ã¢â‚¬â€ Smart Token Validation for system handler addresses.
             // If the recipient is a known system handler address, verify that the
             // token being sent matches the token that address was created for.
             // This prevents accidental or malicious cross-token transfers to system handlers.
@@ -2865,7 +2913,7 @@ app.post('/tx/new', txLimiter, requireWeb3Auth, async (req, res) => {
     }
 });
 
-// ─── PHASE 4: API Gateway (Server-to-Server Integrations) ─────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ PHASE 4: API Gateway (Server-to-Server Integrations) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 // Route 1: Generate a Master API Key for the Game Server
 app.post('/api/keys/generate', txLimiter, requireWeb3Auth, async (req, res) => {
@@ -2972,7 +3020,7 @@ app.post('/api/game/transfer', rateLimit({ windowMs: 60000, max: 300 }), async (
     }
 });
 
-// ─── PHASE 5: Smart Allowances (In-Game Spending) ─────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ PHASE 5: Smart Allowances (In-Game Spending) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 // Route 1: Player Approves Allowance (Requires ECDSA Signature)
 app.post('/api/allowance/approve', txLimiter, requireWeb3Auth, async (req, res) => {
@@ -3073,7 +3121,7 @@ app.post('/api/game/charge', rateLimit({ windowMs: 60000, max: 300 }), async (re
     }
 });
 
-// ─── PHASE 6: FDX Multi-Tier Subscription Gateway ─────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ PHASE 6: FDX Multi-Tier Subscription Gateway Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 // Route 1: Fetch all Subscription Tiers for a Token
 app.get('/api/fdx/tiers/:ticker', readLimiter, async (req, res) => {
@@ -3189,7 +3237,7 @@ app.get('/api/fdx/verify/:playerAddress/:ticker/:tierId', rateLimit({ windowMs: 
     }
 });
 
-// ─── PHASE 7: Multi-Chain Crypto Gateway (NowPayments) ────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ PHASE 7: Multi-Chain Crypto Gateway (NowPayments) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 // Helper to map UI networks to NowPayments tickers
 const getCryptoTicker = (network) => {
@@ -3324,18 +3372,18 @@ app.post('/api/crypto/webhook', express.json(), async (req, res) => {
 });
 
 // Route 3: Withdraw Crypto (Smart Routing for USD/SDX/SDTX -> External Payout)
-// ─── WITHDRAWAL ADDRESS BOOK ──────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ WITHDRAWAL ADDRESS BOOK Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // Users register withdrawal addresses here. Admin reviews and adds them to the
 // NowPayments payout whitelist in the NowPayments dashboard, then approves.
 // This keeps NowPayments security enabled while supporting a public platform.
 
-// ── 1. Add a new withdrawal address (starts as 'pending') ─────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ 1. Add a new withdrawal address (starts as 'pending') Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/api/withdrawal-address/add', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const uid = req.user.uid;
         const { label, address, network } = req.body;
 
-        // KYC gate removed — identity verification no longer required.
+        // KYC gate removed Ã¢â‚¬â€ identity verification no longer required.
 
         if (!label || !address || !network) {
             return res.status(400).json({ error: 'label, address, and network are all required.' });
@@ -3374,32 +3422,32 @@ app.post('/api/withdrawal-address/add', txLimiter, requireWeb3Auth, async (req, 
             [uid, label.trim(), address.trim(), network.toUpperCase(), currency, Date.now()]
         );
 
-        // ── Auto-whitelist on NowPayments ────────────────────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ Auto-whitelist on NowPayments Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         // Attempt to add the address to NowPayments payout whitelist automatically.
-        // If this succeeds → instantly approve the address (user can withdraw now).
-        // If this fails    → keep as 'pending', Railway log shows action needed.
+        // If this succeeds Ã¢â€ â€™ instantly approve the address (user can withdraw now).
+        // If this fails    Ã¢â€ â€™ keep as 'pending', Railway log shows action needed.
         const whitelistResult = await tryAutoWhitelistNowPayments(address.trim(), currency, label.trim());
 
         if (whitelistResult.success) {
-            // Instantly approve — NowPayments whitelist updated, no admin action needed
+            // Instantly approve Ã¢â‚¬â€ NowPayments whitelist updated, no admin action needed
             await pool.query(
                 `UPDATE withdrawal_addresses SET status = 'approved', approved_at = $1
                  WHERE uid = $2 AND LOWER(address) = LOWER($3) AND network = $4`,
                 [Date.now(), uid, address.trim(), network.toUpperCase()]
             );
             return res.status(201).json({
-                message: `✓ Address approved and ready to use! You can withdraw to ${address.substring(0,8)}...${address.slice(-6)} immediately.`,
+                message: `Ã¢Å“â€œ Address approved and ready to use! You can withdraw to ${address.substring(0,8)}...${address.slice(-6)} immediately.`,
                 status: 'approved',
                 autoApproved: true
             });
         }
 
-        // Auto-whitelist failed — fallback to manual admin review
-        console.log(chalk.yellow.bold('\n[WITHDRAWAL ADDRESS] MANUAL ACTION NEEDED — NP AUTO-WHITELIST FAILED:'));
+        // Auto-whitelist failed Ã¢â‚¬â€ fallback to manual admin review
+        console.log(chalk.yellow.bold('\n[WITHDRAWAL ADDRESS] MANUAL ACTION NEEDED Ã¢â‚¬â€ NP AUTO-WHITELIST FAILED:'));
         console.log(chalk.yellow(`  Address : ${address}`));
-        console.log(chalk.yellow(`  Network : ${network} → ${currency}`));
+        console.log(chalk.yellow(`  Network : ${network} Ã¢â€ â€™ ${currency}`));
         console.log(chalk.yellow(`  Error   : ${whitelistResult.error || 'unknown'}`));
-        console.log(chalk.yellow('  ACTION  : 1) Add address to NowPayments → My Account → Payouts → Payout Addresses'));
+        console.log(chalk.yellow('  ACTION  : 1) Add address to NowPayments Ã¢â€ â€™ My Account Ã¢â€ â€™ Payouts Ã¢â€ â€™ Payout Addresses'));
         console.log(chalk.yellow('            2) Call POST /api/admin/withdrawal-address/approve with the address ID\n'));
 
         res.status(201).json({
@@ -3416,7 +3464,7 @@ app.post('/api/withdrawal-address/add', txLimiter, requireWeb3Auth, async (req, 
     }
 });
 
-// ── 2. List user's saved withdrawal addresses ─────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ 2. List user's saved withdrawal addresses Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/api/withdrawal-address/list', readLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -3431,7 +3479,7 @@ app.post('/api/withdrawal-address/list', readLimiter, requireWeb3Auth, async (re
     }
 });
 
-// ── 3. Remove a saved address ──────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ 3. Remove a saved address Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/api/withdrawal-address/remove', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -3451,7 +3499,7 @@ app.post('/api/withdrawal-address/remove', txLimiter, requireWeb3Auth, async (re
     }
 });
 
-// ── 4. Admin: Approve an address (after adding it to NowPayments whitelist) ───
+// Ã¢â€â‚¬Ã¢â€â‚¬ 4. Admin: Approve an address (after adding it to NowPayments whitelist) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // This endpoint requires the caller to be the ADMIN_WALLET. Use this after you
 // have manually added the address to NowPayments payout whitelist in the dashboard.
 app.post('/api/admin/withdrawal-address/approve', txLimiter, requireWeb3Auth, async (req, res) => {
@@ -3478,7 +3526,7 @@ app.post('/api/admin/withdrawal-address/approve', txLimiter, requireWeb3Auth, as
     }
 });
 
-// ── 5. Admin: List all pending addresses needing NowPayments whitelisting ─────
+// Ã¢â€â‚¬Ã¢â€â‚¬ 5. Admin: List all pending addresses needing NowPayments whitelisting Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/api/admin/withdrawal-address/pending', readLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const callerUid = req.user.uid.toLowerCase();
@@ -3495,7 +3543,7 @@ app.post('/api/admin/withdrawal-address/pending', readLimiter, requireWeb3Auth, 
     }
 });
 
-// ── UPGRADE: Price Impact Estimation Endpoint ─────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ UPGRADE: Price Impact Estimation Endpoint Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // GET /api/price-impact?token=TICKER&side=BUY&amount=100000
 // Returns estimated price impact before a trade is placed.
 app.get('/api/price-impact', readLimiter, async (req, res) => {
@@ -3547,7 +3595,7 @@ app.get('/api/price-impact', readLimiter, async (req, res) => {
     }
 });
 
-// ── UPGRADE: Recent Trades Feed Endpoint ──────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ UPGRADE: Recent Trades Feed Endpoint Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // GET /api/recent-trades?limit=50&token=SYR (optional token filter)
 app.get('/api/recent-trades', readLimiter, async (req, res) => {
     try {
@@ -3585,8 +3633,8 @@ app.get('/api/recent-trades', readLimiter, async (req, res) => {
     }
 });
 
-// ── UPGRADE: All-Tokens Price Ticker Data ─────────────────────────────────────
-// GET /api/ticker — Returns price, 24h change, and volume for all active tokens
+// Ã¢â€â‚¬Ã¢â€â‚¬ UPGRADE: All-Tokens Price Ticker Data Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// GET /api/ticker Ã¢â‚¬â€ Returns price, 24h change, and volume for all active tokens
 app.get('/api/ticker', readLimiter, async (req, res) => {
     try {
         const tickers = [];
@@ -3631,18 +3679,18 @@ app.get('/api/ticker', readLimiter, async (req, res) => {
     }
 });
 
-// ─── OPENCHAIN TERMINAL ENDPOINTS ────────────────────────────────────────────
-// Open token deployment — no KYC, no domain verification required.
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ OPENCHAIN TERMINAL ENDPOINTS Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// Open token deployment Ã¢â‚¬â€ no KYC, no domain verification required.
 
 // 1. Public list of all open tokens (includes remaining_supply from open_token_supply table)
-// ── Issue 3: Broadcast Notification Endpoints ─────────────────────────────────
-// GET  /api/notifications          — public, returns last 50 broadcasts
-// POST /api/notifications/broadcast — creator only, sends announcement to all users
+// Ã¢â€â‚¬Ã¢â€â‚¬ Issue 3: Broadcast Notification Endpoints Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// GET  /api/notifications          Ã¢â‚¬â€ public, returns last 50 broadcasts
+// POST /api/notifications/broadcast Ã¢â‚¬â€ creator only, sends announcement to all users
 const DELCHAIN_CREATOR_UID = 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE5z7IyY';
 
 app.get('/api/notifications', readLimiter, async (req, res) => {
     try {
-        // UPGRADE: 10-day auto-expire — only return notifications from the last 10 days
+        // UPGRADE: 10-day auto-expire Ã¢â‚¬â€ only return notifications from the last 10 days
         const tenDaysAgo = Date.now() - (10 * 86400000);
         const result = await pool.query(
             `SELECT id, uid, message, type, created_at
@@ -3758,7 +3806,7 @@ app.get('/api/open-tokens', readLimiter, async (req, res) => {
                 remainingSupply,
                 createdAt:       r.created_at,
                 currentPrice:    parseFloat(currentPrice.toFixed(8)),
-                priceChange24h:  0, // simplified — no historical comparison needed for MVP
+                priceChange24h:  0, // simplified Ã¢â‚¬â€ no historical comparison needed for MVP
                 holderCount:     holderMap[r.ticker] || 0,
                 totalVolume:     volMap[r.ticker] || 0,
                 poolBalance:     poolBalance,
@@ -3872,13 +3920,13 @@ app.post('/api/open-token/set-network-fee', txLimiter, requireWeb3Auth, async (r
     } catch(err) { res.status(500).json({ error: 'Failed to set fee.' }); }
 });
 
-// 5. Deploy an open token — no KYC, no domain verification
+// 5. Deploy an open token Ã¢â‚¬â€ no KYC, no domain verification
 app.post('/api/open-token/deploy', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const uid          = req.user.uid;
         const { name, ticker, totalSupply, logoUrl, description, parentTicker } = req.body;
 
-        // ── Input validation ──────────────────────────────────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ Input validation Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         if (!name || name.length > 25)
             return res.status(400).json({ error: 'Token name required (max 25 characters).' });
         const safeTicker = (ticker || '').toUpperCase().replace(/[^A-Z0-9]/g,'');
@@ -3888,7 +3936,7 @@ app.post('/api/open-token/deploy', txLimiter, requireWeb3Auth, async (req, res) 
         if (isNaN(parsedSupply) || parsedSupply < 1 || parsedSupply > 10_000_000_000)
             return res.status(400).json({ error: 'Invalid supply (max 10 billion).' });
 
-        // ── Check ticker not already taken ────────────────────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ Check ticker not already taken Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         const existing = await pool.query(
             `SELECT 1 FROM open_tokens WHERE ticker = $1
              UNION SELECT 1 FROM transactions WHERE type = 'MINT' AND token_symbol = $1 LIMIT 1`,
@@ -3897,8 +3945,8 @@ app.post('/api/open-token/deploy', txLimiter, requireWeb3Auth, async (req, res) 
         if (existing.rows.length > 0)
             return res.status(409).json({ error: `Ticker ${safeTicker} is already taken.` });
 
-        // ── Fee collection ────────────────────────────────────────────────────
-        // PLATFORM FEE: 1 SDX ($1 stablecoin) — NOT SYR.
+        // Ã¢â€â‚¬Ã¢â€â‚¬ Fee collection Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        // PLATFORM FEE: 1 SDX ($1 stablecoin) Ã¢â‚¬â€ NOT SYR.
         // Using SYR caused "insufficient funds" because at seed price $0.00000001,
         // $1 = 100,000,000 SYR which users never have.
         // SDX is always pegged to $1, so 1 SDX = $1 reliably.
@@ -3924,14 +3972,14 @@ app.post('/api/open-token/deploy', txLimiter, requireWeb3Auth, async (req, res) 
                 return res.status(400).json({ error: `Insufficient SYR for network fee. Need ${networkFee} SYR, have ${availSyr.toFixed(4)}.` });
         }
 
-        // ── Deduct platform fee: 1 SDX → system ──────────────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ Deduct platform fee: 1 SDX Ã¢â€ â€™ system Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         await mempool.addTransaction({
             from: uid, to: 'system', amount: PLATFORM_FEE_SDX, type: 'TOKEN_TRANSFER',
             tokenSymbol: 'SDX', timestamp: Date.now(), isSystemGenerated: true,
             description: `OpenChain deploy fee: ${safeTicker}`
         });
 
-        // ── Deduct network fee → parent token owner ───────────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ Deduct network fee Ã¢â€ â€™ parent token owner Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         if (networkFee > 0 && networkOwner) {
             await mempool.addTransaction({
                 from: uid, to: networkOwner, amount: networkFee, type: 'SYR_TRANSFER',
@@ -3940,14 +3988,14 @@ app.post('/api/open-token/deploy', txLimiter, requireWeb3Auth, async (req, res) 
             });
         }
 
-        // ── SUPPLY ROUTING: All supply goes to hidden system address (Task 3) ────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ SUPPLY ROUTING: All supply goes to hidden system address (Task 3) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         // OpenTerminal tokens NEVER send supply to the creator's wallet.
         // The entire supply lands in a hidden system-controlled address.
         // The creator can see "Remaining Supply" on their token card but
-        // cannot freely withdraw it — supply enters circulation only via trade.
+        // cannot freely withdraw it Ã¢â‚¬â€ supply enters circulation only via trade.
         const openSystemAddress = 'nx_open_' + crypto.randomBytes(16).toString('hex');
 
-        // ── Mint the new open token → system address (NOT creator uid) ────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ Mint the new open token Ã¢â€ â€™ system address (NOT creator uid) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         await mempool.addTransaction({
             from: 'system', to: openSystemAddress, amount: parsedSupply, type: 'MINT',
             tokenSymbol: safeTicker, priceUsd: 0,
@@ -3959,7 +4007,7 @@ app.post('/api/open-token/deploy', txLimiter, requireWeb3Auth, async (req, res) 
             timestamp: Date.now() + 2, isSystemGenerated: true
         });
 
-        // ── Record in open_tokens table ───────────────────────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ Record in open_tokens table Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         await pool.query(
             `INSERT INTO open_tokens (uid, ticker, name, description, logo_url, parent_ticker, total_supply, status, created_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', $8)`,
@@ -3967,7 +4015,7 @@ app.post('/api/open-token/deploy', txLimiter, requireWeb3Auth, async (req, res) 
              parentUpper || null, parsedSupply, Date.now()]
         );
 
-        // ── Record the system address → open_token_supply table ───────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ Record the system address Ã¢â€ â€™ open_token_supply table Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         await pool.query(
             `INSERT INTO open_token_supply (ticker, system_address, total_supply, created_at)
              VALUES ($1, $2, $3, $4)
@@ -3975,7 +4023,7 @@ app.post('/api/open-token/deploy', txLimiter, requireWeb3Auth, async (req, res) 
             [safeTicker, openSystemAddress, parsedSupply, Date.now()]
         );
 
-        console.log(chalk.green(`[OPENCHAIN] Token deployed: ${safeTicker} → system ${openSystemAddress.substring(0,20)}... by ${uid.substring(0,12)}...`));
+        console.log(chalk.green(`[OPENCHAIN] Token deployed: ${safeTicker} Ã¢â€ â€™ system ${openSystemAddress.substring(0,20)}... by ${uid.substring(0,12)}...`));
         res.status(201).json({ success: true, ticker: safeTicker, name, supply: parsedSupply });
 
     } catch(err) {
@@ -3984,7 +4032,7 @@ app.post('/api/open-token/deploy', txLimiter, requireWeb3Auth, async (req, res) 
     }
 });
 
-// ─── Admin: Migrate Legacy OpenTerminal Supply to System Pool ─────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Admin: Migrate Legacy OpenTerminal Supply to System Pool Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // POST /api/admin/migrate-open-supply
 // Headers: X-Admin-Key: <ADMIN_SECRET>
 // For OpenTerminal tokens deployed BEFORE the system-address fix was in place, the
@@ -4021,14 +4069,14 @@ app.post('/api/admin/migrate-open-supply', async (req, res) => {
             // Check how much is actually still in the creator's balance
             const creatorBal = nexusChain.state.getBalance(creatorUid, ticker);
             if (creatorBal <= 0) {
-                // Supply already moved or never existed — just register the supply entry
+                // Supply already moved or never existed Ã¢â‚¬â€ just register the supply entry
                 const sysAddr = `nx_open_${ticker.toLowerCase()}_system`;
                 await pool.query(
                     `INSERT INTO open_token_supply (ticker, system_address, total_supply, created_at)
                      VALUES ($1, $2, $3, $4) ON CONFLICT (ticker) DO NOTHING`,
                     [ticker, sysAddr, supply, Date.now()]
                 );
-                migrated.push({ ticker, note: 'balance was 0 — registered supply entry only' });
+                migrated.push({ ticker, note: 'balance was 0 Ã¢â‚¬â€ registered supply entry only' });
                 continue;
             }
 
@@ -4036,7 +4084,7 @@ app.post('/api/admin/migrate-open-supply', async (req, res) => {
                 // Generate a deterministic system address for this token
                 const sysAddr = `nx_open_${ticker.toLowerCase()}_system`;
 
-                // Transfer from creator wallet → system address in the ledger
+                // Transfer from creator wallet Ã¢â€ â€™ system address in the ledger
                 nexusChain.state.debit(creatorUid, ticker, creatorBal);
                 nexusChain.state.credit(sysAddr, ticker, creatorBal);
 
@@ -4057,7 +4105,7 @@ app.post('/api/admin/migrate-open-supply', async (req, res) => {
                 );
 
                 migrated.push({ ticker, creatorUid: creatorUid.substring(0, 12) + '...', amount: creatorBal, sysAddr });
-                console.log(chalk.green(`[MIGRATE] ${ticker}: moved ${creatorBal} from creator → ${sysAddr}`));
+                console.log(chalk.green(`[MIGRATE] ${ticker}: moved ${creatorBal} from creator Ã¢â€ â€™ ${sysAddr}`));
             } catch(e) {
                 failed.push({ ticker, reason: e.message });
                 console.error(chalk.red(`[MIGRATE] ${ticker} failed:`, e.message));
@@ -4072,11 +4120,11 @@ app.post('/api/admin/migrate-open-supply', async (req, res) => {
 });
 
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// OPENCHAIN TERMINAL — New Endpoints (Plan Components 2,6,7,8,9)
-// ═══════════════════════════════════════════════════════════════════════════════
+// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+// OPENCHAIN TERMINAL Ã¢â‚¬â€ New Endpoints (Plan Components 2,6,7,8,9)
+// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 
-// ── Component 2: Network Stats Overview ──────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ Component 2: Network Stats Overview Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.get('/api/open-tokens/stats', readLimiter, async (req, res) => {
     try {
         const now24h = Date.now() - 86400000;
@@ -4092,7 +4140,7 @@ app.get('/api/open-tokens/stats', readLimiter, async (req, res) => {
 
         const totalTokens = parseInt(countRes.rows[0]?.cnt || 0);
         let totalVolume24h = 0;
-        let mostActiveToken = '—';
+        let mostActiveToken = 'Ã¢â‚¬â€';
         if (volRes.rows.length > 0) {
             mostActiveToken = volRes.rows[0].token_symbol;
             volRes.rows.forEach(r => { totalVolume24h += parseFloat(r.vol || 0); });
@@ -4114,11 +4162,11 @@ app.get('/api/open-tokens/stats', readLimiter, async (req, res) => {
 
         res.json({ totalTokens, combinedMarketCap, totalVolume24h, mostActiveToken });
     } catch(e) {
-        res.json({ totalTokens: 0, combinedMarketCap: 0, totalVolume24h: 0, mostActiveToken: '—' });
+        res.json({ totalTokens: 0, combinedMarketCap: 0, totalVolume24h: 0, mostActiveToken: 'Ã¢â‚¬â€' });
     }
 });
 
-// ── Component 6: Token Edit (creator-only) ──────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ Component 6: Token Edit (creator-only) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/api/open-token/edit', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -4142,7 +4190,7 @@ app.post('/api/open-token/edit', txLimiter, requireWeb3Auth, async (req, res) =>
     } catch(e) { res.status(500).json({ error: 'Edit failed.' }); }
 });
 
-// ── Component 7: Airdrop (creator-only, max 50) ─────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ Component 7: Airdrop (creator-only, max 50) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/api/open-token/airdrop', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -4184,7 +4232,7 @@ app.post('/api/open-token/airdrop', txLimiter, requireWeb3Auth, async (req, res)
     } catch(e) { res.status(500).json({ error: e.message || 'Airdrop failed.' }); }
 });
 
-// ── Component 8: Revenue Dashboard (creator-only) ───────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ Component 8: Revenue Dashboard (creator-only) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/api/open-token/revenue', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -4212,7 +4260,7 @@ app.post('/api/open-token/revenue', txLimiter, requireWeb3Auth, async (req, res)
     } catch(e) { res.status(500).json({ error: 'Revenue fetch failed.' }); }
 });
 
-// ── Component 9b: Supply Stats (public) ─────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬ Component 9b: Supply Stats (public) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.get('/api/open-token/supply-stats/:ticker', readLimiter, async (req, res) => {
     try {
         const ticker = req.params.ticker.toUpperCase();
@@ -4249,7 +4297,7 @@ app.get('/api/open-token/supply-stats/:ticker', readLimiter, async (req, res) =>
 });
 
 // GET /api/token/creator/:ticker?uid=WALLET_ADDRESS
-// Returns { isCreator: true/false } — used by frontend to show creator badge/settings
+// Returns { isCreator: true/false } Ã¢â‚¬â€ used by frontend to show creator badge/settings
 // without exposing the raw MINT owner address to the client.
 app.get('/api/token/creator/:ticker', readLimiter, async (req, res) => {
     const ticker = String(req.params.ticker || '').toUpperCase().trim();
@@ -4265,7 +4313,7 @@ app.get('/api/token/creator/:ticker', readLimiter, async (req, res) => {
 
     try {
         // Layer 1 optimization: run all 3 DB queries IN PARALLEL instead of sequentially.
-        // Previous: mint → (if fail) handler → (if fail) open_tokens = 3 round trips.
+        // Previous: mint Ã¢â€ â€™ (if fail) handler Ã¢â€ â€™ (if fail) open_tokens = 3 round trips.
         // Now: all 3 fire at once, results checked in priority order = ~60% faster.
         const [mintRow, handlerRow, openRow] = await Promise.all([
             pool.query(
@@ -4312,13 +4360,13 @@ app.get('/api/token/creator/:ticker', readLimiter, async (req, res) => {
     }
 });
 
-// ─── Unified Token List Endpoint ──────────────────────────────────────────────
-// GET /api/tokens/all — returns { delchain: [...], openchain: [...] }
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Unified Token List Endpoint Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// GET /api/tokens/all Ã¢â‚¬â€ returns { delchain: [...], openchain: [...] }
 // DelChain = tokens minted via /mint-new-cash (verified, domain-linked)
 // OpenChain = tokens minted via /api/open-token/deploy (permissionless)
 app.get('/api/tokens/all', readLimiter, async (req, res) => {
     try {
-        // ── DelChain tokens: from /tokens (in-memory ledger + DB meta) ─────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ DelChain tokens: from /tokens (in-memory ledger + DB meta) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         const tokensObj = Object.keys(nexusChain.state.balances).filter(
             t => !['SYR', 'SDX', 'SDTX', 'system', 'staking_pool', 'liquidity-pool'].includes(t)
         );
@@ -4378,7 +4426,7 @@ app.get('/api/tokens/all', readLimiter, async (req, res) => {
             };
         });
 
-        // ── OpenChain tokens from open_tokens table with remaining supply ─────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ OpenChain tokens from open_tokens table with remaining supply Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         const openRows = await pool.query(
             `SELECT ot.ticker, ot.name, ot.description, ot.logo_url, ot.parent_ticker,
                     ot.total_supply, ot.created_at, ots.system_address, ot.uid AS owner_uid
@@ -4420,7 +4468,7 @@ app.get('/api/tokens/all', readLimiter, async (req, res) => {
     }
 });
 
-// ─── END OPENCHAIN ENDPOINTS ──────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ END OPENCHAIN ENDPOINTS Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 app.post('/api/crypto/withdraw', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
@@ -4432,10 +4480,10 @@ app.post('/api/crypto/withdraw', txLimiter, requireWeb3Auth, async (req, res) =>
             return res.status(400).json({ error: 'Invalid withdrawal parameters. Minimum $5.00.' });
         }
 
-        // ── ADDRESS BOOK VALIDATION ──────────────────────────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ ADDRESS BOOK VALIDATION Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         // Destination address must be pre-registered and approved in the user's
         // withdrawal address book. This keeps NowPayments whitelist security
-        // enabled while supporting a public platform — same model as Binance/Coinbase.
+        // enabled while supporting a public platform Ã¢â‚¬â€ same model as Binance/Coinbase.
         const addrCheck = await pool.query(
             `SELECT id, status FROM withdrawal_addresses
              WHERE uid = $1 AND LOWER(address) = LOWER($2) AND network = $3`,
@@ -4443,13 +4491,13 @@ app.post('/api/crypto/withdraw', txLimiter, requireWeb3Auth, async (req, res) =>
         );
         if (addrCheck.rows.length === 0) {
             return res.status(403).json({
-                error: 'Address not in your withdrawal address book. Add it first from the Withdraw page → Manage Addresses, then wait for approval.',
+                error: 'Address not in your withdrawal address book. Add it first from the Withdraw page Ã¢â€ â€™ Manage Addresses, then wait for approval.',
                 needsAddressBook: true
             });
         }
         if (addrCheck.rows[0].status !== 'approved') {
             return res.status(403).json({
-                error: `Address is pending approval (status: ${addrCheck.rows[0].status}). You will be able to use it once approved — usually within 24 hours.`,
+                error: `Address is pending approval (status: ${addrCheck.rows[0].status}). You will be able to use it once approved Ã¢â‚¬â€ usually within 24 hours.`,
                 needsAddressBook: true,
                 status: addrCheck.rows[0].status
             });
@@ -4477,13 +4525,13 @@ app.post('/api/crypto/withdraw', txLimiter, requireWeb3Auth, async (req, res) =>
                 address:  address,
                 currency: currency,
                 amount:   parsedAmount
-                // ipn_callback_url deliberately omitted — NowPayments rejects empty string
+                // ipn_callback_url deliberately omitted Ã¢â‚¬â€ NowPayments rejects empty string
             }]
         };
 
         console.log(chalk.cyan(`[NOWPAYMENTS] Requesting payout for ${parsedAmount} ${currency}...`));
 
-        // Get NowPayments JWT — required for Mass Payout in addition to x-api-key
+        // Get NowPayments JWT Ã¢â‚¬â€ required for Mass Payout in addition to x-api-key
         const nowPayJWT = await getNowPaymentsJWT();
 
         // Call NowPayments Mass Payout API with both auth headers
@@ -4497,17 +4545,17 @@ app.post('/api/crypto/withdraw', txLimiter, requireWeb3Auth, async (req, res) =>
             body: JSON.stringify(payoutPayload)
         });
 
-        // ── SAFE RESPONSE PARSING ────────────────────────────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ SAFE RESPONSE PARSING Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         // NowPayments sometimes returns plain text (e.g. "Access denied | Invalid IP - x.x.x.x")
         // instead of JSON when an IP-whitelist restriction blocks the request.
-        // Always read as text first, then try JSON — prevents SyntaxError crash.
+        // Always read as text first, then try JSON Ã¢â‚¬â€ prevents SyntaxError crash.
         const rawBody   = await payoutRes.text();
         let   payoutData = {};
         try   { payoutData = JSON.parse(rawBody); }
         catch { payoutData = { message: rawBody }; }
 
-        // ── IP WHITELIST DETECTION ───────────────────────────────────────────
-        // Detect NowPayments IP block specifically. Use precise patterns only —
+        // Ã¢â€â‚¬Ã¢â€â‚¬ IP WHITELIST DETECTION Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+        // Detect NowPayments IP block specifically. Use precise patterns only Ã¢â‚¬â€
         // a broad .includes('ip') check incorrectly matches "ipn_callback_url"
         // in validation error messages, giving the user a wrong diagnosis.
         const msgLower = (payoutData.message || '').toLowerCase();
@@ -4519,27 +4567,27 @@ app.post('/api/crypto/withdraw', txLimiter, requireWeb3Auth, async (req, res) =>
         if (isIpBlock) {
             console.error(chalk.red.bold('[NOWPAYMENTS] IP WHITELIST BLOCK:'), rawBody);
             return res.status(403).json({
-                error: `NowPayments blocked Railway's server IP. Fix: Log into NowPayments → Account Settings → API Settings → disable IP whitelist (or add the IP shown in the error). Raw: ${rawBody}`
+                error: `NowPayments blocked Railway's server IP. Fix: Log into NowPayments Ã¢â€ â€™ Account Settings Ã¢â€ â€™ API Settings Ã¢â€ â€™ disable IP whitelist (or add the IP shown in the error). Raw: ${rawBody}`
             });
         }
 
-        // ── PAYOUT ADDRESS WHITELIST DETECTION ──────────────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ PAYOUT ADDRESS WHITELIST DETECTION Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         // NowPayments has a separate "Payout Address Whitelist" from the IP whitelist.
         // This restricts which wallet addresses you can send payouts to.
         // For a PUBLIC platform where any user withdraws to their own address,
         // this MUST be disabled in NowPayments account settings:
-        //   NowPayments → My Account → Payouts → Payout Addresses → Disable whitelist
+        //   NowPayments Ã¢â€ â€™ My Account Ã¢â€ â€™ Payouts Ã¢â€ â€™ Payout Addresses Ã¢â€ â€™ Disable whitelist
         const isAddrBlock = msgLower.includes('not whitelisted')
                          || msgLower.includes('address') && msgLower.includes('whitelist')
                          || msgLower.includes('whitelisted');
         if (isAddrBlock) {
             console.error(chalk.red.bold('[NOWPAYMENTS] PAYOUT ADDRESS NOT WHITELISTED:'), rawBody);
             return res.status(403).json({
-                error: 'Withdrawal address is not whitelisted on NowPayments. Fix: Log into NowPayments → My Account → Payouts → Payout Addresses → DISABLE the address whitelist. This setting is designed for fixed-recipient businesses, not public platforms.'
+                error: 'Withdrawal address is not whitelisted on NowPayments. Fix: Log into NowPayments Ã¢â€ â€™ My Account Ã¢â€ â€™ Payouts Ã¢â€ â€™ Payout Addresses Ã¢â€ â€™ DISABLE the address whitelist. This setting is designed for fixed-recipient businesses, not public platforms.'
             });
         }
 
-        // ── GENERAL ERROR HANDLING ───────────────────────────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ GENERAL ERROR HANDLING Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         if (!payoutRes.ok || payoutData.error || payoutData.message) {
             console.error(chalk.red.bold('\n[NOWPAYMENTS API REJECTED PAYOUT REQUEST]'));
             console.error(chalk.yellow('Status Code:'), payoutRes.status);
@@ -4570,7 +4618,7 @@ app.post('/api/crypto/withdraw', txLimiter, requireWeb3Auth, async (req, res) =>
     }
 });
 
-// ─── Secure Integration Tags ──────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Secure Integration Tags Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/api/integration-tags', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const { tokenSymbol } = req.body;
@@ -4595,7 +4643,7 @@ app.post('/api/integration-tags', txLimiter, requireWeb3Auth, async (req, res) =
     }
 });
 
-// ─── Domain Verification & Pending Work Drafts ──────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Domain Verification & Pending Work Drafts Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/register-website', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const { websiteUrl, ticker, supply, platformType, description, logoBase64, publicUrl } = req.body;
@@ -4703,7 +4751,7 @@ app.post('/verify-website', txLimiter, requireWeb3Auth, async (req, res) => {
     }
 });
 
-// ─── Pending Work Endpoints ───────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Pending Work Endpoints Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/api/deploy/draft/fetch', readLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -4780,7 +4828,7 @@ app.get('/verify/:ticker', async (req, res) => {
     }
 });
 
-// ─── FEATURE 1: Feature Activation Gates ($100 USD Fee) ───────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ FEATURE 1: Feature Activation Gates ($100 USD Fee) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/feature/activate', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -4837,7 +4885,7 @@ app.get('/stats/network-features', readLimiter, async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Failed to fetch network feature stats.' }); }
 });
 
-// ─── FEATURE 1: Browser Mining Submit ─────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ FEATURE 1: Browser Mining Submit Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/mine/submit', rateLimit({ windowMs: 60000, max: 30 }), requireWeb3Auth, async (req, res) => {
     try {
         const { hash, nonce, index, previousHash, minerTimestamp } = req.body;
@@ -4895,7 +4943,7 @@ app.post('/mine/submit', rateLimit({ windowMs: 60000, max: 30 }), requireWeb3Aut
     }
 });
 
-// ─── FEATURE 10: SYR Staking & Yield ──────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ FEATURE 10: SYR Staking & Yield Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/stake/lock', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -4992,7 +5040,7 @@ app.post('/stake/claim', txLimiter, requireWeb3Auth, async (req, res) => {
             from: 'fee_pool', to: uid, amount: yieldAmount,
             type: 'USD_TRANSFER',
             timestamp: Date.now() + 1, isSystemGenerated: true,
-            description: `Stake Yield (${(apy * 100)}% APY) — paid from yield pool`
+            description: `Stake Yield (${(apy * 100)}% APY) Ã¢â‚¬â€ paid from yield pool`
         };
 
         if (await mempool.addTransactionBatch([principalTx, yieldTx])) {
@@ -5008,7 +5056,7 @@ app.post('/stake/claim', txLimiter, requireWeb3Auth, async (req, res) => {
      }
 });
 
-// ─── Token Minting (Deploy) ───────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Token Minting (Deploy) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 app.post('/mint-new-cash', txLimiter, requireWeb3Auth, async (req, res) => {
 
@@ -5038,11 +5086,11 @@ app.post('/mint-new-cash', txLimiter, requireWeb3Auth, async (req, res) => {
         if (menuBook.hasMintLock(uid))
             return res.status(400).json({ error: 'You already have a minting transaction pending.' });
 
-        // ── Task 1: Domain Ownership Enforcement ──────────────────────────────
+        // Ã¢â€â‚¬Ã¢â€â‚¬ Task 1: Domain Ownership Enforcement Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         // Parse the platform URL that the deployer specified; this is embedded in
         // the description JSON payload that the deploy wizard sends.  We then look
         // up a 'verified' row in domain_verifications for this uid + URL.
-        // If none exists, the deploy is rejected — this closes the bypass where a
+        // If none exists, the deploy is rejected Ã¢â‚¬â€ this closes the bypass where a
         // user could call /mint-new-cash directly without completing the handshake.
         let platformUrl = '';
         try { platformUrl = (JSON.parse(description || '{}').url || '').trim(); } catch(e) {}
@@ -5100,7 +5148,7 @@ app.post('/mint-new-cash', txLimiter, requireWeb3Auth, async (req, res) => {
 
         menuBook.addMintLock(uid);
 
-                // Task 1 — Mark the domain verification record as 'used' so it cannot be
+                // Task 1 Ã¢â‚¬â€ Mark the domain verification record as 'used' so it cannot be
         // reused to deploy a second ticker under the same URL without re-verifying.
         await pool.query(
             `UPDATE domain_verifications SET status = 'used' WHERE id = $1`,
@@ -5132,7 +5180,7 @@ app.post('/mint-new-cash', txLimiter, requireWeb3Auth, async (req, res) => {
     }
 });
 
-// ─── USD Balances ─────────────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ USD Balances Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/usd/balance/:uid', requireWeb3Auth, (req, res) => {
     if (req.user.uid !== req.params.uid) return res.status(403).json({ error: 'Forbidden' });
     const totalUsd  = nexusChain.state.getUsd(req.params.uid);
@@ -5140,7 +5188,7 @@ app.post('/usd/balance/:uid', requireWeb3Auth, (req, res) => {
     res.json({ address: req.params.uid, balance: totalUsd - lockedUsd, total: totalUsd, locked: lockedUsd });
 });
 
-// ─── PayPal Deposit ───────────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ PayPal Deposit Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/create-paypal-order', requireWeb3Auth, async (req, res) => {
     try {
         const amount = parseFloat(req.body.amount);
@@ -5198,7 +5246,7 @@ app.post('/capture-paypal-order', requireWeb3Auth, async (req, res) => {
     }
 });
 
-// ─── PayPal Withdrawal (PHASE 1 FIX) ──────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ PayPal Withdrawal (PHASE 1 FIX) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
     try {
         const { uid, amount, paypalEmail } = req.body;
@@ -5249,8 +5297,8 @@ app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
     }
 });
 
-// ─── Referral Earnings (Feature 2) ──────────────────────────────────────────
-// GET /api/referrals/:uid — returns this user's referral summary and earnings history
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Referral Earnings (Feature 2) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// GET /api/referrals/:uid Ã¢â‚¬â€ returns this user's referral summary and earnings history
 app.get('/api/referrals/:uid', async (req, res) => {
     const uid = req.params.uid;
     if (!uid || uid.length > 200) return res.status(400).json({ error: 'Invalid uid.' });
@@ -5281,12 +5329,12 @@ app.get('/api/referrals/:uid', async (req, res) => {
     }
 });
 
-// ─── Task B: Liquidity Pool Endpoints ────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Task B: Liquidity Pool Endpoints Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
 // POST /liquidity/deposit
-// Authenticated — deployer deposits custom tokens into the system pool.
+// Authenticated Ã¢â‚¬â€ deployer deposits custom tokens into the system pool.
 // Tokens are locked in the pool; tokenReserve increases; price drops slightly.
-// This is voluntary and free — the deployer gets deeper market liquidity in return.
+// This is voluntary and free Ã¢â‚¬â€ the deployer gets deeper market liquidity in return.
 app.post('/liquidity/deposit', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -5321,7 +5369,7 @@ app.post('/liquidity/deposit', txLimiter, requireWeb3Auth, async (req, res) => {
 });
 
 // POST /liquidity/withdraw
-// Authenticated — user pays USD at the current pool price to retrieve tokens.
+// Authenticated Ã¢â‚¬â€ user pays USD at the current pool price to retrieve tokens.
 // usdReserve increases; tokenReserve decreases; pool price is preserved.
 app.post('/liquidity/withdraw', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
@@ -5373,7 +5421,7 @@ app.post('/liquidity/withdraw', txLimiter, requireWeb3Auth, async (req, res) => 
     }
 });
 
-// GET /liquidity/:ticker — public pool info for a token
+// GET /liquidity/:ticker Ã¢â‚¬â€ public pool info for a token
 app.get('/liquidity/:ticker', readLimiter, (req, res) => {
     const ticker = String(req.params.ticker || '').toUpperCase().trim();
     if (!ticker || ticker === 'SYR') return res.status(400).json({ error: 'Invalid ticker.' });
@@ -5383,9 +5431,9 @@ app.get('/liquidity/:ticker', readLimiter, (req, res) => {
     res.json({ ticker, active: lp.tokenReserve > 0 && lp.usdReserve > 0, tokenReserve: lp.tokenReserve, usdReserve: lp.usdReserve, poolPrice });
 });
 
-// ─── Feature A: System Handler Endpoints ─────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Feature A: System Handler Endpoints Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 
-// GET /system-handler/:ticker — Public: check if a handler exists for this token.
+// GET /system-handler/:ticker Ã¢â‚¬â€ Public: check if a handler exists for this token.
 // Returns the system address only to the token's creator (other callers get exists:true but no address).
 app.get('/system-handler/:ticker', readLimiter, async (req, res) => {
     const ticker = String(req.params.ticker || '').toUpperCase().trim();
@@ -5405,7 +5453,7 @@ app.get('/system-handler/:ticker', readLimiter, async (req, res) => {
     }
 });
 
-// POST /system-handler/pay-fee — Authenticated: pay $2 and generate a system address.
+// POST /system-handler/pay-fee Ã¢â‚¬â€ Authenticated: pay $2 and generate a system address.
 // Only the token creator can call this; only one handler per token is allowed.
 app.post('/system-handler/pay-fee', txLimiter, requireWeb3Auth, async (req, res) => {
     const uid = req.user.uid;
@@ -5437,7 +5485,7 @@ app.post('/system-handler/pay-fee', txLimiter, requireWeb3Auth, async (req, res)
         if (existingRes.rows.length > 0)
             return res.status(409).json({ error: `A System Handler already exists for ${ticker}. Use the existing address.` });
 
-        // Validate: user has ≥ $2.00 USD balance
+        // Validate: user has Ã¢â€°Â¥ $2.00 USD balance
         const usdBalance = nexusChain.state.getUsd(uid);
         const FEE_USD    = 2.00;
         if (usdBalance < FEE_USD)
@@ -5472,7 +5520,7 @@ app.post('/system-handler/pay-fee', txLimiter, requireWeb3Auth, async (req, res)
     }
 });
 
-// ─── Debug: Token Owner Check ────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Debug: Token Owner Check Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 // Authenticated: returns the exact owner address stored in DB for a token.
 // Lets the creator compare their wallet address against what the DB holds.
 app.get('/debug/owner/:ticker', readLimiter, async (req, res) => {
@@ -5510,7 +5558,7 @@ app.get('/debug/owner/:ticker', readLimiter, async (req, res) => {
         res.status(500).json({ error: 'DB query failed.' });
     }
 });
-// ─── PHASE 8: ReamSett (Creator Settings Update) ─────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ PHASE 8: ReamSett (Creator Settings Update) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/api/token/update-settings', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const { ticker, description, logoBase64, fdxTiers, publicUrl } = req.body;
@@ -5552,7 +5600,7 @@ app.post('/api/token/update-settings', txLimiter, requireWeb3Auth, async (req, r
     }
 });
 
-// ─── PHASE 8: Stablecoin Bridge (USD <-> SDX <-> SDTX Converter) ───────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ PHASE 8: Stablecoin Bridge (USD <-> SDX <-> SDTX Converter) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/api/crypto/convert', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const { fromCoin, toCoin, amount } = req.body;
@@ -5611,11 +5659,11 @@ app.post('/api/crypto/convert', txLimiter, requireWeb3Auth, async (req, res) => 
     }
 });
 
-// ─── Token Burn Mechanism (Limitation 20) ────────────────────────────────────
-// ─── Issue 1/3: Token Burn → 7-Day Deletion System ───────────────────────────
-// POST /api/token/burn-request  — Creator initiates a 7-day deletion countdown
-// GET  /api/token/burn-status/:ticker — Returns countdown status
-// POST /api/token/burn-cancel   — Creator cancels a pending deletion (within 7 days)
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Token Burn Mechanism (Limitation 20) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Issue 1/3: Token Burn Ã¢â€ â€™ 7-Day Deletion System Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// POST /api/token/burn-request  Ã¢â‚¬â€ Creator initiates a 7-day deletion countdown
+// GET  /api/token/burn-status/:ticker Ã¢â‚¬â€ Returns countdown status
+// POST /api/token/burn-cancel   Ã¢â‚¬â€ Creator cancels a pending deletion (within 7 days)
 // Internal: processPendingBurns() runs at startup + every hour
 
 // Helper: get all holders of a token with balance > 0
@@ -5629,8 +5677,8 @@ async function getTokenHolders(ticker) {
 // Helper: send deletion alert to all holders (via broadcast_notifications + push to anyone who queries)
 async function alertTokenDeletion(ticker, daysLeft) {
     const msg = daysLeft > 0
-        ? `⚠️ TOKEN DELETION ALERT: ${ticker} will be permanently deleted in ${daysLeft} day(s). Move your ${ticker} funds now. No refunds after deletion.`
-        : `🔥 ${ticker} has been permanently deleted by its creator. All remaining balances have been zeroed.`;
+        ? `Ã¢Å¡Â Ã¯Â¸Â TOKEN DELETION ALERT: ${ticker} will be permanently deleted in ${daysLeft} day(s). Move your ${ticker} funds now. No refunds after deletion.`
+        : `Ã°Å¸â€Â¥ ${ticker} has been permanently deleted by its creator. All remaining balances have been zeroed.`;
     const type = daysLeft > 0 ? 'warning' : 'alert';
     try {
         await pool.query(
@@ -5658,7 +5706,7 @@ async function executeTokenDeletion(ticker, creatorUid) {
         if (menuBook.books[ticker]) delete menuBook.books[ticker];
         apiCache.tokenStats.delete(ticker);
 
-        // Mark as deleted in DB (don't remove — keep for audit trail)
+        // Mark as deleted in DB (don't remove Ã¢â‚¬â€ keep for audit trail)
         await pool.query(
             `UPDATE token_burn_requests SET status = 'executed' WHERE ticker = $1`,
             [ticker]
@@ -5675,7 +5723,7 @@ async function executeTokenDeletion(ticker, creatorUid) {
         ).catch(() => {});
 
         await alertTokenDeletion(ticker, 0);
-        console.log(chalk.red(`[BURN] ✓ Token ${ticker} permanently deleted.`));
+        console.log(chalk.red(`[BURN] Ã¢Å“â€œ Token ${ticker} permanently deleted.`));
     } catch(e) {
         console.error(chalk.red(`[BURN] Deletion failed for ${ticker}:`, e.message));
     }
@@ -5708,7 +5756,7 @@ async function processPendingBurns() {
     } catch(e) { console.error('[BURN] processPendingBurns error:', e.message); }
 }
 
-// POST /api/token/burn-request — Initiates 7-day deletion countdown
+// POST /api/token/burn-request Ã¢â‚¬â€ Initiates 7-day deletion countdown
 app.post('/api/token/burn-request', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const uid    = req.user.uid;
@@ -5716,7 +5764,7 @@ app.post('/api/token/burn-request', txLimiter, requireWeb3Auth, async (req, res)
         const platform = String(req.body?.platform || 'delchain').toLowerCase();
         if (!ticker) return res.status(400).json({ error: 'Ticker required.' });
 
-        // Verify creator — check both transactions table and open_tokens
+        // Verify creator Ã¢â‚¬â€ check both transactions table and open_tokens
         let isCreator = false;
         const mintRes = await pool.query(
             `SELECT to_address FROM transactions WHERE type = 'MINT' AND token_symbol = $1 AND is_system_generated = TRUE LIMIT 1`,
@@ -5762,7 +5810,7 @@ app.post('/api/token/burn-request', txLimiter, requireWeb3Auth, async (req, res)
 
         // Immediately notify all users
         await alertTokenDeletion(ticker, 7);
-        console.log(chalk.yellow(`[BURN] Deletion initiated for ${ticker} by ${uid.substring(0,12)}... → executes ${new Date(executeAt).toISOString()}`));
+        console.log(chalk.yellow(`[BURN] Deletion initiated for ${ticker} by ${uid.substring(0,12)}... Ã¢â€ â€™ executes ${new Date(executeAt).toISOString()}`));
         res.json({ success: true, ticker, executeAt, message: `${ticker} deletion scheduled. All holders have been notified. The token will be permanently deleted after 7 days.` });
     } catch(e) {
         console.error('[BURN-REQUEST]', e);
@@ -5770,7 +5818,7 @@ app.post('/api/token/burn-request', txLimiter, requireWeb3Auth, async (req, res)
     }
 });
 
-// GET /api/token/burn-status/:ticker — Returns countdown info
+// GET /api/token/burn-status/:ticker Ã¢â‚¬â€ Returns countdown info
 app.get('/api/token/burn-status/:ticker', readLimiter, async (req, res) => {
     const ticker = String(req.params.ticker || '').toUpperCase().trim();
     try {
@@ -5786,7 +5834,7 @@ app.get('/api/token/burn-status/:ticker', readLimiter, async (req, res) => {
     } catch(e) { res.status(500).json({ error: 'Failed to fetch burn status.' }); }
 });
 
-// POST /api/token/burn-cancel — Creator cancels a pending deletion (grace period)
+// POST /api/token/burn-cancel Ã¢â‚¬â€ Creator cancels a pending deletion (grace period)
 app.post('/api/token/burn-cancel', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -5794,12 +5842,12 @@ app.post('/api/token/burn-cancel', txLimiter, requireWeb3Auth, async (req, res) 
         const normAddr = (a) => String(a || '').trim().replace(/^nx_/, '');
         const r = await pool.query(`SELECT creator_uid, status FROM token_burn_requests WHERE ticker = $1 LIMIT 1`, [ticker]);
         if (r.rows.length === 0) return res.status(404).json({ error: 'No pending deletion found for this token.' });
-        if (r.rows[0].status !== 'pending') return res.status(400).json({ error: 'Cannot cancel — deletion already executed.' });
+        if (r.rows[0].status !== 'pending') return res.status(400).json({ error: 'Cannot cancel Ã¢â‚¬â€ deletion already executed.' });
         if (normAddr(r.rows[0].creator_uid) !== normAddr(uid)) return res.status(403).json({ error: 'Only the creator can cancel deletion.' });
         await pool.query(`UPDATE token_burn_requests SET status = 'cancelled' WHERE ticker = $1`, [ticker]);
         // Notify users the deletion was cancelled
         await pool.query(`INSERT INTO broadcast_notifications (uid, message, type, created_at) VALUES ($1, $2, $3, $4)`,
-            ['system', `✅ ${ticker} deletion has been CANCELLED by the creator. The token will continue to exist.`, 'success', Date.now()]);
+            ['system', `Ã¢Å“â€¦ ${ticker} deletion has been CANCELLED by the creator. The token will continue to exist.`, 'success', Date.now()]);
         res.json({ success: true, message: `Deletion of ${ticker} has been cancelled.` });
     } catch(e) { res.status(500).json({ error: 'Failed to cancel deletion.' }); }
 });
@@ -5831,9 +5879,9 @@ app.post('/api/token/burn', txLimiter, requireWeb3Auth, async (req, res) => {
 });
 
 // FEATURE 28: Stripe Card Deposit Session
-// Stripe card deposit removed — STRIPE_SECRET_KEY no longer needed.
+// Stripe card deposit removed Ã¢â‚¬â€ STRIPE_SECRET_KEY no longer needed.
 
-// KYC endpoints removed — /api/kyc/create-session, /api/kyc/return, /api/kyc/status
+// KYC endpoints removed Ã¢â‚¬â€ /api/kyc/create-session, /api/kyc/return, /api/kyc/status
 // Status endpoint returns verified=true so no existing code breaks.
 app.post('/api/kyc/status', readLimiter, requireWeb3Auth, (req, res) => {
     // KYC removed: always return verified so no frontend lock-screens appear
@@ -6049,12 +6097,12 @@ app.get('/p2p/my-trades', readLimiter, requireWeb3Auth, async (req, res) => {
     }
 });
 
-// ─── 404 Catch-all ────────────────────────────────────────────────────────────
+// Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ 404 Catch-all Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.use((req, res) => { res.status(404).json({ error: 'API Node Endpoint Not Found' }); });
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 // SERVER BOOT
-// ═══════════════════════════════════════════════════════════════════════════════
+// Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 (async () => {
     console.log(chalk.blue('Initializing PostgreSQL API States...'));
     await loadApiState();
@@ -6081,7 +6129,7 @@ app.use((req, res) => { res.status(404).json({ error: 'API Node Endpoint Not Fou
 
     await updateMarketEconomics();
 
-    // ── Approve all pending withdrawal addresses ─────────────────────────────
+    // Ã¢â€â‚¬Ã¢â€â‚¬ Approve all pending withdrawal addresses Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     // Since NowPayments has no whitelist API, security is handled by our own
     // address book. All KYC-verified users' addresses are approved immediately.
     // This runs at startup to catch any addresses stuck in 'pending' state.
@@ -6164,7 +6212,7 @@ app.use((req, res) => { res.status(404).json({ error: 'API Node Endpoint Not Fou
                          VALUES ($1, $2, $3, $4) ON CONFLICT (ticker) DO UPDATE SET system_address = $2`,
                         [ticker, sysAddr, supply, Date.now()]
                     );
-                    console.log(chalk.green(`[AUTO-MIGRATE] ${ticker}: system address created → ${sysAddr}`));
+                    console.log(chalk.green(`[AUTO-MIGRATE] ${ticker}: system address created Ã¢â€ â€™ ${sysAddr}`));
                 } catch(e) {
                     console.error(chalk.red(`[AUTO-MIGRATE] ${ticker} failed:`, e.message));
                 }
@@ -6174,14 +6222,23 @@ app.use((req, res) => { res.status(404).json({ error: 'API Node Endpoint Not Fou
         console.warn(chalk.yellow('[AUTO-MIGRATE] Legacy token scan failed:', e.message));
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // ADMIN ENDPOINTS — Protected by ECDSA requireWeb3Auth + ADMIN_WALLET check
+    // Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+    // ADMIN ENDPOINTS Ã¢â‚¬â€ Protected by ECDSA requireWeb3Auth + ADMIN_WALLET check
     // Only the ADMIN_WALLET can call these. Rate limited to 5/min.
-    // ═══════════════════════════════════════════════════════════════════════════
+    // Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
     const adminLimiter = rateLimit({ windowMs: 60 * 1000, max: 5, standardHeaders: true, legacyHeaders: false });
 
-    // GET /admin/stats — full platform analytics for admin dashboard
-    app.get('/admin/stats', adminLimiter, requireWeb3Auth, async (req, res) => {
+
+    // POST /admin/verify - lightweight auth-ping for the frontend lock screen.
+    // Frontend calls this before revealing admin panel. Returns 200 only for ADMIN_WALLET.
+    app.post('/admin/verify', adminLimiter, requireWeb3Auth, (req, res) => {
+        if (!ADMIN_WALLET) return res.status(503).json({ error: 'Admin not configured on this server.' });
+        if (req.user.uid.toLowerCase() !== ADMIN_WALLET)
+            return res.status(403).json({ error: 'Forbidden: Not the admin wallet.' });
+        res.json({ ok: true, message: 'Admin identity verified.' });
+    });
+    // GET /admin/stats Ã¢â‚¬â€ full platform analytics for admin dashboard
+    app.get('/admin/stats', adminLimiter, requireHeaderAuth, async (req, res) => {
         if (req.user.uid.toLowerCase() !== ADMIN_WALLET) return res.status(403).json({ error: 'Forbidden: admin only' });
         try {
             const now = Date.now();
@@ -6272,7 +6329,7 @@ app.use((req, res) => { res.status(404).json({ error: 'API Node Endpoint Not Fou
         }
     });
 
-    // POST /admin/sweep-fees — transfer system/fee_pool balance to ADMIN_WALLET
+    // POST /admin/sweep-fees Ã¢â‚¬â€ transfer system/fee_pool balance to ADMIN_WALLET
     app.post('/admin/sweep-fees', adminLimiter, requireWeb3Auth, async (req, res) => {
         if (req.user.uid.toLowerCase() !== ADMIN_WALLET) return res.status(403).json({ error: 'Forbidden: admin only' });
         const { asset, source } = req.body; // asset: 'USD'|'SYR'|'SDX', source: 'system'|'fee_pool'
@@ -6296,7 +6353,7 @@ app.use((req, res) => { res.status(404).json({ error: 'API Node Endpoint Not Fou
                 description: `Admin fee sweep: ${asset} from ${srcAddr}`
             };
             await mempool.addTransaction(tx);
-            console.log(chalk.magenta(`[ADMIN SWEEP] ${amount} ${asset} from ${srcAddr} → ADMIN_WALLET`));
+            console.log(chalk.magenta(`[ADMIN SWEEP] ${amount} ${asset} from ${srcAddr} Ã¢â€ â€™ ADMIN_WALLET`));
             res.json({ success: true, asset, source: srcAddr, amount, message: `Sweeping ${amount.toFixed(6)} ${asset} to your wallet. Will settle in next block.` });
         } catch(e) {
             console.error('[ADMIN/SWEEP]', e.message);
@@ -6304,8 +6361,8 @@ app.use((req, res) => { res.status(404).json({ error: 'API Node Endpoint Not Fou
         }
     });
 
-    // GET /admin/revenue-chart — 30-day daily fee breakdown
-    app.get('/admin/revenue-chart', adminLimiter, requireWeb3Auth, async (req, res) => {
+    // GET /admin/revenue-chart Ã¢â‚¬â€ 30-day daily fee breakdown
+    app.get('/admin/revenue-chart', adminLimiter, requireHeaderAuth, async (req, res) => {
         if (req.user.uid.toLowerCase() !== ADMIN_WALLET) return res.status(403).json({ error: 'Forbidden: admin only' });
         try {
             const thirtyDaysAgo = Date.now() - 30 * 86400000;
@@ -6329,8 +6386,8 @@ app.use((req, res) => { res.status(404).json({ error: 'API Node Endpoint Not Fou
         }
     });
 
-    // GET /admin/p2p-disputes — list all disputed P2P trades for admin resolution
-    app.get('/admin/p2p-disputes', adminLimiter, requireWeb3Auth, async (req, res) => {
+    // GET /admin/p2p-disputes Ã¢â‚¬â€ list all disputed P2P trades for admin resolution
+    app.get('/admin/p2p-disputes', adminLimiter, requireHeaderAuth, async (req, res) => {
         if (req.user.uid.toLowerCase() !== ADMIN_WALLET) return res.status(403).json({ error: 'Forbidden: admin only' });
         try {
             const result = await pool.query(
@@ -6366,3 +6423,5 @@ app.use((req, res) => { res.status(404).json({ error: 'API Node Endpoint Not Fou
         }, 2000);
     });
 })();
+
+

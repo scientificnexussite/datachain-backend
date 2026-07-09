@@ -1,4 +1,4 @@
-﻿import express from 'express';
+import express from 'express';
 import bodyParser from 'body-parser';
 import cors from 'cors';
 import chalk from 'chalk';
@@ -6396,6 +6396,69 @@ app.get('/p2p/my-trades', readLimiter, requireWeb3Auth, async (req, res) => {
         } catch(e) {
             console.error('[ADMIN/P2P-DISPUTES]', e.message);
             res.status(500).json({ error: 'Failed to fetch disputes.' });
+        }
+    });
+
+    // ═══════════════════════════════════════════════════════════════
+    // WP5: DATA EXPORT ENDPOINTS (for EXE local migration)
+    // Admin-only. Exports PostgreSQL table data as JSON for local import.
+    // ═══════════════════════════════════════════════════════════════
+
+    // GET /admin/export-manifest — list exportable tables and row counts
+    app.get('/admin/export-manifest', adminLimiter, requireHeaderAuth, async (req, res) => {
+        if (req.user.uid.toLowerCase() !== ADMIN_WALLET) return res.status(403).json({ error: 'Forbidden: admin only' });
+        try {
+            const tables = [
+                'balances', 'usd_balances', 'orders', 'transactions',
+                'liquidity_pools', 'token_metadata', 'referrals', 'referral_earnings',
+                'notifications', 'staking_positions', 'feature_activations',
+                'price_history', 'system_handlers', 'token_burn_requests', 'public_keys'
+            ];
+            const manifest = [];
+            for (const t of tables) {
+                try {
+                    const countResult = await pool.query(`SELECT COUNT(*) as cnt FROM ${t}`);
+                    manifest.push({ table: t, rows: parseInt(countResult.rows[0].cnt) || 0 });
+                } catch (e) {
+                    manifest.push({ table: t, rows: 0, error: 'Table may not exist' });
+                }
+            }
+            res.json({ manifest, exportedAt: new Date().toISOString() });
+        } catch(e) {
+            res.status(500).json({ error: e.message });
+        }
+    });
+
+    // GET /admin/export/:table — export a table's data as JSON array
+    app.get('/admin/export/:table', adminLimiter, requireHeaderAuth, async (req, res) => {
+        if (req.user.uid.toLowerCase() !== ADMIN_WALLET) return res.status(403).json({ error: 'Forbidden: admin only' });
+
+        const allowedTables = [
+            'balances', 'usd_balances', 'orders', 'transactions',
+            'liquidity_pools', 'token_metadata', 'referrals', 'referral_earnings',
+            'notifications', 'staking_positions', 'feature_activations',
+            'price_history', 'system_handlers', 'token_burn_requests', 'public_keys'
+        ];
+        const tableName = req.params.table;
+        if (!allowedTables.includes(tableName)) {
+            return res.status(400).json({ error: `Table '${tableName}' is not exportable.` });
+        }
+
+        const offset = parseInt(req.query.offset) || 0;
+        const limit  = Math.min(parseInt(req.query.limit) || 1000, 5000);
+
+        try {
+            const result = await pool.query(`SELECT * FROM ${tableName} ORDER BY 1 LIMIT $1 OFFSET $2`, [limit, offset]);
+            res.json({
+                table: tableName,
+                rows: result.rows,
+                count: result.rows.length,
+                offset, limit,
+                hasMore: result.rows.length === limit
+            });
+        } catch(e) {
+            console.error(`[ADMIN/EXPORT] Error exporting ${tableName}:`, e.message);
+            res.status(500).json({ error: `Export failed: ${e.message}` });
         }
     });
 

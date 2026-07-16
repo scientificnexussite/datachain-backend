@@ -4909,6 +4909,21 @@ app.post('/mine/submit', rateLimit({ windowMs: 60000, max: 30 }), requireWeb3Aut
         // "system" is the SYR mint authority (state.js), so mining continues forever.
         const REWARD = 50;
 
+        // R111 FIX (owner 2026-07-13): per-wallet DAILY cap so uncapped browser mining
+        // can't be farmed. Ceiling on SYR a single wallet can mint per calendar day
+        // (server-local midnight). Tunable: raise for more generosity, lower to tighten.
+        // The 30/min rate-limit still applies; counts MINED rewards (pending mempool ones
+        // lag until mined, but the rate-limit bounds any overage).
+        const DAILY_MINE_CAP = 5000;
+        const startOfDayMs = new Date().setHours(0, 0, 0, 0);
+        const minedTodayRes = await pool.query(
+            "SELECT COALESCE(SUM(amount), 0) AS total FROM transactions WHERE to_address = $1 AND description = 'Browser Mining Reward' AND timestamp_ms >= $2",
+            [uid, startOfDayMs]
+        );
+        if ((parseFloat(minedTodayRes.rows[0].total) || 0) + REWARD > DAILY_MINE_CAP) {
+            return res.status(429).json({ error: `Daily browser-mining limit reached (${DAILY_MINE_CAP} SYR/day per wallet). Come back tomorrow.` });
+        }
+
         // Issue 50 SYR Reward
         const rewardTx = {
             from: 'system', to: uid, amount: REWARD,

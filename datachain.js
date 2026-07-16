@@ -419,7 +419,10 @@ class DataChain {
         }
     }
     
-    return Math.max(0, 12000000000 - totalCirculating);
+    // UNCAPPED (2026-07-13): no longer floored at 0, so "circulating = MAX_SUPPLY - remaining"
+    // stays correct past the legacy 12B reference. Minting is no longer halted by this value
+    // (the block reward + browser mining no longer clamp on it).
+    return 12000000000 - totalCirculating;
   }
 
   async getLastMarketPrice(defaultPrice) {
@@ -503,30 +506,42 @@ class DataChain {
         if (this.blockCount > 0 && this.chain[0].index === 0) return true;
     }
 
-    let rewardAmount = config.blockchain.reward;
-    if (config.blockchain.halving_interval) {
-        const halvings = Math.floor(this.blockCount / config.blockchain.halving_interval);
-        rewardAmount = rewardAmount / Math.pow(2, halvings);
-    }
-    const remaining = this.getRemainingSupply("SYR");
-    if (rewardAmount > remaining) rewardAmount = remaining;
+    // ── UNCAPPED FLAT TAIL EMISSION (owner decision 2026-07-13) ──────────────────
+    // Fixes the miner-reward decay: the old reward = 50 / 2^(blockCount/100000) halved
+    // every 100,000 blocks (~11.6 days @10s), collapsing to ~0 within a year; and the
+    // 12B getRemainingSupply() clamp would have halted mining. Now a FLAT reward every
+    // block FOREVER (no halving, no cap): R_tail = 15 SYR = 2 -> miner + 13 -> AI treasury.
+    // "system" is the SYR mint authority (state.js applyTransaction), so it mints as needed.
+    const minerReward    = config.blockchain.miner_reward    ?? 2;
+    const treasuryReward = config.blockchain.treasury_reward ?? 13;
 
     const rewardTx = {
         from: "system",
         to: config.blockchain.miner_address,
-        amount: rewardAmount,
+        amount: minerReward,
         type: "TRANSFER",
-        tokenSymbol: "SYR", 
+        tokenSymbol: "SYR",
         timestamp: Date.now(),
         isSystemGenerated: true
+    };
+    const treasuryTx = {
+        from: "system",
+        to: config.blockchain.treasury_address,
+        amount: treasuryReward,
+        type: "TRANSFER",
+        tokenSymbol: "SYR",
+        timestamp: Date.now(),
+        isSystemGenerated: true,
+        description: "AI Treasury Emission"
     };
 
     const tempState = new State();
     tempState.balances = JSON.parse(JSON.stringify(this.state.balances));
-    tempState.usd_balances = { ...this.state.usd_balances }; 
-    
-    const validTransactions = rewardAmount > 0 ? [rewardTx] : [];
-    if (rewardAmount > 0) tempState.applyTransaction(rewardTx, currentPrice, false);
+    tempState.usd_balances = { ...this.state.usd_balances };
+
+    const validTransactions = [];
+    if (minerReward > 0)    { tempState.applyTransaction(rewardTx, currentPrice, false);   validTransactions.push(rewardTx); }
+    if (treasuryReward > 0 && config.blockchain.treasury_address) { tempState.applyTransaction(treasuryTx, currentPrice, false); validTransactions.push(treasuryTx); }
 
         for (const tx of transactions) {
       // --- ARMOR PLATE 5: THE VAULT DOOR (Defense in Depth) ---

@@ -4905,10 +4905,9 @@ app.post('/mine/submit', rateLimit({ windowMs: 60000, max: 30 }), requireWeb3Aut
              return res.status(400).json({ error: 'Block already mined by network.' });
         }
 
-        // FEATURE M4 FIX: Ensure reward doesn't exceed MAX_SUPPLY
+        // UNCAPPED (owner 2026-07-13): browser mining no longer halts at the 12B cap.
+        // "system" is the SYR mint authority (state.js), so mining continues forever.
         const REWARD = 50;
-        const remaining = nexusChain.getRemainingSupply('SYR');
-        if (remaining < REWARD) return res.status(400).json({ error: 'Max supply reached. Minting halted.' });
 
         // Issue 50 SYR Reward
         const rewardTx = {

@@ -6,8 +6,11 @@
     "max_peers": 50
   },
   "blockchain": {
-    "reward": 50,
-    "halving_interval": 100000,
+    "reward": 15,
+    "miner_reward": 2,
+    "treasury_reward": 13,
+    "treasury_address": "nexus-ai-treasury",
+    "halving_interval": null,
     "currency_symbol": "SYR",
     "sub_unit": "Sats",
     "genesis_date": "03/27/2026",

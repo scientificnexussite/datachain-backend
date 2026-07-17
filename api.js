@@ -1047,7 +1047,7 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/config', (req, res) => {
-    res.json({ paypalClientId: PAYPAL_CLIENT_ID, sandboxMode: process.env.PAYPAL_MODE !== 'live' });
+    res.json({ paypalClientId: null, sandboxMode: process.env.PAYPAL_MODE !== 'live' }); // PayPal REMOVED (crypto-only) 2026-07-13
 });
 
 // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Price Alert Endpoints (IMPROVEMENT 6) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
@@ -5205,6 +5205,8 @@ app.post('/usd/balance/:uid', requireWeb3Auth, (req, res) => {
 
 // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ PayPal Deposit Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/create-paypal-order', requireWeb3Auth, async (req, res) => {
+    // PayPal REMOVED 2026-07-13 (crypto-only). Route disabled; deposits are crypto via NowPayments.
+    return res.status(410).json({ error: 'PayPal deposits have been removed. Use crypto deposit instead.' });
     try {
         const amount = parseFloat(req.body.amount);
         if (isNaN(amount) || amount < 1 || amount > 10000)
@@ -5228,6 +5230,8 @@ app.post('/create-paypal-order', requireWeb3Auth, async (req, res) => {
 });
 
 app.post('/capture-paypal-order', requireWeb3Auth, async (req, res) => {
+    // PayPal REMOVED 2026-07-13 (crypto-only). Route disabled.
+    return res.status(410).json({ error: 'PayPal deposits have been removed. Use crypto deposit instead.' });
     try {
         if (req.body.uid !== req.user.uid) return res.status(403).json({ error: 'Forbidden' });
         const orderRecord = pendingPayPalOrders.get(req.body.orderID);
@@ -5263,6 +5267,8 @@ app.post('/capture-paypal-order', requireWeb3Auth, async (req, res) => {
 
 // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ PayPal Withdrawal (PHASE 1 FIX) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 app.post('/usd/withdraw', requireWeb3Auth, async (req, res) => {
+    // PayPal REMOVED 2026-07-13 (crypto-only). Fiat/PayPal withdrawal disabled; use crypto withdrawal.
+    return res.status(410).json({ error: 'PayPal withdrawal has been removed. Use crypto withdrawal instead.' });
     try {
         const { uid, amount, paypalEmail } = req.body;
         if (uid !== req.user.uid) return res.status(403).json({ error: 'Forbidden' });

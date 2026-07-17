@@ -1,5 +1,6 @@
 import chalk from 'chalk';
 import crypto from 'crypto';
+import * as powpolicy from './powpolicy.js';
 
 // ─── DER Encoding Helper ──────────────────────────────────────────────────────
 const rawToDer = (rawSigHex) => {
@@ -27,7 +28,7 @@ class Validator {
 
   // LIMITATION 18 COMPATIBILITY: calculateHash() automatically uses the Merkle Root
   // if available, keeping validation lightweight without rewriting this core engine.
-  validateBlock(newBlock, previousBlock, chainDifficulty = 2) {
+  validateBlock(newBlock, previousBlock, chainDifficulty = 2, blocks = null) {
     // 1) Hash-link integrity
     if (newBlock.previousHash !== previousBlock.hash) {
       console.log(chalk.red('[VALIDATOR] Error: Hash Link Broken — previousHash mismatch.'));
@@ -41,11 +42,22 @@ class Validator {
       return false;
     }
 
-    // 3) Proof-of-Work target using the live chain difficulty
-    const target = Array((chainDifficulty || 2) + 1).join('0');
-    if (!newBlock.hash.startsWith(target)) {
-      console.log(chalk.red(`[VALIDATOR] Error: Block hash does not meet difficulty target (${chainDifficulty} leading zeros required).`));
-      return false;
+    // 3) Proof-of-Work — fork-aware (spec: DATACHAIN_DIFFICULTY_FORK.txt). DORMANT until
+    //    FORK_1_HEIGHT is calibrated: every real index is below it, so the OLD leading-hex-
+    //    zeros rule below runs UNCHANGED. The post-fork branch validates the hash against the
+    //    256-bit per-height target recomputed from the chain window (fixes the per-tip bug).
+    if (newBlock.index < powpolicy.FORK_1_HEIGHT) {
+      const target = Array((chainDifficulty || 2) + 1).join('0');
+      if (!newBlock.hash.startsWith(target)) {
+        console.log(chalk.red(`[VALIDATOR] Error: Block hash does not meet difficulty target (${chainDifficulty} leading zeros required).`));
+        return false;
+      }
+    } else {
+      const t = powpolicy.targetForHeight(blocks || [], newBlock.index);
+      if (powpolicy.hashToBigInt(newBlock.hash) > t) {
+        console.log(chalk.red(`[VALIDATOR] Error: Block hash does not meet target (post-fork) at height ${newBlock.index}.`));
+        return false;
+      }
     }
 
     return true;

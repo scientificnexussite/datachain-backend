@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 import CryptoJS from 'crypto-js';
 import chalk from 'chalk';
 import validator from './validator.js';
+import * as powpolicy from './powpolicy.js';
 import State from './state.js';
 import config from './config.json' with { type: "json" };
 import pool from './db.js'; 
@@ -107,7 +108,7 @@ class Block {
   }
 
   // LIMITATION 6 FIX: This leverages node worker_threads natively to offload PoW hash logic 
-  mineBlock(difficulty) {
+  mineBlock(difficulty, targetHex = null) {
     return new Promise((resolve, reject) => {
         const worker = new Worker(join(__dirname, 'mine-worker.js'), {
             workerData: {
@@ -115,9 +116,11 @@ class Block {
                 previousHash: this.previousHash,
                 timestamp: this.timestamp,
                 // MASSIVE PERFORMANCE FIX: Pass the 64-character Merkle Root instead of a giant array
-                merkleRoot: this.merkleRoot, 
+                merkleRoot: this.merkleRoot,
                 data: this.data, // Kept for backwards compatibility if worker is outdated
-                difficulty: difficulty
+                difficulty: difficulty,
+                targetHex: targetHex,                   // post-fork 256-bit target (null = pre-fork)
+                forkHeight: powpolicy.FORK_1_HEIGHT      // DORMANT sentinel until calibrated
             }
         });
         
@@ -244,7 +247,7 @@ class DataChain {
       for(let i=1; i<newBlocks.length; i++) {
           // FIX 3 — Use the shared validator with the live chain difficulty so
           // that resolveConflict() and addBlock() enforce the exact same PoW target.
-          if (!validator.validateBlock(newBlocks[i], newBlocks[i-1], this.difficulty)) {
+          if (!validator.validateBlock(newBlocks[i], newBlocks[i-1], this.difficulty, newBlocks)) {
               console.log(chalk.red('[NETWORK] Rejecting fork: Received block fails validator check.'));
               return false;
           }
@@ -390,7 +393,7 @@ class DataChain {
 
           if (rescueTxs.length > 0) {
               const newBlock = new Block(this.blockCount, Date.now(), rescueTxs, this.getLatestBlock().hash);
-              await newBlock.mineBlock(this.difficulty);
+              await newBlock.mineBlock(this.difficulty, powpolicy.targetHexForHeight(this.chain, newBlock.index));
               
               for (const tx of rescueTxs) {
                   this.state.applyTransaction(tx, await this.getLastMarketPrice(0.50), false);
@@ -564,9 +567,9 @@ class DataChain {
 
     const newBlock = new Block(this.blockCount, Date.now(), validTransactions, this.getLatestBlock().hash);
     
-    await newBlock.mineBlock(this.difficulty); 
+    await newBlock.mineBlock(this.difficulty, powpolicy.targetHexForHeight(this.chain, newBlock.index)); 
 
-    if (!validator.validateBlock(newBlock, this.getLatestBlock(), this.difficulty)) return false;
+    if (!validator.validateBlock(newBlock, this.getLatestBlock(), this.difficulty, this.chain)) return false;
 
     this.chain.push(newBlock);
     this.blockCount++;

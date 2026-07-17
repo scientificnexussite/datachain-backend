@@ -4889,13 +4889,20 @@ app.post('/mine/submit', rateLimit({ windowMs: 60000, max: 30 }), requireWeb3Aut
         const actRes = await pool.query("SELECT 1 FROM feature_activations WHERE uid = $1 AND feature = 'browser_mining'", [uid]);
         if (actRes.rows.length === 0) return res.status(403).json({ error: 'Browser Mining is not activated for this wallet.' });
 
+        // R111 HARDENING (owner 2026-07-13): browser mining uses a DEDICATED, higher PoW
+        // difficulty than the chain floor so the 50-SYR reward costs real work (~16^6 hashes).
+        // The website UI already deprecated browser mining, so no legitimate client is affected;
+        // this only raises the cost of scripted farming. Scales up if chain difficulty rises.
+        const BROWSER_MINE_DIFFICULTY = Math.max(6, nexusChain.difficulty);
+        const browserTarget = '0'.repeat(BROWSER_MINE_DIFFICULTY);
+
         // BUG 5 FIX: Strict Proof-of-Work Mathematical Verification
         if (nonce === undefined || !index || !previousHash || !minerTimestamp) {
             // Graceful fallback for older frontends temporarily
-            if (!hash.startsWith('0'.repeat(nexusChain.difficulty))) return res.status(400).json({ error: 'Invalid PoW hash rejected.' });
+            if (!hash.startsWith(browserTarget)) return res.status(400).json({ error: 'Invalid PoW hash rejected.' });
         } else {
             const expectedHash = crypto.createHash('sha256').update(index + previousHash + minerTimestamp + JSON.stringify([]) + nonce).digest('hex');
-            if (expectedHash !== hash || !hash.startsWith('0'.repeat(nexusChain.difficulty))) {
+            if (expectedHash !== hash || !hash.startsWith(browserTarget)) {
                 return res.status(400).json({ error: 'SECURITY: Cryptographic Proof-of-Work verification failed.' });
             }
         }

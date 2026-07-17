@@ -2,8 +2,12 @@ import { parentPort, workerData } from 'worker_threads';
 import CryptoJS from 'crypto-js';
 
 // Solves Issue #14: Worker Thread Mining prevents Express API freezes during PoW
-const { index, previousHash, timestamp, data, merkleRoot, difficulty } = workerData;
+const { index, previousHash, timestamp, data, merkleRoot, difficulty, targetHex, forkHeight } = workerData;
+// Fork-aware acceptance (spec: DATACHAIN_DIFFICULTY_FORK.txt). DORMANT until FORK_1_HEIGHT is
+// calibrated: usePostFork is false for every real index -> the OLD leading-hex-zeros test runs.
+const usePostFork = (typeof forkHeight === 'number' && index >= forkHeight);
 const target = Array(difficulty + 1).join("0");
+const targetBig = (usePostFork && targetHex) ? BigInt('0x' + targetHex) : 0n;
 
 // Limitation 6 FIX: Added MAX_NONCE cap so the worker exits cleanly if nonce is
 // exhausted (virtually impossible but prevents an infinite loop at extreme difficulty).
@@ -32,7 +36,8 @@ const calculateHash = (n) => {
 
 while (!aborted && nonce <= MAX_NONCE) {
     hash = calculateHash(nonce);
-    if (hash.substring(0, difficulty) === target) {
+    const ok = usePostFork ? (BigInt('0x' + hash) <= targetBig) : (hash.substring(0, difficulty) === target);
+    if (ok) {
         parentPort.postMessage({ nonce, hash });
         break;
     }

@@ -5,6 +5,7 @@ import CryptoJS from 'crypto-js';
 import chalk from 'chalk';
 import validator from './validator.js';
 import * as powpolicy from './powpolicy.js';
+import * as epoch from './epoch.js';
 import State from './state.js';
 import config from './config.json' with { type: "json" };
 import pool from './db.js'; 
@@ -153,6 +154,10 @@ class DataChain {
     
     this.isSaving = false;
     this.saveQueue = false;
+
+    // F22 pending-payment queue: treasury obligations an epoch could not cover, retried
+    // next epoch (hosts first, oldest first). Empty while epoch settlement is dormant.
+    this.treasuryPending = [];
 
     this.isInitializing = this.loadChain();
   }
@@ -545,6 +550,41 @@ class DataChain {
     const validTransactions = [];
     if (minerReward > 0)    { tempState.applyTransaction(rewardTx, currentPrice, false);   validTransactions.push(rewardTx); }
     if (treasuryReward > 0 && config.blockchain.treasury_address) { tempState.applyTransaction(treasuryTx, currentPrice, false); validTransactions.push(treasuryTx); }
+
+    // ── AI TREASURY EPOCH SETTLEMENT (M1) — DORMANT ─────────────────────────────
+    // At a daily epoch boundary the treasury pays hosts for verified work (F2/F3/F8/F12),
+    // oldest debt first, hosts before salaries (F22). Payouts are ordinary TRANSFERs from
+    // the treasury address, so applyTransaction below refuses any payout the treasury
+    // cannot actually cover — a hard floor under the solvency invariant.
+    // No-op today: epoch.js EPOCH_1_HEIGHT is dormant and there are no receipts yet.
+    if (epoch.isEpochBoundary(this.blockCount)) {
+        const settlement = epoch.buildEpochTransactions({
+            height: this.blockCount,
+            treasuryAddress: config.blockchain.treasury_address,
+            treasuryBalance: tempState.getBalance(config.blockchain.treasury_address),
+            epochPool: treasuryReward * epoch.EPOCH_BLOCKS,
+            receipts: epoch.getVerifiedWorkReceipts(this.chain, epoch.epochNumber(this.blockCount)),
+            carriedPending: this.treasuryPending || []
+        });
+
+        settlement.txs.forEach((tx, i) => {
+            tx.timestamp = Date.now();   // same convention as the coinbase txs above
+            if (tempState.applyTransaction(tx, currentPrice, false)) {
+                validTransactions.push(tx);
+            } else {
+                // Should be unreachable — the queue already checked the balance. But a host's
+                // debt must never be silently lost, so re-queue it for the next epoch.
+                console.log(chalk.red(`[TREASURY] Payout rejected by the ledger, re-queued: ${tx.to} (${tx.amount} SYR)`));
+                settlement.pending.push(Object.assign({}, settlement.obligations[i], { status: 'PENDING' }));
+            }
+        });
+        this.treasuryPending = settlement.pending;
+
+        if (settlement.summary && settlement.summary.paidCount > 0) {
+            const s = settlement.summary;
+            console.log(chalk.cyan(`[TREASURY] Epoch ${s.epoch} settled: ${s.totalPaid.toFixed(4)} SYR to ${s.paidCount} hosts, ${s.pendingCount} pending`));
+        }
+    }
 
         for (const tx of transactions) {
       // --- ARMOR PLATE 5: THE VAULT DOOR (Defense in Depth) ---

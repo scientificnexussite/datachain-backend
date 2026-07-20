@@ -9,7 +9,8 @@
   },
   "scripts": {
     "start": "node api.js",
-    "p2p": "node p2p.js"
+    "p2p": "node p2p.js",
+    "test": "node tests/treasury.test.js && node tests/epoch.test.js"
   },
   "dependencies": {
     "@libp2p/mplex": "^1.0.0",

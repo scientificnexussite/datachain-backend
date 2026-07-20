@@ -3255,7 +3255,7 @@ app.post('/api/crypto/generate-address', txLimiter, requireWeb3Auth, async (req,
         if (!network) return res.status(400).json({ error: 'Network is required.' });
 
         // Default to SDTX if no target asset is provided by older app versions
-        const safeTarget = ['SDX', 'SDTX', 'USD'].includes(targetAsset) ? targetAsset : 'SDTX';
+        const safeTarget = ['SDTX', 'USD'].includes(targetAsset) ? targetAsset : 'SDTX'; // SDX RETIRED 2026-07-13 — never a mint target; legacy SDX requests settle as SDTX
         const currency = getCryptoTicker(network);
 
                 // Fetch Minimum Deposit Amount in USD to display to the user
@@ -3335,7 +3335,7 @@ app.post('/api/crypto/webhook', express.json(), async (req, res) => {
 
         // Unpack the UID and Target Asset from our custom packed order_id string
         const [uid, targetAsset] = order_id.split(':::');
-        const safeTarget = ['SDX', 'SDTX', 'USD'].includes(targetAsset) ? targetAsset : 'SDTX';
+        const safeTarget = ['SDTX', 'USD'].includes(targetAsset) ? targetAsset : 'SDTX'; // SDX RETIRED 2026-07-13 — never a mint target; legacy SDX requests settle as SDTX
 
         const fiatAmount = actually_paid_in_fiat ? parseFloat(actually_paid_in_fiat) : parseFloat(actually_paid);
 
@@ -5636,6 +5636,12 @@ app.post('/api/crypto/convert', txLimiter, requireWeb3Auth, async (req, res) => 
 
         if (!validCoins.includes(fromUpper) || !validCoins.includes(toUpper) || fromUpper === toUpper) {
             return res.status(400).json({ error: 'Conversion is only supported between SDX, SDTX, and USD.' });
+        }
+
+        // SDX RETIRED 2026-07-13: no NEW SDX may be created. Converting OUT of SDX stays open so
+        // existing holders can move to SDTX/USD; converting INTO SDX is refused.
+        if (toUpper === 'SDX') {
+            return res.status(400).json({ error: 'SDX is retired and can no longer be created. Convert to SDTX instead.' });
         }
 
         // Check user balance

@@ -37,10 +37,25 @@ export function hostWeight(h) {
 }
 
 /**
- * F3 + F12 — shares proportional to verified-work weight, with every share capped at cCap.
+ * F3 + F12 — shares proportional to verified-work weight, with every share capped.
  * When a host hits the cap its excess is redistributed to the others, repeatedly, until
  * every share respects the cap. Shares always sum to <= 1 (never more), so any unallocated
  * remainder simply stays in the treasury.
+ *
+ * ── ADAPTIVE CAP (R113, owner decision 2026-07-21) ──────────────────────────────
+ * The effective cap is  max(cCap, 1 / n_eligible).
+ *
+ * A fixed 0.5% cap silently throttles payouts on a SMALL network: a sub-pool needs >=200
+ * hosts before 100% of it can be allocated at all, so a 10-host network paid out 2.5% of
+ * each epoch and stranded the rest — worst exactly when bootstrapping matters most.
+ *
+ * 1/n is the MINIMUM POSSIBLE MAXIMUM SHARE: with n eligible hosts, someone must receive
+ * at least 1/n of any fully-allocated pool. So raising the cap to 1/n adds NO concentration
+ * risk that was avoidable — it only permits the most even split that exists. Above ~200
+ * hosts, 1/n < cCap and the 0.5% cap binds exactly as before, unchanged.
+ *
+ * n_eligible counts hosts with POSITIVE weight: zero-weight hosts can never receive
+ * anything, so including them would leave the pool short by their share.
  */
 export function cappedShares(hosts, cCap = TREASURY_DEFAULTS.C_CAP) {
     const list = Array.isArray(hosts) ? hosts : [];
@@ -51,13 +66,16 @@ export function cappedShares(hosts, cCap = TREASURY_DEFAULTS.C_CAP) {
     const w = list.map(hostWeight);
     if (w.reduce((a, b) => a + b, 0) <= 0) return shares;   // nobody did verified work
 
+    const eligible = w.reduce((c, x) => c + (x > 0 ? 1 : 0), 0);
+    const effCap = Math.min(1, Math.max(cCap, eligible > 0 ? 1 / eligible : cCap));
+
     const capped = new Array(n).fill(false);
 
     // At most n rounds: each round caps at least one more host, or settles.
     for (let round = 0; round <= n; round++) {
         let cappedTotal = 0, freeW = 0;
         for (let i = 0; i < n; i++) {
-            if (capped[i]) cappedTotal += cCap;
+            if (capped[i]) cappedTotal += effCap;
             else freeW += w[i];
         }
         const remaining = Math.max(0, 1 - cappedTotal);
@@ -66,16 +84,16 @@ export function cappedShares(hosts, cCap = TREASURY_DEFAULTS.C_CAP) {
         let newlyCapped = false;
         for (let i = 0; i < n; i++) {
             if (capped[i]) continue;
-            if (remaining * (w[i] / freeW) > cCap) { capped[i] = true; newlyCapped = true; }
+            if (remaining * (w[i] / freeW) > effCap) { capped[i] = true; newlyCapped = true; }
         }
         if (!newlyCapped) {
             for (let i = 0; i < n; i++) {
-                shares[i] = capped[i] ? cCap : remaining * (w[i] / freeW);
+                shares[i] = capped[i] ? effCap : remaining * (w[i] / freeW);
             }
             break;
         }
     }
-    for (let i = 0; i < n; i++) if (capped[i]) shares[i] = cCap;
+    for (let i = 0; i < n; i++) if (capped[i]) shares[i] = effCap;
 
     // Safety net: shares can never sum above 1 (protects F8 against any edge case).
     const total = shares.reduce((a, b) => a + b, 0);
@@ -99,7 +117,14 @@ export function settleEpoch({ pool, hosts, params = {} } = {}) {
     const list = Array.isArray(hosts) ? hosts.filter(h => h && h.address) : [];
 
     const homeHosts = list.filter(h => !!h.home);     // verified home hosts only
-    const homePool  = poolAmt * clamp01(p.RHO_HOME);
+
+    // R113 — EMPTY-SLICE FALLBACK. The home slice is reserved for verified home hosts, but
+    // if there are NONE it must not be reserved for nobody: that stranded rho_home (half)
+    // of EVERY epoch permanently, so 400 open hosts still saw only 50% of the pool paid.
+    // Reserving capacity for a class that does not exist yet is not anti-concentration,
+    // it is just a leak. When no home host qualifies, the whole pool becomes the open slice.
+    const hasHomeHosts = homeHosts.some(h => hostWeight(h) > 0);
+    const homePool  = hasHomeHosts ? poolAmt * clamp01(p.RHO_HOME) : 0;
     const openPool  = poolAmt - homePool;             // open slice: everyone competes
 
     const acc = new Map();

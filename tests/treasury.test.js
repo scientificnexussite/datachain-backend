@@ -25,19 +25,59 @@ A(hostWeight(null) === 0, 'null host contributes nothing');
 }
 
 // ── F12 cap binds, excess redistributes, cap still holds ──────────────
+// The cap is ADAPTIVE (R113): effective cap = max(C_CAP, 1/n_eligible). On a LARGE
+// network 1/n < C_CAP so the 0.5% cap binds exactly as before; on a small one the cap
+// relaxes to 1/n, which is the most even split that exists.
 {
+    // 250 eligible hosts -> 1/250 = 0.004 < 0.005, so C_CAP binds unchanged.
     const hosts = [{ address: 'whale', q: 1, u: 1, f: 1e6 }];
-    for (let i = 0; i < 10; i++) hosts.push({ address: 'h' + i, q: 1, u: 1, f: 1 });
+    for (let i = 0; i < 249; i++) hosts.push({ address: 'h' + String(i).padStart(3, '0'), q: 1, u: 1, f: 1 });
     const cap = 0.005;
     const s = cappedShares(hosts, cap);
-    A(s[0] <= cap + 1e-12, 'whale is capped at C_CAP');
+    A(s[0] <= cap + 1e-12, 'on a large network the whale is still capped at C_CAP');
     A(s.every(x => x <= cap + 1e-12), 'every share still respects the cap after redistribution');
     A(sum(s) <= 1 + 1e-12, 'shares never exceed 1');
 }
 {
+    // Small network: the cap relaxes so the pool can actually be distributed.
+    const hosts = [{ address: 'whale', q: 1, u: 1, f: 1e6 }];
+    for (let i = 0; i < 10; i++) hosts.push({ address: 'h' + i, q: 1, u: 1, f: 1 });
+    const s = cappedShares(hosts, 0.005);
+    const effCap = 1 / 11;
+    A(s.every(x => x <= effCap + 1e-12), 'no host exceeds 1/n on a small network');
+    A(near(sum(s), 1, 1e-9), 'a small network allocates the WHOLE pool (R113)');
+    A(near(s[0], effCap), 'the whale is held to exactly 1/n, the minimum possible maximum');
+}
+{
     const one = cappedShares([{ address: 'solo', q: 1, u: 1, f: 10 }], 0.005);
-    A(near(one[0], 0.005), 'a lone host is still capped (no concentration)');
-    A(sum(one) <= 1, 'a capped lone host cannot over-allocate');
+    A(near(one[0], 1), 'a lone host takes the whole sub-pool — 1/1 is the only full allocation');
+    A(sum(one) <= 1, 'a lone host cannot over-allocate');
+}
+{
+    // The R113 table: payout must no longer collapse on a small network.
+    for (const n of [1, 3, 10, 50, 100]) {
+        const hosts = [];
+        for (let i = 0; i < n; i++) hosts.push({ address: 'h' + String(i).padStart(4, '0'), q: 1, u: 1, f: 1000 });
+        A(near(sum(cappedShares(hosts, 0.005)), 1, 1e-9), `${n} hosts allocate the full pool`);
+    }
+    // And a genuinely large network still enforces 0.5%.
+    const big = [];
+    for (let i = 0; i < 500; i++) big.push({ address: 'b' + String(i).padStart(4, '0'), q: 1, u: 1, f: 1000 });
+    const sBig = cappedShares(big, 0.005);
+    A(sBig.every(x => x <= 0.005 + 1e-12), 'a 500-host network is still capped at 0.5% per identity');
+}
+{
+    // Zero-weight hosts must not dilute the cap: they can never be paid, so counting
+    // them in n would leave the pool permanently short by their share.
+    const hosts = [
+        { address: 'a', q: 1, u: 1, f: 10 },
+        { address: 'b', q: 1, u: 1, f: 10 },
+        { address: 'dead1', q: 0, u: 1, f: 10 },
+        { address: 'dead2', q: 1, u: 0, f: 10 }
+    ];
+    const s = cappedShares(hosts, 0.005);
+    A(near(sum(s), 1, 1e-9), 'zero-weight hosts do not strand part of the pool');
+    A(s[2] === 0 && s[3] === 0, 'zero-weight hosts still receive nothing');
 }
 A(sum(cappedShares([{ address: 'a', q: 1, u: 1, f: 0 }], 0.5)) === 0, 'zero verified work -> zero shares');
 A(sum(cappedShares([], 0.5)) === 0, 'empty host list -> no shares');

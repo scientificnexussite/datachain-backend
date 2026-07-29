@@ -1,4 +1,5 @@
 import express from 'express';
+import { checkLedger, formatReport } from './integrity.js';
 import bodyParser from 'body-parser';
 import cors from 'cors';
 import chalk from 'chalk';
@@ -882,6 +883,60 @@ async function refreshAllPoolOrders() {
 //          mempool.restoreTransactions() puts them back so they are retried
 //          on the next 5-second tick instead of being silently lost forever.
 let isMining = false;
+
+// ── Ledger integrity state (see integrity.js) ──────────────────────────────────
+const LEDGER_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;      // every 6 hours
+let lastIntegrityResult = null;
+let lastIntegrityCheckedAt = null;
+
+/**
+ * Compare every stored balance against the sum of its own transactions.
+ *
+ * DELIBERATELY NON-FATAL. A consistency failure means the ledger needs a human decision
+ * (see tools/reconcile-plan.js), not that the API should refuse to serve — taking the
+ * whole site down over a historical accounting discrepancy would turn a bookkeeping
+ * problem into an outage. It logs loudly and reports at GET /integrity instead.
+ * Set LEDGER_STRICT=1 to exit on failure once the ledger is known clean.
+ */
+async function runLedgerIntegrityCheck() {
+    const started = Date.now();
+    // Stream in pages: the transactions table grows without bound and this must never
+    // become the reason the process runs out of memory.
+    const PAGE = 5000;
+    const transactions = [];
+    for (let offset = 0; ; offset += PAGE) {
+        const res = await pool.query(
+            `SELECT from_address, to_address, amount, type, token_symbol
+               FROM transactions ORDER BY id ASC LIMIT $1 OFFSET $2`, [PAGE, offset]);
+        if (!res.rows.length) break;
+        transactions.push(...res.rows);
+        if (res.rows.length < PAGE) break;
+    }
+
+    const balRes = await pool.query('SELECT address, token_symbol, balance FROM state_balances');
+    const stored = {};
+    for (const row of balRes.rows) {
+        const token = String(row.token_symbol || 'SYR').toUpperCase();
+        if (!stored[token]) stored[token] = {};
+        stored[token][row.address] = parseFloat(row.balance) || 0;
+    }
+
+    const result = checkLedger({ stored, transactions });
+    lastIntegrityResult = result;
+    lastIntegrityCheckedAt = new Date().toISOString();
+
+    const ms = Date.now() - started;
+    if (result.consistent) {
+        console.log(chalk.green(`[INTEGRITY] OK — ${result.checked} balances match their history (${ms}ms).`));
+    } else {
+        console.error(chalk.red.bold(formatReport(result)));
+        if (process.env.LEDGER_STRICT === '1') {
+            console.error(chalk.red.bold('[INTEGRITY] LEDGER_STRICT=1 — refusing to run on an inconsistent ledger.'));
+            process.exit(1);
+        }
+    }
+    return result;
+}
 setInterval(async () => {
     if (isMining) return;
     const pendingCount = mempool.getPendingCount();
@@ -6496,6 +6551,24 @@ app.get('/p2p/my-trades', readLimiter, requireWeb3Auth, async (req, res) => {
     });
 
 
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  LEDGER INTEGRITY  — balances must equal the sum of their own transactions
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Exposed read-only so the state is visible without reading logs.
+    app.get('/integrity', readLimiter, (req, res) => {
+        if (!lastIntegrityResult) {
+            return res.json({ status: 'pending', message: 'No ledger check has completed yet.' });
+        }
+        res.json({
+            status: lastIntegrityResult.consistent ? 'consistent' : 'INCONSISTENT',
+            checkedAt: lastIntegrityCheckedAt,
+            positionsChecked: lastIntegrityResult.checked,
+            positionsDrifted: lastIntegrityResult.drifted.length,
+            netUnexplained: lastIntegrityResult.netDrift,
+            byToken: lastIntegrityResult.byToken
+        });
+    });
+
     // ——— 404 Catch-all (MUST be LAST route, after all admin endpoints) ———
     app.use((req, res) => { res.status(404).json({ error: 'API Node Endpoint Not Found' }); });
     server.listen(port, '0.0.0.0', () => {
@@ -6503,6 +6576,16 @@ app.get('/p2p/my-trades', readLimiter, requireWeb3Auth, async (req, res) => {
 
         // Start background systems
         startNoiseTrader(nexusChain.state, wss);
+
+        // Ledger self-check. ~70,300 SYR sat unexplained in the balances snapshot for
+        // MONTHS because nothing ever compared balances against their own transaction
+        // history. This closes that hole: drift now surfaces within one restart.
+        runLedgerIntegrityCheck().catch(e =>
+            console.error(chalk.red('[INTEGRITY] check failed to run:'), e.message));
+        // And periodically, so drift appearing on a long-lived process is caught too.
+        setInterval(() => {
+            runLedgerIntegrityCheck().catch(() => {});
+        }, LEDGER_CHECK_INTERVAL_MS);
     });
 
     process.on('SIGTERM', () => {

@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node api.js",
     "p2p": "node p2p.js",
-    "test": "node tests/treasury.test.js && node tests/epoch.test.js && node tests/verify.test.js && node tests/dispatch.test.js"
+    "test": "node tests/treasury.test.js && node tests/epoch.test.js && node tests/verify.test.js && node tests/dispatch.test.js && node tests/integrity.test.js && node tests/checkpoint.test.js"
   },
   "dependencies": {
     "@libp2p/mplex": "^1.0.0",

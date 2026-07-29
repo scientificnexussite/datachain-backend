@@ -14,39 +14,13 @@
 // a balance can legitimately exceed the sum of its own transaction history.
 // ════════════════════════════════════════════════════════════════════════════════
 
-export const EPS = 0.01;                 // cent-level tolerance for float noise
+// The ledger's semantics live in ONE place — ../../integrity.js. An auditor that keeps
+// its own copy of the rules will, sooner or later, disagree with the ledger it audits:
+// inventing drift that is not there and missing drift that is. Import, never duplicate.
+import { deltaFor, INTEGRITY_DEFAULTS } from '../../integrity.js';
 
-/**
- * Net effect of one transaction on `address`, under the primary's own per-type rules
- * (state.js applyTransaction). Auditing with the wrong rules invents drift.
- *   MINT                          credit `to` only (no sender exists)
- *   USD_DEPOSIT / USD_WITHDRAWAL  move DOLLARS -> ignored in a token audit
- *   LIQUIDITY_INIT                seeds pool reserves; debits nobody
- *   BUY / SELL                    counterparty is `system` (sender/receiver rewritten)
- *   TRANSFER / MARKET_TRADE       debit sender, credit receiver
- * `system` is the SYR mint authority and is never debited.
- */
-export function deltaFor(tx, address, token) {
-    const type = String(tx.type || 'TRANSFER').toUpperCase();
-    const sym = String(tx.tokenSymbol || tx.token || 'SYR').toUpperCase();
-    if (sym !== token) return 0;
-    if (type === 'USD_DEPOSIT' || type === 'USD_WITHDRAWAL') return 0;
-    if (type === 'LIQUIDITY_INIT') return 0;
-
-    const amt = parseFloat(tx.amount) || 0;
-    if (!amt) return 0;
-
-    if (type === 'MINT') return (tx.to || tx.from) === address ? amt : 0;
-
-    let sender = tx.from, receiver = tx.to;
-    if (type === 'BUY') { receiver = (tx.to && tx.to !== 'system') ? tx.to : tx.from; sender = 'system'; }
-    else if (type === 'SELL') { sender = (tx.from && tx.from !== 'system') ? tx.from : tx.to; receiver = 'system'; }
-
-    let delta = 0;
-    if (receiver === address && receiver !== 'system') delta += amt;
-    if (sender === address && sender !== 'system' && sender !== 'NETWORK') delta -= amt;
-    return delta;
-}
+export { deltaFor };
+export const EPS = INTEGRITY_DEFAULTS.EPS;
 
 export function makeClient(api) {
     const base = String(api).replace(/\/+$/, '');

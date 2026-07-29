@@ -85,4 +85,106 @@ const receipts = [
     A(strip(a) === strip(b), 'every node builds an identical batch regardless of receipt order');
 }
 
+// ── F15: checkpoint commitment + storage rewards ──────────────────────────────
+{
+    const ROOT = 'ab'.repeat(32);
+    const r = buildEpochTransactions({
+        height: 8640, treasuryBalance: 100000, treasuryAddress: 'nexus-ai-treasury',
+        epochPool: 10000,
+        receipts: [{ address: 'host1', f: 100, q: 1, u: 1 }],
+        checkpointRoot: ROOT
+    });
+    const cp = r.txs[0];
+    A(cp.type === 'CHECKPOINT', 'the checkpoint commitment is FIRST in the block');
+    A(cp.root === ROOT, 'the commitment carries the Merkle root');
+    A(cp.amount === 0, 'the commitment moves no value');
+    A(r.summary.checkpointCommitted === true, 'the summary reports the commitment');
+    A(r.checkpointRoot === ROOT, 'the committed root is returned for the caller to record');
+
+    // obligations must stay index-aligned with txs, or a rejected payout re-queues the
+    // WRONG host's debt.
+    A(r.obligations.length === r.txs.length, 'obligations stay index-aligned with txs');
+    A(r.obligations[0] === null, 'the checkpoint slot holds no obligation');
+    for (let i = 1; i < r.txs.length; i++) {
+        A(r.obligations[i] && r.obligations[i].address === r.txs[i].to,
+          'each payout tx maps to its own obligation');
+    }
+}
+{
+    // A malformed root must NOT be committed — nodes would agree on a root that nothing
+    // can be proven against, and every storage proof would fail invisibly.
+    for (const bad of ['', 'xyz', 'ab'.repeat(10), null, undefined, 12345, 'zz'.repeat(32)]) {
+        const r = buildEpochTransactions({
+            height: 8640, treasuryBalance: 1000, treasuryAddress: 'nexus-ai-treasury',
+            epochPool: 100, receipts: [], checkpointRoot: bad
+        });
+        A(!r.txs.some(t => t.type === 'CHECKPOINT'), 'a malformed root is not committed: ' + String(bad));
+        A(r.summary.checkpointCommitted === false, 'the summary reports no commitment');
+    }
+    const upper = buildEpochTransactions({
+        height: 8640, treasuryBalance: 1000, treasuryAddress: 'nexus-ai-treasury',
+        epochPool: 100, receipts: [], checkpointRoot: 'AB'.repeat(32)
+    });
+    A(upper.txs[0].root === 'ab'.repeat(32), 'a root is normalised to lower case for byte-identical blocks');
+}
+{
+    // Storage rewards ride the same F22 queue and the same solvency invariant.
+    const r = buildEpochTransactions({
+        height: 8640, treasuryBalance: 100000, treasuryAddress: 'nexus-ai-treasury',
+        epochPool: 10000,
+        receipts: [{ address: 'compute1', f: 100, q: 1, u: 1 }],
+        storage: [{ address: 'keeper1', amount: 25, chunks: 5 },
+                  { address: 'keeper2', amount: 10, chunks: 2 }],
+        checkpointRoot: 'cd'.repeat(32)
+    });
+    const store = r.txs.filter(t => /Storage Reward/.test(t.description || ''));
+    A(store.length === 2, 'storage providers are paid');
+    A(store.some(t => t.to === 'keeper1' && t.amount === 25), 'a storage reward pays the right amount');
+    A(/5 chunks/.test(store.find(t => t.to === 'keeper1').description), 'the chunk count is recorded');
+    A(r.summary.storagePaid === 2, 'the summary counts storage payouts');
+}
+{
+    // Storage must not break solvency: a treasury that cannot cover everything leaves the
+    // remainder PENDING rather than paying money it does not have.
+    const r = buildEpochTransactions({
+        height: 8640, treasuryBalance: 30, treasuryAddress: 'nexus-ai-treasury',
+        epochPool: 10000,
+        receipts: [{ address: 'compute1', f: 100, q: 1, u: 1 }],
+        storage: [{ address: 'keeper1', amount: 1000, chunks: 5 }]
+    });
+    const paid = r.txs.filter(t => t.type === 'TRANSFER').reduce((s, t) => s + t.amount, 0);
+    A(paid <= 30, 'storage rewards never exceed the treasury balance (F8)');
+    A(r.summary.balanceAfter >= 0, 'the balance never goes negative');
+    A(r.pending.length > 0, 'what could not be covered stays PENDING');
+}
+{
+    // Compute is paid before storage, storage before everything else (F22 ordering).
+    const r = buildEpochTransactions({
+        height: 8640, treasuryBalance: 1e9, treasuryAddress: 'nexus-ai-treasury',
+        epochPool: 1000,
+        receipts: [{ address: 'zzz-compute', f: 100, q: 1, u: 1 }],
+        storage: [{ address: 'aaa-keeper', amount: 5, chunks: 1 }]
+    });
+    const order = r.txs.filter(t => t.type === 'TRANSFER').map(t => t.to);
+    A(order.indexOf('zzz-compute') < order.indexOf('aaa-keeper'),
+      'compute is paid before storage even when the address sorts later');
+}
+{
+    // Determinism must survive the new fields.
+    const args = {
+        height: 8640, treasuryBalance: 100000, treasuryAddress: 'nexus-ai-treasury',
+        epochPool: 10000, checkpointRoot: 'ef'.repeat(32),
+        receipts: [{ address: 'h2', f: 50, q: 1, u: 1 }, { address: 'h1', f: 50, q: 1, u: 1 }],
+        storage: [{ address: 's2', amount: 5, chunks: 1 }, { address: 's1', amount: 5, chunks: 1 }]
+    };
+    const a = buildEpochTransactions(args);
+    const b = buildEpochTransactions({
+        ...args,
+        receipts: args.receipts.slice().reverse(),
+        storage: args.storage.slice().reverse()
+    });
+    A(JSON.stringify(a.txs) === JSON.stringify(b.txs),
+      'the block is byte-identical regardless of receipt and storage order');
+}
+
 console.log('ALL ' + n + ' EPOCH TESTS PASSED');

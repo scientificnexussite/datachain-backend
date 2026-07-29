@@ -25,6 +25,18 @@
 
 import { buildEpochBatch, PRIORITY } from './treasury.js';
 
+/**
+ * A checkpoint root is only committed if it is a well-formed 32-byte hash.
+ * Committing a malformed root would be worse than committing none: nodes would "agree" on
+ * a canonical state that no chunk can ever be proven against, and every storage proof
+ * would fail for a reason nobody could see.
+ */
+function normaliseRoot(root) {
+    if (typeof root !== 'string') return null;
+    const r = root.trim().toLowerCase();
+    return /^[0-9a-f]{64}$/.test(r) ? r : null;
+}
+
 // Activation height — MAX_SAFE_INTEGER = dormant. See the DORMANT note above.
 export const EPOCH_1_HEIGHT = Number.MAX_SAFE_INTEGER;
 
@@ -70,7 +82,8 @@ export function getVerifiedWorkReceipts(/* chain, epoch */) {
  * @returns {{txs: Array, pending: Array, summary: object}}
  */
 export function buildEpochTransactions({ height, treasuryBalance = 0, treasuryAddress,
-                                          epochPool = 0, receipts = [], carriedPending = [] } = {}) {
+                                          epochPool = 0, receipts = [], carriedPending = [],
+                                          storage = [], checkpointRoot = null } = {}) {
     const epoch = epochNumber(height);
     const empty = { txs: [], pending: Array.isArray(carriedPending) ? carriedPending : [], summary: null };
     if (!treasuryAddress) return empty;
@@ -80,7 +93,8 @@ export function buildEpochTransactions({ height, treasuryBalance = 0, treasuryAd
         balance: treasuryBalance,
         epochPool,
         hosts: receipts,
-        carriedPending
+        carriedPending,
+        storage
     });
 
     // Deterministic: buildEpochBatch pays in a fixed (priority, age, id) order, so the
@@ -93,15 +107,43 @@ export function buildEpochTransactions({ height, treasuryBalance = 0, treasuryAd
         tokenSymbol: "SYR",
         timestamp: 0,                     // set by the caller from the block timestamp
         isSystemGenerated: true,
-        description: "AI Work Reward (epoch " + epoch + ")"
+        description: (o.priority === PRIORITY.STORAGE
+            ? "Checkpoint Storage Reward (epoch " + epoch + ", " + (o.chunks || 0) + " chunks)"
+            : "AI Work Reward (epoch " + epoch + ")")
     }));
+
+    // F15 — commit the checkpoint's Merkle root ON-CHAIN, FIRST in the block.
+    //
+    // Ordering is deliberate: the commitment is what makes the epoch's model state
+    // canonical, and it must not be lost if the payout list is truncated or a payout is
+    // rejected. It carries no value and is validated by state.js on its own terms.
+    const commitment = normaliseRoot(checkpointRoot);
+    if (commitment) {
+        txs.unshift({
+            from: treasuryAddress,
+            to: treasuryAddress,
+            amount: 0,
+            type: "CHECKPOINT",
+            tokenSymbol: "SYR",
+            root: commitment,
+            epoch,
+            timestamp: 0,
+            isSystemGenerated: true,
+            description: "Model Checkpoint Root (epoch " + epoch + ")"
+        });
+    }
 
     return {
         txs,
         // obligations[i] is the debt that produced txs[i] — lets the caller re-queue a payout
         // if the ledger rejects it, instead of dropping a host's debt on the floor.
-        obligations: batch.payouts,
+        //
+        // The CHECKPOINT tx carries no debt, so a null is held in its slot to keep this
+        // index-aligned with `txs`. Without the placeholder every obligation would be
+        // shifted by one and a rejected payout would re-queue the WRONG host's debt.
+        obligations: commitment ? [null].concat(batch.payouts) : batch.payouts,
         pending: batch.pending,
+        checkpointRoot: commitment,
         summary: {
             epoch,
             height: Number(height),
@@ -109,7 +151,9 @@ export function buildEpochTransactions({ height, treasuryBalance = 0, treasuryAd
             totalPaid: batch.totalPaid,
             pendingCount: batch.pending.length,
             pendingTotal: batch.pending.reduce((s, o) => s + (Number(o.amount) || 0), 0),
-            balanceAfter: batch.balanceAfter
+            balanceAfter: batch.balanceAfter,
+            checkpointCommitted: !!commitment,
+            storagePaid: batch.payouts.filter(o => o.priority === PRIORITY.STORAGE).length
         }
     };
 }

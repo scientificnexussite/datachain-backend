@@ -25,7 +25,10 @@ export const TREASURY_DEFAULTS = {
 };
 
 // Obligation priorities (F22): hosts keep Pefe alive, so they are paid first.
-export const PRIORITY = { HOST: 0, SERVING: 5, SALARY: 10 };
+// STORAGE sits immediately behind compute: if storage providers go unpaid they drop their
+// chunks, and once fewer than k survive the model is GONE — an unrecoverable loss, where
+// unpaid compute merely slows training down. Salaries come last, as F22 requires.
+export const PRIORITY = { HOST: 0, STORAGE: 1, SERVING: 5, SALARY: 10 };
 
 const clamp01 = (x) => { const n = Number(x); return !isFinite(n) ? 0 : (n < 0 ? 0 : (n > 1 ? 1 : n)); };
 const nonNeg  = (x) => { const n = Number(x); return (!isFinite(n) || n < 0) ? 0 : n; };
@@ -197,7 +200,8 @@ export function settleQueue({ balance, obligations } = {}) {
  * @param {Array}  args.carriedPending  obligations earlier epochs could not cover
  */
 export function buildEpochBatch({ epoch = 0, balance = 0, epochPool = 0,
-                                  hosts = [], carriedPending = [], params = {} } = {}) {
+                                  hosts = [], carriedPending = [], storage = [],
+                                  params = {} } = {}) {
     const settled = settleEpoch({ pool: epochPool, hosts, params });
 
     const fresh = settled.payouts.map(p => ({
@@ -208,13 +212,28 @@ export function buildEpochBatch({ epoch = 0, balance = 0, epochPool = 0,
         since: epoch
     }));
 
+    // F15 storage rewards: r_store per chunk a host PROVED it still holds this epoch.
+    // Paid from the same treasury balance and through the same F22 queue, so the solvency
+    // invariant covers them too — storage cannot be paid out of money that is not there.
+    // Amounts are supplied by the caller (already verified); this only queues them.
+    const stored = (Array.isArray(storage) ? storage : [])
+        .filter(s => s && s.address && nonNeg(s.amount) > 0)
+        .map(s => ({
+            id: 'e' + epoch + ':store:' + s.address,
+            address: s.address,
+            amount: nonNeg(s.amount),
+            priority: PRIORITY.STORAGE,
+            since: epoch,
+            chunks: Number(s.chunks) || 0
+        }));
+
     const carried = (Array.isArray(carriedPending) ? carriedPending : [])
         .filter(o => o && o.address && nonNeg(o.amount) > 0)
         .map(o => Object.assign({}, o, { since: Number(o.since) || 0 }));
 
     const { paid, pending, balanceAfter } = settleQueue({
         balance,
-        obligations: carried.concat(fresh)
+        obligations: carried.concat(fresh).concat(stored)
     });
 
     return {

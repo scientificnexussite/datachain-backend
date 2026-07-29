@@ -97,6 +97,31 @@ class State {
     applyTransaction(tx, currentPrice = 0, isReplay = false) {
     let { from, to, type } = tx;
 
+    // CHECKPOINT (F15) — commits the epoch's model-checkpoint Merkle root on-chain, so every
+    // node agrees on the one true model and can verify any chunk against it. It moves NO
+    // value: it is accepted and recorded in the block, and no balance is touched.
+    //
+    // Checked BEFORE the ledger lock below deliberately. That guard rejects anything with
+    // amount <= 0, and a checkpoint commitment legitimately has no amount — running it
+    // through the value path would either drop the commitment or force a fake amount onto
+    // a transaction that must never move funds.
+    //
+    // ⚠️ CONSENSUS NOTE: a node WITHOUT this branch falls through to `return false`, drops
+    // the transaction, and therefore builds a DIFFERENT block than a node that accepts it.
+    // This acceptance must be deployed everywhere BEFORE the first CHECKPOINT is emitted.
+    // Safe today only because epoch settlement is dormant (epoch.js EPOCH_1_HEIGHT =
+    // MAX_SAFE_INTEGER) and nothing emits one yet.
+    if (String(type).toUpperCase() === 'CHECKPOINT') {
+      const root = typeof tx.root === 'string' ? tx.root : '';
+      // A malformed root is worse than no commitment: nodes would "agree" on a root that
+      // verifies nothing, so every chunk proof against it fails silently.
+      if (!/^[0-9a-f]{64}$/i.test(root)) {
+        if (!isReplay) console.log(chalk.red('[LEDGER] Rejected CHECKPOINT: malformed Merkle root.'));
+        return false;
+      }
+      return true;
+    }
+
     // --- ARMOR PLATE 6: THE LEDGER LOCK (Immutable Math Bounds) ---
     // The absolute final barrier before writing to the database.
     // Blocks negative numbers, zero, AND massive overflow attacks.
@@ -122,6 +147,7 @@ class State {
       this.balances[tokenSymbol][receiver] = fixDust((this.balances[tokenSymbol][receiver] || 0) + amount);
       return true;
     }
+
 
     if (type === 'USD_DEPOSIT') {
       this.addUsd(to || from, amount);

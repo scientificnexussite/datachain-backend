@@ -1,5 +1,6 @@
 import express from 'express';
 import { checkLedger, formatReport } from './integrity.js';
+import { buildSnapshot, chunkProof as buildChunkProof, SNAPSHOT_TABLES } from './snapshot.js';
 import bodyParser from 'body-parser';
 import cors from 'cors';
 import chalk from 'chalk';
@@ -883,6 +884,47 @@ async function refreshAllPoolOrders() {
 //          mempool.restoreTransactions() puts them back so they are retried
 //          on the next 5-second tick instead of being silently lost forever.
 let isMining = false;
+
+// ── State snapshot (see snapshot.js) ───────────────────────────────────────────
+// Built on demand and cached: a full snapshot is a table scan, so rebuilding it per
+// request would let anyone turn /snapshot/* into a database denial-of-service. Nodes only
+// need a recent snapshot, not a live one — anything newer arrives as blocks.
+const SNAPSHOT_TTL_MS = 10 * 60 * 1000;
+let snapshotCache = null;
+let snapshotBuiltAt = 0;
+let snapshotBuilding = null;
+
+async function getStateSnapshot() {
+    if (snapshotCache && (Date.now() - snapshotBuiltAt) < SNAPSHOT_TTL_MS) return snapshotCache;
+    // Collapse concurrent requests onto ONE build. Without this, a burst of nodes starting
+    // together would each trigger a full scan simultaneously.
+    if (snapshotBuilding) return snapshotBuilding;
+
+    snapshotBuilding = (async () => {
+        const tables = {};
+        for (const name of SNAPSHOT_TABLES) {
+            try {
+                const r = await pool.query(`SELECT * FROM ${name}`);
+                tables[name] = r.rows;
+            } catch (e) {
+                // A table that does not exist on this deployment is simply empty, not fatal
+                // — but say so, because a silently empty balances table would produce a
+                // valid-looking snapshot of nothing.
+                console.warn(`[SNAPSHOT] table ${name} unavailable: ${e.message}`);
+                tables[name] = [];
+            }
+        }
+        const built = buildSnapshot({ tables, height: nexusChain.chain.length });
+        snapshotCache = built;
+        snapshotBuiltAt = Date.now();
+        snapshotBuilding = null;
+        console.log(chalk.cyan(`[SNAPSHOT] built: ${built.manifest.chunkCount} chunk(s), ` +
+            `${built.manifest.totalBytes} bytes, root ${String(built.manifest.root).slice(0, 16)}...`));
+        return built;
+    })().catch(e => { snapshotBuilding = null; throw e; });
+
+    return snapshotBuilding;
+}
 
 // ── Ledger integrity state (see integrity.js) ──────────────────────────────────
 const LEDGER_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;      // every 6 hours
@@ -6550,6 +6592,50 @@ app.get('/p2p/my-trades', readLimiter, requireWeb3Auth, async (req, res) => {
         }
     });
 
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  STATE SNAPSHOT — the hand-off that lets this server be switched off
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Balances, price history, the token registry and order books are NOT derivable from
+    // the chain, so a node cannot rebuild them by syncing blocks. These endpoints hand
+    // that state to ANY node, committed to a Merkle root so each chunk is independently
+    // verifiable. Once nodes hold the snapshot and its root, they re-serve it to each
+    // other and this server stops being required.
+    //
+    // PUBLIC on purpose: every node needs it, not just an admin. It is read-only and
+    // exposes nothing that the balance/history endpoints do not already expose one row at
+    // a time — it is the same public ledger, served in bulk and made verifiable.
+
+    app.get('/snapshot/manifest', readLimiter, async (req, res) => {
+        try {
+            const snap = await getStateSnapshot();
+            res.json(snap.manifest);
+        } catch (e) {
+            console.error('[SNAPSHOT] manifest failed:', e.message);
+            res.status(500).json({ error: 'Snapshot unavailable.' });
+        }
+    });
+
+    app.get('/snapshot/chunk/:index', readLimiter, async (req, res) => {
+        try {
+            const snap = await getStateSnapshot();
+            const index = parseInt(req.params.index, 10);
+            if (!Number.isInteger(index) || index < 0 || index >= snap.chunks.length) {
+                return res.status(404).json({ error: 'No such chunk.' });
+            }
+            res.json({
+                index,
+                root: snap.manifest.root,
+                // base64: chunk bodies are newline-delimited JSON and must survive transport
+                // byte-for-byte, or the Merkle proof fails for a reason nobody can see.
+                data: Buffer.from(snap.chunks[index].data).toString('base64'),
+                proof: buildChunkProof(snap.chunks, index)
+            });
+        } catch (e) {
+            console.error('[SNAPSHOT] chunk failed:', e.message);
+            res.status(500).json({ error: 'Snapshot unavailable.' });
+        }
+    });
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  LEDGER INTEGRITY  — balances must equal the sum of their own transactions

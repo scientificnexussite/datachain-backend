@@ -666,4 +666,8 @@ class DataChain {
   }
 }
 
-export { DataChain };
+// Block is exported so api.js can reconstruct a submitted block for validation
+// (/submit-block). Validation must run against the SAME class the chain uses — a
+// hand-rolled object would compute its hash differently and every external block would
+// be rejected as invalid.
+export { DataChain, Block };

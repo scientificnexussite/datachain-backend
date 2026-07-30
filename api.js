@@ -14,7 +14,7 @@ import { WebSocketServer } from 'ws';
 import nodemailer from 'nodemailer';
 import pool from './db.js';
 import mempool from './mempool.js';
-import { DataChain } from './datachain.js';
+import { DataChain, Block } from './datachain.js';
 import validator from './validator.js';
 import menuBook, { processReferralBonus } from './menubook.js'; // IMPROVEMENT 4 Ã¢â‚¬â€ static import
 import { initP2P, broadcastP2P } from './p2p.js';
@@ -6592,6 +6592,84 @@ app.get('/p2p/my-trades', readLimiter, requireWeb3Auth, async (req, res) => {
         }
     });
 
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    //  BLOCK SUBMISSION — external miners (DataChain-Core) contribute blocks
+    // ═══════════════════════════════════════════════════════════════════════════
+    // THIS ENDPOINT WAS MISSING, and its absence caused a real chain fork. The desktop
+    // miner has always POSTed mined blocks to /submit-block; with no such route the
+    // primary answered 404, every block was rejected, and because the exe adds blocks to
+    // its LOCAL chain regardless it kept building on its own history. Result: the exe
+    // reached height 1311 on a fork that diverged at block 357, while this chain sat at
+    // 358 — a month of mining that could never count for anything.
+    //
+    // Accepting external blocks is also what makes mining decentralised at all: without
+    // it only this process can extend the chain, which is the opposite of the goal.
+    app.post('/submit-block', txLimiter, async (req, res) => {
+        try {
+            const b = req.body || {};
+            if (!Number.isInteger(b.index) || typeof b.hash !== 'string' || !Array.isArray(b.data)) {
+                return res.status(400).json({ error: 'Malformed block.' });
+            }
+
+            const tip = nexusChain.getLatestBlock();
+
+            // Already have it — idempotent, so a miner retrying is not an error.
+            if (b.index <= tip.index) {
+                const known = nexusChain.chain[b.index];
+                if (known && known.hash === b.hash) {
+                    return res.json({ success: true, message: 'Block already known.', height: nexusChain.chain.length });
+                }
+                return res.status(409).json({
+                    error: 'Stale block: this height is already filled by a different block.',
+                    yourIndex: b.index, ourHeight: nexusChain.chain.length, ourTip: tip.hash,
+                    hint: 'Resync from /blocks and mine on top of our tip.'
+                });
+            }
+
+            // Must extend the tip exactly. A gap cannot be validated, and accepting one
+            // would fork this chain the same way the exe forked.
+            if (b.index !== tip.index + 1 || b.previousHash !== tip.hash) {
+                return res.status(409).json({
+                    error: 'Block does not extend our tip.',
+                    expectedIndex: tip.index + 1, expectedPreviousHash: tip.hash,
+                    ourHeight: nexusChain.chain.length,
+                    hint: 'Resync from /blocks and mine on top of our tip.'
+                });
+            }
+
+            const block = new Block(b.index, b.timestamp, b.data, b.previousHash);
+            block.nonce = b.nonce;
+            block.hash = b.hash;
+            block.merkleRoot = b.merkleRoot;
+
+            if (!validator.validateBlock(block, tip, nexusChain.difficulty, nexusChain.chain)) {
+                return res.status(400).json({ error: 'Block failed validation (proof of work, hash or merkle root).' });
+            }
+
+            // Apply the block's transactions to state. A transaction the ledger refuses is
+            // fatal for the whole block: accepting it partially would leave this node's
+            // state disagreeing with the block it just stored.
+            const price = await nexusChain.getLastMarketPrice(0.50);
+            for (const tx of block.data) {
+                if (!nexusChain.state.applyTransaction(tx, price, false)) {
+                    return res.status(400).json({ error: 'Block contains a transaction the ledger rejected.' });
+                }
+            }
+
+            nexusChain.chain.push(block);
+            nexusChain.blockCount = nexusChain.chain.length;
+            await nexusChain.saveChain();
+            await nexusChain.state.saveSnapshot(nexusChain.blockCount - 1);
+            broadcastP2P({ type: 'BROADCAST_BLOCK', data: block });
+
+            console.log(chalk.green(`[SUBMIT-BLOCK] Accepted block #${block.index} from an external miner.`));
+            res.json({ success: true, message: `Block #${block.index} accepted`, height: nexusChain.chain.length });
+        } catch (e) {
+            console.error('[SUBMIT-BLOCK] failed:', e.message);
+            res.status(500).json({ error: 'Block submission failed.' });
+        }
+    });
 
     // ═══════════════════════════════════════════════════════════════════════════
     //  STATE SNAPSHOT — the hand-off that lets this server be switched off

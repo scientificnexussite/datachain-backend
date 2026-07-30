@@ -83,7 +83,8 @@ export function getVerifiedWorkReceipts(/* chain, epoch */) {
  */
 export function buildEpochTransactions({ height, treasuryBalance = 0, treasuryAddress,
                                           epochPool = 0, receipts = [], carriedPending = [],
-                                          storage = [], checkpointRoot = null } = {}) {
+                                          storage = [], checkpointRoot = null,
+                                          snapshotRoot = null } = {}) {
     const epoch = epochNumber(height);
     const empty = { txs: [], pending: Array.isArray(carriedPending) ? carriedPending : [], summary: null };
     if (!treasuryAddress) return empty;
@@ -118,18 +119,30 @@ export function buildEpochTransactions({ height, treasuryBalance = 0, treasuryAd
     // canonical, and it must not be lost if the payout list is truncated or a payout is
     // rejected. It carries no value and is validated by state.js on its own terms.
     const commitment = normaliseRoot(checkpointRoot);
-    if (commitment) {
+    const stateCommitment = normaliseRoot(snapshotRoot);
+    if (commitment || stateCommitment) {
         txs.unshift({
             from: treasuryAddress,
             to: treasuryAddress,
             amount: 0,
             type: "CHECKPOINT",
             tokenSymbol: "SYR",
-            root: commitment,
+            // The model checkpoint. `root` stays the primary field for backward
+            // compatibility with anything already reading it.
+            root: commitment || stateCommitment,
+            // The STATE SNAPSHOT root (snapshot.js). Committing it here is what removes the
+            // last trust gap in the hand-off: a brand-new node reads the canonical root
+            // straight off the chain and needs to trust NO server for it — not the primary,
+            // not a peer. Without this, the first sync has to trust whoever answers.
+            snapshotRoot: stateCommitment || null,
+            checkpointRoot: commitment || null,
             epoch,
             timestamp: 0,
             isSystemGenerated: true,
-            description: "Model Checkpoint Root (epoch " + epoch + ")"
+            description: (commitment && stateCommitment)
+                ? "Model Checkpoint + State Root (epoch " + epoch + ")"
+                : (commitment ? "Model Checkpoint Root (epoch " + epoch + ")"
+                              : "State Snapshot Root (epoch " + epoch + ")")
         });
     }
 
@@ -141,9 +154,10 @@ export function buildEpochTransactions({ height, treasuryBalance = 0, treasuryAd
         // The CHECKPOINT tx carries no debt, so a null is held in its slot to keep this
         // index-aligned with `txs`. Without the placeholder every obligation would be
         // shifted by one and a rejected payout would re-queue the WRONG host's debt.
-        obligations: commitment ? [null].concat(batch.payouts) : batch.payouts,
+        obligations: (commitment || stateCommitment) ? [null].concat(batch.payouts) : batch.payouts,
         pending: batch.pending,
         checkpointRoot: commitment,
+        snapshotRoot: stateCommitment,
         summary: {
             epoch,
             height: Number(height),
@@ -153,9 +167,44 @@ export function buildEpochTransactions({ height, treasuryBalance = 0, treasuryAd
             pendingTotal: batch.pending.reduce((s, o) => s + (Number(o.amount) || 0), 0),
             balanceAfter: batch.balanceAfter,
             checkpointCommitted: !!commitment,
+            snapshotCommitted: !!stateCommitment,
             storagePaid: batch.payouts.filter(o => o.priority === PRIORITY.STORAGE).length
         }
     };
+}
+
+/**
+ * Read the most recently committed roots back OUT of the chain.
+ *
+ * This is the other half of committing them: a node bootstrapping from scratch scans the
+ * chain it already verified by proof-of-work and learns the canonical state-snapshot root
+ * WITHOUT trusting any server to tell it. Whoever then serves the snapshot bytes is
+ * irrelevant, because a forged snapshot cannot match this root.
+ *
+ * @param {Array} chain  blocks, oldest first
+ * @returns {{snapshotRoot:string|null, checkpointRoot:string|null, epoch:number, height:number}|null}
+ */
+export function latestCommittedRoots(chain) {
+    if (!Array.isArray(chain)) return null;
+    // Newest first: the most recent commitment wins.
+    for (let i = chain.length - 1; i >= 0; i--) {
+        const block = chain[i];
+        const txs = (block && Array.isArray(block.data)) ? block.data : [];
+        for (const tx of txs) {
+            if (!tx || String(tx.type).toUpperCase() !== 'CHECKPOINT') continue;
+            const snap = normaliseRoot(tx.snapshotRoot);
+            const cp = normaliseRoot(tx.checkpointRoot) || normaliseRoot(tx.root);
+            if (snap || cp) {
+                return {
+                    snapshotRoot: snap,
+                    checkpointRoot: cp,
+                    epoch: Number(tx.epoch) || 0,
+                    height: Number(block.index) || i
+                };
+            }
+        }
+    }
+    return null;
 }
 
 export { PRIORITY };

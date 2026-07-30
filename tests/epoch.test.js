@@ -3,7 +3,7 @@
 // The first block of tests PROVES the feature is inert on the live chain; the rest prove it
 // behaves correctly once activated. Re-run both before setting a real EPOCH_1_HEIGHT.
 import { isEpochBoundary, epochNumber, buildEpochTransactions, getVerifiedWorkReceipts,
-         EPOCH_1_HEIGHT, EPOCH_BLOCKS } from '../epoch.js';
+         EPOCH_1_HEIGHT, EPOCH_BLOCKS, latestCommittedRoots } from '../epoch.js';
 
 let n = 0; const A = (c, m) => { n++; if (!c) { console.error('FAIL:', m); process.exit(1); } };
 const near = (a, b, eps = 1e-6) => Math.abs(a - b) <= eps;
@@ -185,6 +185,58 @@ const receipts = [
     });
     A(JSON.stringify(a.txs) === JSON.stringify(b.txs),
       'the block is byte-identical regardless of receipt and storage order');
+}
+
+// ── the snapshot root committed ON-CHAIN (removes the last trust gap) ─────────
+{
+    const SNAP = 'cd'.repeat(32), CP = 'ab'.repeat(32);
+    const r = buildEpochTransactions({
+        height: 8640, treasuryBalance: 1000, treasuryAddress: 'nexus-ai-treasury',
+        epochPool: 100, receipts: [], checkpointRoot: CP, snapshotRoot: SNAP
+    });
+    const cp = r.txs[0];
+    A(cp.type === 'CHECKPOINT', 'a single commitment tx carries both roots');
+    A(cp.snapshotRoot === SNAP, 'the STATE snapshot root is committed on-chain');
+    A(cp.checkpointRoot === CP, 'the model checkpoint root is committed on-chain');
+    A(cp.root === CP, '`root` stays the model checkpoint for backward compatibility');
+    A(r.summary.snapshotCommitted && r.summary.checkpointCommitted, 'the summary reports both');
+
+    // Reading them back out is what lets a new node trust NO server.
+    const found = latestCommittedRoots([{ index: 8640, data: r.txs }]);
+    A(found && found.snapshotRoot === SNAP, 'the snapshot root can be read back from the chain');
+    A(found.checkpointRoot === CP, 'the checkpoint root can be read back from the chain');
+}
+{
+    // A snapshot root alone must still commit — the state hand-off does not depend on
+    // there being a model checkpoint yet.
+    const SNAP = 'ef'.repeat(32);
+    const r = buildEpochTransactions({
+        height: 8640, treasuryBalance: 1000, treasuryAddress: 'nexus-ai-treasury',
+        epochPool: 100, receipts: [], snapshotRoot: SNAP
+    });
+    A(r.txs[0].type === 'CHECKPOINT' && r.txs[0].snapshotRoot === SNAP,
+      'a state root commits even with no model checkpoint');
+    A(r.txs[0].checkpointRoot === null, 'no model checkpoint is claimed when there is none');
+    A(/State Snapshot Root/.test(r.txs[0].description), 'the description says what was committed');
+    A(r.obligations.length === r.txs.length && r.obligations[0] === null,
+      'obligations stay aligned when only the state root is committed');
+}
+{
+    // Newest commitment wins, and malformed ones never enter the chain.
+    const chain = [
+        { index: 1, data: [{ type: 'CHECKPOINT', snapshotRoot: '11'.repeat(32), epoch: 1 }] },
+        { index: 2, data: [{ type: 'TRANSFER', from: 'a', to: 'b', amount: 1 }] },
+        { index: 3, data: [{ type: 'CHECKPOINT', snapshotRoot: '22'.repeat(32), epoch: 2 }] }
+    ];
+    const found = latestCommittedRoots(chain);
+    A(found.snapshotRoot === '22'.repeat(32), 'the MOST RECENT committed root wins');
+    A(found.epoch === 2 && found.height === 3, 'the commitment epoch and height are reported');
+
+    A(latestCommittedRoots([{ index: 1, data: [{ type: 'CHECKPOINT', snapshotRoot: 'garbage' }] }]) === null,
+      'a malformed committed root is ignored, not returned as canonical');
+    A(latestCommittedRoots([]) === null, 'an empty chain commits nothing');
+    A(latestCommittedRoots(null) === null, 'a missing chain is handled safely');
+    A(latestCommittedRoots([{ index: 1, data: [] }]) === null, 'a chain with no commitment returns null');
 }
 
 console.log('ALL ' + n + ' EPOCH TESTS PASSED');

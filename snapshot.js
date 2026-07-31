@@ -43,12 +43,26 @@ export const SNAPSHOT_DEFAULTS = {
 export const SNAPSHOT_TABLES = [
     'state_balances',
     'state_usd_balances',
-    'price_history',
     'token_metadata',
     'open_tokens',
-    'liquidity_pools',
+    'state_liquidity_pools',
     'orders'
 ];
+
+// DELIBERATELY NOT SNAPSHOTTED, and why — both were verified against the live primary:
+//
+//   price_history  — the table exists but holds ZERO rows. /pricehistory computes prices
+//                    from the TRANSACTIONS table (`amount_usd / amount` on trades), and a
+//                    node already rebuilds the same series while replaying blocks
+//                    (state-db._recordTradePrice). Shipping the empty table made the
+//                    snapshot report "0 price points" and looked like data loss when in
+//                    fact the data was never there to copy.
+//
+//   liquidity_pools — WRONG NAME. The real table is `state_liquidity_pools` (state.js:23);
+//                    the misspelled one does not exist, so pools silently came through as
+//                    zero. This is exactly the failure mode a snapshot must not have: an
+//                    unreadable table is logged as a warning and treated as empty, which
+//                    produces a perfectly valid-looking snapshot of nothing.
 
 /**
  * Deterministic JSON: object keys sorted at every level.

@@ -22,13 +22,14 @@ const sampleTables = () => ({
         { address: 'alice', token_symbol: 'GAMECASH', balance: 7 }
     ],
     state_usd_balances: [{ address: 'alice', balance: 42.25 }],
-    price_history: [
-        { token: 'SYR', price: 0.53, volume: 10, timestamp: 1780000000000 },
-        { token: 'SYR', price: 0.54, volume: 3, timestamp: 1780000060000 }
-    ],
     token_metadata: [{ ticker: 'SYR', name: 'SilverCash', total_supply: 12000000000 }],
     open_tokens: [{ ticker: 'TESTMOVE', name: 'TestMove' }],
-    liquidity_pools: [{ token: 'SYR', token_reserve: 1000, usd_reserve: 530 }],
+    // NOTE the name: the real table is `state_liquidity_pools`. The snapshot originally
+    // asked for `liquidity_pools`, which does not exist, so pools silently arrived empty.
+    state_liquidity_pools: [
+        { token_symbol: 'SYR', token_reserve: 1000, usd_reserve: 530 },
+        { token_symbol: 'GAMECASH', token_reserve: 50, usd_reserve: 5 }
+    ],
     orders: [{ id: 'o1', uid: 'alice', pair: 'SYR', side: 'BUY', price: 0.5, amount: 10 }]
 });
 
@@ -64,7 +65,7 @@ A(canonicalJSON(1.5) === '1.5', 'numbers serialise');
     const t1 = sampleTables();
     const t2 = sampleTables();
     t2.state_balances.reverse();
-    t2.price_history.reverse();
+    t2.state_liquidity_pools.reverse();
     const a = buildSnapshot({ tables: t1, height: 358 });
     const b = buildSnapshot({ tables: t2, height: 358 });
     A(a.manifest.root === b.manifest.root, 'row order does not change the root');
@@ -115,7 +116,7 @@ A(canonicalJSON(1.5) === '1.5', 'numbers serialise');
     const parsed = parseSnapshot(s.chunks, s.manifest);
     A(parsed.height === 358, 'the parsed snapshot carries the height');
     A(parsed.tables.state_balances.length === 3, 'balances survive the round trip');
-    A(parsed.tables.price_history.length === 2, 'price history survives the round trip');
+    A(parsed.tables.state_liquidity_pools.length === 2, 'liquidity pools survive the round trip');
     A(parsed.tables.orders.length === 1, 'orders survive the round trip');
     const alice = parsed.tables.state_balances.find(r => r.address === 'alice' && r.token_symbol === 'SYR');
     A(alice && alice.balance === 100.5, 'an exact balance survives the round trip');
@@ -179,12 +180,12 @@ A(canonicalJSON(1.5) === '1.5', 'numbers serialise');
 
 // ── scale: a realistic snapshot chunks and verifies ──────────────────────────
 {
-    const big = { state_balances: [], price_history: [] };
+    const big = { state_balances: [], state_liquidity_pools: [] };
     for (let i = 0; i < 4000; i++) {
         big.state_balances.push({ address: 'addr' + String(i).padStart(6, '0'), token_symbol: 'SYR', balance: i * 1.5 });
     }
     for (let i = 0; i < 8000; i++) {
-        big.price_history.push({ token: 'SYR', price: 0.5 + (i % 100) / 1000, volume: i, timestamp: 1780000000000 + i * 1000 });
+        big.state_liquidity_pools.push({ token_symbol: 'T'+i, token_reserve: i, usd_reserve: i * 0.5 });
     }
     const s = buildSnapshot({ tables: big, height: 1000 });
     A(s.chunks.length > 1, 'a realistic snapshot spans multiple chunks');
@@ -194,7 +195,7 @@ A(canonicalJSON(1.5) === '1.5', 'numbers serialise');
     }
     const parsed = parseSnapshot(s.chunks, s.manifest);
     A(parsed.tables.state_balances.length === 4000, 'all 4000 balances survive');
-    A(parsed.tables.price_history.length === 8000, 'all 8000 price points survive');
+    A(parsed.tables.state_liquidity_pools.length === 8000, 'all 8000 pool rows survive');
     A(verifySnapshot({ tables: parsed.tables, manifest: s.manifest }), 'the large snapshot verifies end to end');
 }
 

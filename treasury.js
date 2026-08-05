@@ -201,7 +201,7 @@ export function settleQueue({ balance, obligations } = {}) {
  */
 export function buildEpochBatch({ epoch = 0, balance = 0, epochPool = 0,
                                   hosts = [], carriedPending = [], storage = [],
-                                  params = {} } = {}) {
+                                  serving = [], params = {} } = {}) {
     const settled = settleEpoch({ pool: epochPool, hosts, params });
 
     const fresh = settled.payouts.map(p => ({
@@ -227,13 +227,29 @@ export function buildEpochBatch({ epoch = 0, balance = 0, epochPool = 0,
             chunks: Number(s.chunks) || 0
         }));
 
+    // SERVING rewards: nodes that kept the public website reachable. Built by serving.js
+    // (which owns the eligibility rules — stake, independent witnesses, uptime) and queued
+    // here so they obey the same solvency invariant as everything else. PRIORITY.SERVING
+    // sits behind hosts and storage: if the treasury is short, the model's survival is
+    // worth more than a day of website hosting, which degrades gracefully.
+    const served = (Array.isArray(serving) ? serving : [])
+        .filter(s => s && s.address && nonNeg(s.amount) > 0)
+        .map(s => ({
+            id: s.id || ('e' + epoch + ':serve:' + s.address),
+            address: s.address,
+            amount: nonNeg(s.amount),
+            priority: PRIORITY.SERVING,
+            since: Number(s.since) || epoch,
+            uptime: Number(s.uptime) || 0
+        }));
+
     const carried = (Array.isArray(carriedPending) ? carriedPending : [])
         .filter(o => o && o.address && nonNeg(o.amount) > 0)
         .map(o => Object.assign({}, o, { since: Number(o.since) || 0 }));
 
     const { paid, pending, balanceAfter } = settleQueue({
         balance,
-        obligations: carried.concat(fresh).concat(stored)
+        obligations: carried.concat(fresh).concat(stored).concat(served)
     });
 
     return {

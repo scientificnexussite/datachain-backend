@@ -38,7 +38,15 @@ class State {
     // Keyed by ticker (UPPERCASE); value: { tokenReserve, usdReserve }.
     // poolPrice = usdReserve / tokenReserve when both > 0.
     this.liquidityPools = {};
-    
+
+    // THE NODE REGISTRY — the phone book that replaces editing nodes.js by hand.
+    // Keyed by the announcing wallet address; value: { url, at, height }.
+    // Every node that agrees to serve the website publishes its public address here with a
+    // NODE_ANNOUNCE transaction, so the list lives on the chain rather than in a static file.
+    // A node that changes address (a free tunnel gets a new one every restart) simply
+    // announces again and overwrites its own entry — nobody edits or redeploys anything.
+    this.nodes = {};
+
     const volumeDir = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
     this.snapshotFile = path.join(volumeDir, 'state_snapshot.json');
     
@@ -119,6 +127,53 @@ class State {
         if (!isReplay) console.log(chalk.red('[LEDGER] Rejected CHECKPOINT: malformed Merkle root.'));
         return false;
       }
+      return true;
+    }
+
+    // NODE_ANNOUNCE — a node publishes the public address it serves the website on.
+    // Moves NO value, so like CHECKPOINT it is handled BEFORE the ledger lock, which
+    // rejects anything with amount <= 0.
+    //
+    // WHY ON-CHAIN. The alternative is a list in a file (nodes.js) or on one server. A file
+    // must be re-edited and re-deployed every time any node's address changes, and a server
+    // is the single point of failure this whole exercise exists to remove. On-chain, the
+    // registry is replicated by every node that already replicates the ledger, it survives
+    // any individual machine going down, and it costs no new infrastructure.
+    //
+    // ⚠️ CONSENSUS NOTE (same as CHECKPOINT above): a node without this branch falls through
+    // to `return false`, drops the transaction, and builds a DIFFERENT block. Every node must
+    // run this build BEFORE the first NODE_ANNOUNCE is emitted. That is why announcing is
+    // gated behind a settings flag that ships OFF — see Exe/core/announce.js.
+    if (String(type).toUpperCase() === 'NODE_ANNOUNCE') {
+      const url = typeof tx.url === 'string' ? tx.url.trim() : '';
+      const owner = from || to;
+      if (!owner) return false;
+
+      // Retire an address by announcing an empty url — this is how a node says
+      // "stop sending visitors to me" when it stops sharing.
+      if (url === '') {
+        delete this.nodes[owner];
+        return true;
+      }
+
+      // HTTPS ONLY, and no credentials, no query, no port games. A browser on an https page
+      // cannot call http at all, so an http entry would be dead weight that every visitor
+      // wastes a timeout on. Rejecting it here keeps the registry free of unusable rows.
+      if (url.length > 200) return false;
+      let parsed;
+      try { parsed = new URL(url); } catch (e) { return false; }
+      if (parsed.protocol !== 'https:') return false;
+      if (parsed.username || parsed.password) return false;
+      if (parsed.search || parsed.hash) return false;
+      if (parsed.pathname !== '/') return false;
+
+      // One entry per address: re-announcing REPLACES, never appends. This is what makes a
+      // rotating tunnel address free — and it caps the registry at one row per identity, so
+      // it cannot be inflated into a denial-of-service by a single loud node.
+      this.nodes[owner] = {
+        url: parsed.origin,
+        at: Number(tx.timestamp) || Date.now()
+      };
       return true;
     }
 

@@ -9,6 +9,9 @@ import {
     validateBatch as validateReceiptBatch,
     verifyAttestations as verifyReceiptAttestations
 } from './receipts.js';
+// F6 security bonds. Same reasoning as receipts: ONE definition of "is this bond valid",
+// shared by the ledger, the registry and the tests.
+import { validateBond, canRelease, BOND_DEFAULTS } from './bonds.js';
 
 const fixDust = (num) => Number(Number(num).toFixed(8));
 
@@ -96,6 +99,17 @@ class State {
     // is owed what — the property the treasury needs before it can pay anyone.
     // A later batch for the same epoch REPLACES an earlier one; it is keyed, not appended.
     this.epochReceipts = {};
+
+    // ── F6 SECURITY BONDS ──────────────────────────────────────────────────────────
+    // address -> { amount, verifierKey, since, releasableAt }. SYR that has been DEBITED
+    // from the spendable balance and is held at risk to back a verifier identity.
+    //
+    // NOT the same thing as api.js's /stake/lock yield product, which is a plain TRANSFER
+    // plus a Postgres row and is invisible to a replaying node. See bonds.js.
+    //
+    // ⚠️ Bonded SYR is not destroyed. Anything totalling circulating supply must add it
+    // back, or bonding reads as a burn.
+    this.bonds = {};
 
     const volumeDir = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
     this.snapshotFile = path.join(volumeDir, 'state_snapshot.json');
@@ -468,8 +482,20 @@ class State {
       // signed this exact batch, so a host cannot pay itself — it cannot produce other
       // people's signatures. verifyAttestations counts one vote per key, so the same
       // verifier signing repeatedly does not reach quorum on its own.
+      // THE BOND GATE, EVALUATED AS OF THIS EPOCH — not as of now.
+      //
+      // `tx.verifierSet` is supplied by the caller that has the chain (datachain.js /
+      // the miner), because State does not hold one. When absent the check degrades to
+      // "distinct keys", which is the pre-bond behaviour: weaker, but it must still
+      // validate, or every chain built before bonds existed would become unreplayable.
+      //
+      // ⚠️ HISTORICAL ON PURPOSE. Validating an old batch against TODAY's registry would
+      // make a retired verifier's past signatures retroactively invalid, so a replay would
+      // reach a different answer than the original run — a fork with no attacker involved.
+      // See bonds.verifierSetAt.
       const quorum = verifyReceiptAttestations({
-        epoch, receipts: list, attestations: tx.attestations
+        epoch, receipts: list, attestations: tx.attestations,
+        verifierSet: tx.verifierSet instanceof Set ? tx.verifierSet : null
       });
       if (!quorum.ok) {
         if (!isReplay) {
@@ -486,6 +512,50 @@ class State {
         verifiers: quorum.signers,
         at: Number(tx.timestamp) || 0
       };
+      return true;
+    }
+
+    // VERIFIER_UNBOND / VERIFIER_RELEASE — the two halves of withdrawing a bond.
+    //
+    // ⚠️ WHY THESE ARE UP HERE BUT VERIFIER_BOND IS NOT. The split is deliberate and was
+    // found the hard way: the ledger lock below rejects `amount <= 0`, and both of these
+    // legitimately carry no amount. UNBOND only sets a timer; RELEASE returns a sum the
+    // LEDGER already recorded (`bond.amount`), never a number the sender supplied. So there
+    // is nothing for the overflow guard to check, and running them through it simply
+    // rejected them.
+    //
+    // VERIFIER_BOND stays BELOW the lock, because it debits an attacker-supplied `amount`
+    // and must face the same overflow and overdraft discipline as any transfer.
+    if (String(type).toUpperCase() === 'VERIFIER_UNBOND') {
+      const bond = this.bonds[from];
+      if (!bond) {
+        if (!isReplay) console.log(chalk.red('[LEDGER] Rejected VERIFIER_UNBOND: no bond.'));
+        return false;
+      }
+      // The key stops counting as a verifier IMMEDIATELY (see bonds.verifierSetAt), but the
+      // money stays at risk for the cooling-off window. Quitting must not be a way to
+      // escape a judgement that is already in flight.
+      bond.releasableAt = (Number(tx.height) || 0) + BOND_DEFAULTS.COOLING_OFF_BLOCKS;
+      return true;
+    }
+
+    if (String(type).toUpperCase() === 'VERIFIER_RELEASE') {
+      const bond = this.bonds[from];
+      const allowed = canRelease({ bond, height: Number(tx.height) || 0 });
+      if (!allowed.ok) {
+        if (!isReplay) {
+          console.log(chalk.red(`[LEDGER] Rejected VERIFIER_RELEASE: ${allowed.reason}` +
+            (allowed.releasableAt ? ` (releasable at height ${allowed.releasableAt}, now ${allowed.height})` : '') + '.'));
+        }
+        return false;
+      }
+      // The SYR was never destroyed, only held out of the balances map. The amount comes
+      // from the bond record, NOT from the transaction — so a forged `amount` field cannot
+      // withdraw more than was put in.
+      const sym = tx.tokenSymbol ? String(tx.tokenSymbol).toUpperCase() : 'SYR';
+      if (!this.balances[sym]) this.balances[sym] = {};
+      this.balances[sym][from] = fixDust((this.balances[sym][from] || 0) + (Number(bond.amount) || 0));
+      delete this.bonds[from];
       return true;
     }
 
@@ -584,6 +654,45 @@ class State {
       return true;
     }
 
+    // ── F6 SECURITY BONDS ──────────────────────────────────────────────────────
+    // Below the ledger lock, unlike CHECKPOINT/NODE_ANNOUNCE/RECEIPT, because a bond MOVES
+    // VALUE — it must go through the same overflow and overdraft discipline as a transfer,
+    // not around it.
+    //
+    // The bond DEBITS the spendable balance rather than flagging it. Every "what can this
+    // address spend" path is then correct with no changes, because the money is genuinely
+    // not in the balances map. A lock that every future spend path must remember to
+    // subtract is a lock that will eventually be forgotten.
+    //
+    // ⚠️ CONSENSUS NOTE: mirrored in Exe/core/state-db.js and pinned by
+    // Exe/tests/state-parity.test.mjs. A node without these branches drops the transaction
+    // and builds a different block — the 955-block lesson.
+    if (type === 'VERIFIER_BOND') {
+      const v = validateBond({ address: from, amount, verifierKey: tx.verifierKey });
+      if (!v.ok) {
+        if (!isReplay) console.log(chalk.red(`[LEDGER] Rejected VERIFIER_BOND: ${v.reason}.`));
+        return false;
+      }
+      // Same overdraft rule as a transfer. A bond you cannot afford is not a bond.
+      const bal = this.balances[tokenSymbol][from] || 0;
+      if (!isReplay && bal < amount) {
+        console.log(chalk.red('[LEDGER] Rejected VERIFIER_BOND: insufficient balance.'));
+        return false;
+      }
+      this.balances[tokenSymbol][from] = fixDust(bal - amount);
+
+      const prev = this.bonds[from];
+      // Topping up ADDS rather than replaces, so strengthening a bond never leaves a gap
+      // where the verifier is briefly unbonded. It also cancels a pending unbond.
+      this.bonds[from] = {
+        amount: fixDust((prev ? prev.amount : 0) + amount),
+        verifierKey: tx.verifierKey,
+        since: prev ? prev.since : (Number(tx.height) || 0),
+        releasableAt: null
+      };
+      return true;
+    }
+
     let sender = from;
     let receiver = to;
 
@@ -663,6 +772,10 @@ class State {
         // still knows what past epochs credited — and a replay simply overwrites, since
         // every write here is keyed on epoch.
         if (snap.epochReceipts   && typeof snap.epochReceipts === 'object')   this.epochReceipts = snap.epochReceipts;
+        // Bonds hold real SYR that was debited from spendable balances. Losing them on a
+        // restart would silently destroy that money — the balance is already gone from the
+        // balances map, so nothing else remembers it exists.
+        if (snap.bonds           && typeof snap.bonds === 'object')           this.bonds = snap.bonds;
         const n = Object.keys(this.tokens).length + Object.keys(this.openTokens).length;
         if (n > 0) console.log(chalk.cyan(`[STATE] Loaded ${n} token registry record(s) from snapshot.`));
     } catch (e) {
@@ -716,8 +829,8 @@ class State {
         this.usd_balances = {};
         this.liquidityPools = {};
 
-        // ⚠️ `tokens`, `openTokens`, `openTokenSupply` AND `epochReceipts` ARE DELIBERATELY
-        // NOT CLEARED.
+        // ⚠️ `tokens`, `openTokens`, `openTokenSupply`, `epochReceipts` AND `bonds` ARE
+        // DELIBERATELY NOT CLEARED.
         // Same invariant as Exe/core/state-db.js rebuildFromChain (:677-691), which is
         // explicit that no `DELETE FROM token_metadata` may ever be added there: tokens
         // that predate TOKEN_DEPLOY exist only in the snapshot, so clearing would erase
@@ -779,6 +892,9 @@ class State {
               // Verified-work receipts by epoch. Re-derivable from RECEIPT transactions, but
               // persisted so a node that prunes old blocks keeps the credit history.
               epochReceipts: this.epochReceipts,
+              // F6 security bonds. MUST be persisted: the SYR has already been debited from
+              // the balances map, so this record is the only thing that knows it is owed back.
+              bonds: this.bonds,
               lastIndex
           };
           const tempFile = this.snapshotFile + '.tmp';

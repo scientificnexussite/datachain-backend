@@ -74,7 +74,11 @@ class Validator {
     // put this node on a different chain from one that applied them — the same class of
     // divergence as the coinbase-type fork.
     const type = String(tx.type).toUpperCase();
-    const ZERO_VALUE = type === 'CHECKPOINT' || type === 'NODE_ANNOUNCE' || type === 'RECEIPT';
+    const ZERO_VALUE = type === 'CHECKPOINT' || type === 'NODE_ANNOUNCE' || type === 'RECEIPT'
+                   // A bond WITHDRAWAL carries no amount: UNBOND only starts a timer, and
+                   // RELEASE returns a sum the ledger recorded rather than one the sender
+                   // supplied. VERIFIER_BOND is absent on purpose — it moves value.
+                   || type === 'VERIFIER_UNBOND' || type === 'VERIFIER_RELEASE';
     if (!ZERO_VALUE && !tx.amount) return false;
 
     if (tx.isSystemGenerated) return true;

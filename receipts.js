@@ -96,10 +96,28 @@ export function signBatch({ epoch, receipts, privateKeyPem }) {
  *
  * @returns {{ok:boolean, reason:string|null, signers:string[], required:number}}
  */
-export function verifyAttestations({ epoch, receipts, attestations, params = {} } = {}) {
+export function verifyAttestations({ epoch, receipts, attestations, verifierSet = null,
+                                     params = {} } = {}) {
     const p = Object.assign({}, RECEIPT_DEFAULTS, params);
-    const required = Math.max(1, Math.floor(p.MIN_VERIFIERS));
     const list = Array.isArray(attestations) ? attestations : [];
+
+    // ── THE BOND GATE ──────────────────────────────────────────────────────────
+    // `verifierSet` is the set of keys that were BONDED verifiers at this epoch, derived
+    // from the chain by bonds.verifierSetAt(). When it is supplied, a signature counts
+    // only if its key is in it — which is what makes "independent verifier" cost money
+    // instead of costing a keygen call.
+    //
+    // With a registry present the quorum becomes F6's real rule, a MAJORITY of the
+    // registered set (verify.js decideShard uses the same floor(r/2)+1), instead of the
+    // flat MIN_VERIFIERS floor that was only ever a placeholder.
+    //
+    // ⚠️ Passing no set means NO BOND CHECK — the old, weaker behaviour. That is kept so a
+    // chain with no registered verifiers yet is still validatable, but a caller that can
+    // supply the set and does not is silently accepting sybils.
+    const gated = verifierSet instanceof Set;
+    const required = gated
+        ? Math.max(p.MIN_VERIFIERS, Math.floor(verifierSet.size / 2) + 1)
+        : Math.max(1, Math.floor(p.MIN_VERIFIERS));
 
     if (list.length > p.MAX_ATTESTATIONS) {
         return { ok: false, reason: 'too-many-attestations', signers: [], required };
@@ -117,6 +135,10 @@ export function verifyAttestations({ epoch, receipts, attestations, params = {} 
         if (seen.has(a.verifier)) continue;
         seen.add(a.verifier);
 
+        // An unbonded key is not a verifier, however valid its signature. Checked before
+        // the (more expensive) cryptography, and before the key can occupy a quorum slot.
+        if (gated && !verifierSet.has(a.verifier)) continue;
+
         let valid = false;
         try {
             const v = crypto.createVerify('SHA256');
@@ -130,9 +152,16 @@ export function verifyAttestations({ epoch, receipts, attestations, params = {} 
 
     signers.sort();             // deterministic order for anything that records them
     if (signers.length < required) {
-        return { ok: false, reason: 'insufficient-quorum', signers, required };
+        return {
+            ok: false,
+            // Distinguish "not enough signed" from "the ones that signed were not bonded" —
+            // they need completely different fixes, and a single vague reason would send
+            // an operator hunting the wrong one.
+            reason: (gated && list.length >= required) ? 'signers-not-bonded' : 'insufficient-quorum',
+            signers, required, gated
+        };
     }
-    return { ok: true, reason: null, signers, required };
+    return { ok: true, reason: null, signers, required, gated };
 }
 
 /**

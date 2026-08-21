@@ -29,6 +29,24 @@ pool.query(`
     );
 `).catch(err => console.error(chalk.red("[DB] Failed to initialize state tables"), err));
 
+/* ── DEPLOY FEES ────────────────────────────────────────────────────────────────────
+   Creating a token is NOT free on either product, and the two charge differently.
+
+     DelChain  — $1.00 WORTH of SYR to `system`               (api.js:5227-5228)
+     OpenChain — 1.00 SDX to `system`                         (api.js:4044)
+                 PLUS the parent network owner's SYR fee      (api.js:4053-4079)
+
+   These are the SAME two numbers as Exe/core/state-db.js:31-32, and they must stay the
+   same: a node that charged a different amount would rebuild different balances from the
+   very same block.
+
+   SDX is used for the OpenChain platform fee for a concrete reason: it is pegged to $1,
+   whereas $1 of SYR at the seed price is 100,000,000 SYR, which nobody holds — the fee was
+   unpayable when it was denominated in SYR.
+   ──────────────────────────────────────────────────────────────────────────────────── */
+const DELCHAIN_DEPLOY_FEE_USD    = 1.00;
+const OPENCHAIN_PLATFORM_FEE_SDX = 1.00;
+
 class State {
   constructor() {
     this.balances = { "SYR": {} };     
@@ -46,6 +64,24 @@ class State {
     // A node that changes address (a free tunnel gets a new one every restart) simply
     // announces again and overwrites its own entry — nobody edits or redeploys anything.
     this.nodes = {};
+
+    // ── THE TOKEN REGISTRIES, REBUILT FROM BLOCKS ──────────────────────────────────
+    // Mirrors of the three tables Exe/core/state-db.js writes from a TOKEN_DEPLOY —
+    // token_metadata (:129), open_tokens (:215) and open_token_supply (:231) — kept here
+    // in memory so that replaying a chain on this node produces the same registry as
+    // replaying it in the exe. Without them the deploy would move money on both sides but
+    // leave only one side knowing the token exists.
+    //
+    // Deliberately NOT written back into api.js's Postgres tables of the same name: those
+    // belong to the API layer, have entirely different columns (token_metadata there is
+    // (ticker, description, logo_base64, fdx_tiers, public_url, updated_at)), and are
+    // upserted by routes that know nothing about replay. State owns these copies and
+    // persists them in its OWN snapshot file.
+    //
+    // Keyed by UPPERCASE ticker, exactly like `liquidityPools`.
+    this.tokens          = {};   // DelChain registry  → token_metadata
+    this.openTokens      = {};   // OpenChain registry → open_tokens
+    this.openTokenSupply = {};   // where an OpenChain supply lives → open_token_supply
 
     const volumeDir = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
     this.snapshotFile = path.join(volumeDir, 'state_snapshot.json');
@@ -100,6 +136,96 @@ class State {
     const effUsd   = p.usdReserve   + (p.virtualUsdReserve   || 0);
     if (effToken <= 0 || effUsd <= 0) return 0;
     return fixDust(effUsd / effToken);
+  }
+
+  // ── Token Registry Helpers ─────────────────────────────────────────────────
+  // Read side of the three registries a TOKEN_DEPLOY writes. Named after their
+  // Exe/core/state-db.js counterparts so the two can be compared field for field —
+  // see Exe/tests/state-parity.test.mjs, which does exactly that.
+
+  /** A DelChain token's record, or null. Mirrors state-db.getTokenMetadata. */
+  getTokenMetadata(ticker) {
+    return this.tokens[String(ticker || '').toUpperCase()] || null;
+  }
+
+  /** An OpenChain token's record, or null. Mirrors state-db.getOpenToken. */
+  getOpenToken(ticker) {
+    return this.openTokens[String(ticker || '').toUpperCase()] || null;
+  }
+
+  /** Which hidden address holds an OpenChain supply, and how much. */
+  getOpenTokenSupply(ticker) {
+    return this.openTokenSupply[String(ticker || '').toUpperCase()] || null;
+  }
+
+  /**
+   * Move a token balance by `delta`, byte-for-byte like Exe/core/state-db.js adjustBalance.
+   *
+   * ⚠️ THE ASYMMETRY IS DELIBERATE AND MUST BE COPIED. Over there an EXISTING row is a
+   * plain `amount = amount + delta` (which may go negative), while a row that does not
+   * exist yet is INSERTed with `Math.max(0, delta)` — so a fee charged to an address that
+   * has never held that token floors at zero instead of going negative. Two nodes that
+   * disagreed about that single case would rebuild different balances from the same block,
+   * which is the whole failure this branch exists to prevent.
+   *
+   * `fixDust` is applied because every other write in this file does; the exe stores raw
+   * floats. The two therefore agree to 8 decimal places, which is this ledger's canonical
+   * precision (fixDust) and the precision the deploy routes already round their fees to.
+   */
+  _adjustBalance(address, tokenSymbol, delta) {
+    if (!address) return;
+    const t = String(tokenSymbol || 'SYR').toUpperCase();
+    if (!this.balances[t]) this.balances[t] = {};
+    const book = this.balances[t];
+    book[address] = Object.prototype.hasOwnProperty.call(book, address)
+      ? fixDust(book[address] + delta)
+      : fixDust(Math.max(0, delta));
+  }
+
+  /**
+   * Charge one deploy fee. Mirrors Exe/core/state-db.js _payFee (:636-643).
+   *
+   * `system` is the SYR mint authority and its balance is NOT tracked in this ledger — the
+   * transfer path below skips crediting it for exactly the same reason. Crediting it here
+   * would invent a balance the exe does not have.
+   */
+  _payDeployFee(payer, tokenSymbol, amount, to) {
+    if (!(amount > 0)) return;
+    this._adjustBalance(payer, tokenSymbol, -amount);
+    if (to && to !== 'system') this._adjustBalance(to, tokenSymbol, amount);
+  }
+
+  /**
+   * Charge a token deployment, as part of applying its transaction.
+   *
+   * Mirrors Exe/core/state-db.js _applyDeployFees (:612-634). It has to run HERE rather
+   * than in the deploy route because balances are rebuilt from blocks: a fee taken outside
+   * the transaction exists only on the machine that took it, and every other node — this
+   * one included, after its next rebuild — would compute a balance a whole fee higher.
+   */
+  _applyDeployFees(payer, chain, meta) {
+    if (!payer) return;
+    if (chain === 'openchain') {
+      // A CONSTANT, enforced here rather than read from the transaction. SDX is pegged to
+      // $1 so this amount never depends on a price, which means every node can derive it
+      // independently and none of them has to trust what the signer wrote. Reading
+      // `meta.platformFeeSdx` would let whoever signs the deploy set their own fee to 0.
+      this._payDeployFee(payer, 'SDX', OPENCHAIN_PLATFORM_FEE_SDX, 'system');
+
+      // The parent network owner's cut. This one MUST come from the transaction: the fee
+      // registry is not on the chain, so a replay has no other way to learn what was
+      // charged, and reading today's table would reproduce a different number for a deploy
+      // that happened months ago.
+      const networkFee = Number(meta.networkFeeSyr) || 0;
+      const networkTo  = String(meta.networkFeeTo || '');
+      if (networkFee > 0 && networkTo) this._payDeployFee(payer, 'SYR', networkFee, networkTo);
+    } else {
+      // $1.00 WORTH of SYR. The SYR amount depends on the price at the moment of creation,
+      // which no replay can recover, so the deploy route prices it once and records the
+      // result in the signed transaction.
+      const feeSyr = Number(meta.feeSyr) || 0;
+      if (feeSyr > 0) this._payDeployFee(payer, 'SYR', feeSyr, 'system');
+    }
   }
 
     applyTransaction(tx, currentPrice = 0, isReplay = false) {
@@ -174,6 +300,112 @@ class State {
         url: parsed.origin,
         at: Number(tx.timestamp) || Date.now()
       };
+      return true;
+    }
+
+    // TOKEN_DEPLOY — a new token, recorded ON-CHAIN.
+    //
+    // WHY IT IS ON THE CHAIN AT ALL. The token registry never was: it lived in this
+    // server's Postgres, which is why a node with no primary could not create a token and
+    // reported a stale list. Carrying the definition in a transaction makes the registry
+    // replicated, rebuildable from blocks, and independent of any server — exactly like
+    // balances. Exe/core/state-db.js:464-531 is the live implementation; this branch is its
+    // mirror and the two are pinned together by Exe/tests/state-parity.test.mjs.
+    //
+    // ⚠️ CONSENSUS NOTE — THIS IS THE URGENT ONE. Exe/core/miner.js now puts mempool
+    // transactions into blocks, so TOKEN_DEPLOY reaches the wire. A node without this
+    // branch falls through to `return false`, datachain.js:572 drops the transaction, and
+    // it builds a DIFFERENT block from the same input. That is a fork — the same class of
+    // bug as the coinbase type mismatch that cost this project 955 blocks.
+    //
+    // Handled BEFORE the ledger lock, like CHECKPOINT and NODE_ANNOUNCE above, and for two
+    // concrete reasons rather than one:
+    //   · the exe registers a token even when the supply is 0 (`if (amt > 0)` guards only
+    //     the credit), and the lock rejects amount <= 0;
+    //   · the lock also rejects amount > 100,000,000,000, while the exe's deploy route
+    //     allows a supply up to 1e15 and its applyTransaction caps nothing at all.
+    // Either case would be accepted by the exe and dropped here. Both are forks.
+    if (String(type).toUpperCase() === 'TOKEN_DEPLOY') {
+      // `amount` is the initial supply. There is no sender: like MINT, this brings a new
+      // asset into existence. WHO receives it depends on the product — see below.
+      const amt  = parseFloat(tx.amount) || 0;
+      const meta = (tx.token && typeof tx.token === 'object') ? tx.token : {};
+      // Uppercased, as every other type in this file is. The deploy routes uppercase the
+      // ticker before signing (local-api.js:1091, :1179), so this and the exe's raw symbol
+      // are the same string for anything a route can produce.
+      const ticker = String(tx.tokenSymbol || 'SYR').toUpperCase();
+      const creator = from;
+
+      // ── WHICH PRODUCT ────────────────────────────────────────────────────────────
+      // ⚠️ READ THE SERVER-SET `chain` FIELD, NEVER A CLIENT `openChain` BOOLEAN.
+      // DelChain and OpenChain charge different fees, send the supply to different places
+      // and write to different registries, so letting the caller pick the label would let
+      // anyone buy the cheap product and receive the expensive one. `chain` is set by the
+      // deploy route after it has enforced that product's rules.
+      const chain = String(meta.chain || '').toLowerCase() === 'openchain'
+        ? 'openchain' : 'delchain';
+
+      // ── FEES, DEBITED INSIDE THE TRANSACTION ─────────────────────────────────────
+      this._applyDeployFees(creator, chain, meta);
+
+      if (chain === 'openchain') {
+        // The supply goes to a hidden, network-held address — NOT the creator's wallet
+        // (api.js:4082-4099). The address is carried in the transaction because it is
+        // generated randomly at creation: regenerating it here would put the supply
+        // somewhere new on every replay.
+        const supplyTo = String(meta.supplyTo || '') ||
+                         ('nx_open_' + ticker.toLowerCase() + '_system');
+        this.openTokens[ticker] = {
+          ticker,
+          uid: creator || '',
+          name: String(meta.name || ticker).slice(0, 64),
+          description: String(meta.description || '').slice(0, 500),
+          logo_url: typeof meta.logo === 'string' ? meta.logo : '',
+          parent_ticker: meta.parent ? String(meta.parent).toUpperCase() : null,
+          total_supply: amt,
+          status: 'active',
+          created_at: Number(tx.timestamp) || Date.now()
+        };
+        this.openTokenSupply[ticker] = {
+          ticker,
+          system_address: supplyTo,
+          total_supply: amt,
+          created_at: Number(tx.timestamp) || Date.now()
+        };
+        if (amt > 0) this._adjustBalance(supplyTo, ticker, amt);
+        // ⚠️ DELIBERATELY NOTHING IS WRITTEN TO `tokens` HERE.
+        // That is the DelChain registry; an OpenChain row in it shows up on the DelChain
+        // list as an independent coin, which it is not.
+      } else {
+        this.tokens[ticker] = {
+          ticker,
+          name: String(meta.name || ticker).slice(0, 64),
+          creator: creator || '',
+          total_supply: amt,
+          circulating_supply: amt,
+          created_at: Number(tx.timestamp) || Date.now(),
+          description: String(meta.description || '').slice(0, 500),
+          is_open_token: 0,
+          network: meta.network || 'mainnet',
+          // ⚠️ TOP LEVEL, NOT NESTED UNDER `data`. state-db.setTokenMetadata serialises the
+          // WHOLE object into its `data` column, so a `data:` key here would be double
+          // encoded and every reader would find `website` undefined.
+          logo: typeof meta.logo === 'string' ? meta.logo : null,
+          website: typeof meta.website === 'string' ? meta.website : null,
+          // Recorded but NOT trusted: a domain counts as verified only once a proof has
+          // been checked, and DNS can change after the fact — so the flag is never written
+          // to the chain, it is re-derived locally. See local-api /api/token/verify-domain.
+          domainVerified: false,
+          // What was actually paid, kept with the token so the charge is auditable from the
+          // registry and not only from the block.
+          deployFeeSyr: Number(meta.feeSyr) || 0
+        };
+        if (amt > 0) this._adjustBalance(creator, ticker, amt);
+      }
+
+      // ⚠️ ALWAYS TRUE. Never refuse a deploy for insufficient funds the way the transfer
+      // path does: the exe applies it regardless (its balance floor is the Math.max(0, …)
+      // in _adjustBalance), so a refusal here would drop a transaction the exe keeps.
       return true;
     }
 
@@ -327,7 +559,38 @@ class State {
     return this.balances[tokenSymbol][address] || 0;
   }
 
+  /**
+   * Restore the three token registries from State's OWN snapshot file.
+   *
+   * They are not in Postgres: api.js's tables of the same name have different columns and
+   * different owners (see the constructor), so State keeps its copies in the JSON snapshot
+   * it already writes on every save. Registry rows only — balances still come from
+   * Postgres, which stays authoritative for money.
+   *
+   * Safe to run before either path below. Every write is an assignment keyed on ticker, so
+   * a later chain replay overwrites rather than accumulating: loading and then replaying
+   * cannot double-apply.
+   */
+  _loadRegistriesFromFile() {
+    try {
+        if (!fs.existsSync(this.snapshotFile)) return;
+        const snap = JSON.parse(fs.readFileSync(this.snapshotFile, 'utf8')) || {};
+        if (snap.tokens          && typeof snap.tokens === 'object')          this.tokens = snap.tokens;
+        if (snap.openTokens      && typeof snap.openTokens === 'object')      this.openTokens = snap.openTokens;
+        if (snap.openTokenSupply && typeof snap.openTokenSupply === 'object') this.openTokenSupply = snap.openTokenSupply;
+        const n = Object.keys(this.tokens).length + Object.keys(this.openTokens).length;
+        if (n > 0) console.log(chalk.cyan(`[STATE] Loaded ${n} token registry record(s) from snapshot.`));
+    } catch (e) {
+        console.warn(chalk.yellow('[STATE] Could not read the token registry snapshot:'), e.message);
+    }
+  }
+
   async loadSnapshot(chain) {
+    // Tokens created BEFORE TOKEN_DEPLOY existed were never transactions, so no replay can
+    // bring them back — they live only here. Loaded first so that both paths below start
+    // from them, and never cleared afterwards.
+    this._loadRegistriesFromFile();
+
     try {
         const usdRes = await pool.query('SELECT address, balance FROM state_usd_balances');
         for (const row of usdRes.rows) {
@@ -367,6 +630,15 @@ class State {
         this.balances = { "SYR": {} };
         this.usd_balances = {};
         this.liquidityPools = {};
+
+        // ⚠️ `tokens`, `openTokens` AND `openTokenSupply` ARE DELIBERATELY NOT CLEARED.
+        // Same invariant as Exe/core/state-db.js rebuildFromChain (:677-691), which is
+        // explicit that no `DELETE FROM token_metadata` may ever be added there: tokens
+        // that predate TOKEN_DEPLOY exist only in the snapshot, so clearing would erase
+        // every one of them permanently on the next restart. Replay is idempotent without
+        // clearing because each registry write is an assignment keyed on ticker, so
+        // applying the same deploy twice is a no-op — the balances above are the only part
+        // that ACCUMULATES, and those are the only part reset.
 
         try {
             const allTxs = await pool.query("SELECT * FROM transactions ORDER BY block_index ASC, timestamp_ms ASC, id ASC");
@@ -411,6 +683,13 @@ class State {
               balances: this.balances,
               usd_balances: this.usd_balances,
               liquidityPools: this.liquidityPools,
+              // The three token registries. This file is the ONLY place they are persisted
+              // — Postgres's tables of the same name belong to api.js and have different
+              // columns — so leaving them out would lose every locally created token on
+              // restart unless the whole chain happened to be replayed.
+              tokens: this.tokens,
+              openTokens: this.openTokens,
+              openTokenSupply: this.openTokenSupply,
               lastIndex
           };
           const tempFile = this.snapshotFile + '.tmp';
@@ -498,5 +777,12 @@ class State {
       }
   }
 }
+
+// Published on the class so the fees can be asserted equal across the two implementations
+// without re-typing the numbers in a test — Exe/core/state-db.js exposes them the same way
+// (StateDB.DELCHAIN_DEPLOY_FEE_USD / .OPENCHAIN_PLATFORM_FEE_SDX). Two constants that
+// silently drifted apart would charge two different fees for the same block.
+State.DELCHAIN_DEPLOY_FEE_USD    = DELCHAIN_DEPLOY_FEE_USD;
+State.OPENCHAIN_PLATFORM_FEE_SDX = OPENCHAIN_PLATFORM_FEE_SDX;
 
 export default State;

@@ -6,6 +6,7 @@ import chalk from 'chalk';
 import validator from './validator.js';
 import * as powpolicy from './powpolicy.js';
 import * as epoch from './epoch.js';
+import * as receipts from './receipts.js';
 import State from './state.js';
 import config from './config.json' with { type: "json" };
 import pool from './db.js'; 
@@ -156,10 +157,23 @@ class DataChain {
     this.saveQueue = false;
 
     // F22 pending-payment queue: treasury obligations an epoch could not cover, retried
-    // next epoch (hosts first, oldest first). Empty while epoch settlement is dormant.
+    // next epoch (hosts first, oldest first).
+    //
+    // ⚠️ THIS USED TO BE MEMORY-ONLY, AND THAT WAS A LATENT FORK.
+    // It was never persisted, never in the state snapshot, never rebuilt on replay — so a
+    // restart reset it to empty and two nodes with different uptimes carried different
+    // debts, built different payout batches, and therefore different blocks. Harmless only
+    // while settlement was dormant; a fork the moment receipts became real.
+    //
+    // It is now written to disk and, on load, CHECKED against the pending-queue root
+    // committed on-chain (epoch.js writes it into the CHECKPOINT transaction). A file that
+    // does not match the chain is refused rather than trusted — see _loadPending.
     this.treasuryPending = [];
+    this.pendingFile = path.join(this.volumeDir, 'treasury_pending.json');
 
-    this.isInitializing = this.loadChain();
+    // Chained rather than hooked into loadChain's several return paths: the queue can only
+    // be checked once the chain is in memory, and this runs after every one of them.
+    this.isInitializing = this.loadChain().then(() => this._loadPending());
   }
 
   async loadChain() {
@@ -241,6 +255,64 @@ class DataChain {
     this.difficulty = 2;
     
     await this.executeHardForkAmnesty();
+  }
+
+  // ── The treasury's pending-payment queue ─────────────────────────────────────────
+  //
+  // Money owed to hosts that an epoch could not cover. Two properties matter:
+  //   · it must SURVIVE a restart, or a node forgets debts other nodes remember;
+  //   · it must be CHECKABLE, or a tampered file silently changes who gets paid.
+  // The chain carries the root (epoch.js commits it in the CHECKPOINT transaction); this
+  // file carries the list. Neither is trusted without the other.
+
+  _savePending() {
+    try {
+      if (!fs.existsSync(this.volumeDir)) fs.mkdirSync(this.volumeDir, { recursive: true });
+      const list = Array.isArray(this.treasuryPending) ? this.treasuryPending : [];
+      // The root is stored alongside so a mismatch is visible even before the chain is
+      // consulted — a file edited by hand fails its own checksum first.
+      const payload = JSON.stringify({ root: receipts.pendingRoot(list), pending: list });
+      const tmp = this.pendingFile + '.tmp';
+      fs.writeFileSync(tmp, payload);
+      fs.renameSync(tmp, this.pendingFile);   // atomic: a crash mid-write cannot truncate it
+    } catch (e) {
+      console.error(chalk.red('[TREASURY] Could not persist the pending queue:'), e.message);
+    }
+  }
+
+  _loadPending() {
+    try {
+      if (!fs.existsSync(this.pendingFile)) return;
+      const raw = JSON.parse(fs.readFileSync(this.pendingFile, 'utf8')) || {};
+      const list = Array.isArray(raw.pending) ? raw.pending : [];
+
+      // What does the CHAIN say the queue should be? That is the authority — the file is
+      // only a carrier, exactly like the state snapshot's bytes versus its on-chain root.
+      const committed = epoch.latestCommittedRoots(this.chain);
+      const wanted = committed ? committed.pendingRoot : null;
+
+      if (!receipts.verifyPendingList(list, wanted)) {
+        // Refuse rather than guess. Loading a queue the chain does not vouch for is how a
+        // node ends up paying the wrong addresses while believing it is in consensus.
+        console.error(chalk.red(
+          `[TREASURY] The stored pending queue does not match the root committed on-chain ` +
+          `(${list.length} obligation(s), expected root ${wanted || 'none'}). Refusing it.`));
+        console.error(chalk.red(
+          `[TREASURY] Starting with an EMPTY queue. Any genuinely owed debt will be ` +
+          `re-derived when the next epoch settles.`));
+        this.treasuryPending = [];
+        return;
+      }
+
+      this.treasuryPending = list;
+      if (list.length > 0) {
+        console.log(chalk.cyan(`[TREASURY] Restored ${list.length} pending obligation(s), verified against the chain.`));
+      }
+    } catch (e) {
+      // A corrupt file must not stop the node booting, but it must not be trusted either.
+      console.error(chalk.red('[TREASURY] Could not read the pending queue, starting empty:'), e.message);
+      this.treasuryPending = [];
+    }
   }
 
   async resolveConflict(newBlocks) {
@@ -572,13 +644,27 @@ class DataChain {
             if (tempState.applyTransaction(tx, currentPrice, false)) {
                 validTransactions.push(tx);
             } else {
+                // ⚠️ A COMMITMENT CARRIES NO DEBT. obligations[i] is deliberately null for the
+                // prepended CHECKPOINT (epoch.js keeps the array index-aligned with txs), and
+                // Object.assign({}, null, …) silently yields {status:'PENDING'} — an
+                // obligation with no address and no amount, quietly poisoning the queue.
+                // Only a real payout can be re-queued.
+                const owed = settlement.obligations[i];
+                if (!owed || !owed.address) {
+                    console.log(chalk.red(`[TREASURY] Epoch commitment rejected by the ledger (${tx.type}). ` +
+                                          `Nothing to re-queue, but the epoch's roots were NOT committed.`));
+                    return;
+                }
                 // Should be unreachable — the queue already checked the balance. But a host's
                 // debt must never be silently lost, so re-queue it for the next epoch.
                 console.log(chalk.red(`[TREASURY] Payout rejected by the ledger, re-queued: ${tx.to} (${tx.amount} SYR)`));
-                settlement.pending.push(Object.assign({}, settlement.obligations[i], { status: 'PENDING' }));
+                settlement.pending.push(Object.assign({}, owed, { status: 'PENDING' }));
             }
         });
         this.treasuryPending = settlement.pending;
+        // Persist immediately: the queue is money owed, and until this write it exists only
+        // in this process's memory. See _savePending for why the root matters.
+        this._savePending();
 
         if (settlement.summary && settlement.summary.paidCount > 0) {
             const s = settlement.summary;

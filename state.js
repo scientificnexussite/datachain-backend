@@ -2,6 +2,13 @@ import chalk from 'chalk';
 import fs from 'fs';
 import path from 'path';
 import pool from './db.js'; // Issue #3 Fixed
+// Receipt validation lives in receipts.js so the ledger, the epoch driver and the tests all
+// apply exactly ONE definition of "is this batch well-formed and properly attested". Two
+// copies of a consensus rule is two chances to disagree.
+import {
+    validateBatch as validateReceiptBatch,
+    verifyAttestations as verifyReceiptAttestations
+} from './receipts.js';
 
 const fixDust = (num) => Number(Number(num).toFixed(8));
 
@@ -82,6 +89,13 @@ class State {
     this.tokens          = {};   // DelChain registry  → token_metadata
     this.openTokens      = {};   // OpenChain registry → open_tokens
     this.openTokenSupply = {};   // where an OpenChain supply lives → open_token_supply
+
+    // ── VERIFIED-WORK RECEIPTS, BY EPOCH ───────────────────────────────────────────
+    // What each host was credited for one epoch's AI work: { epoch: {receipts, verifiers, at} }.
+    // Rebuilt from RECEIPT transactions, so every node that replays the chain agrees on who
+    // is owed what — the property the treasury needs before it can pay anyone.
+    // A later batch for the same epoch REPLACES an earlier one; it is keyed, not appended.
+    this.epochReceipts = {};
 
     const volumeDir = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
     this.snapshotFile = path.join(volumeDir, 'state_snapshot.json');
@@ -246,11 +260,25 @@ class State {
     // Safe today only because epoch settlement is dormant (epoch.js EPOCH_1_HEIGHT =
     // MAX_SAFE_INTEGER) and nothing emits one yet.
     if (String(type).toUpperCase() === 'CHECKPOINT') {
-      const root = typeof tx.root === 'string' ? tx.root : '';
+      // A CHECKPOINT is a commitment ENVELOPE and may carry any of several roots: the model
+      // checkpoint, the state snapshot, and the treasury's pending-payment queue. It is
+      // valid if AT LEAST ONE is well-formed.
+      //
+      // ⚠️ THIS USED TO REQUIRE `tx.root` SPECIFICALLY. An epoch that had only a pending
+      // queue to commit — no new model checkpoint, no new snapshot — emits a transaction
+      // with `root: null`, which the old test rejected. That is a block the epoch driver
+      // builds and the ledger refuses: an instant fork, in exactly the case the pending
+      // root exists to protect (debts carried, nothing else happening).
+      const wellFormed = (r) => typeof r === 'string' && /^[0-9a-f]{64}$/i.test(r);
+
       // A malformed root is worse than no commitment: nodes would "agree" on a root that
-      // verifies nothing, so every chunk proof against it fails silently.
-      if (!/^[0-9a-f]{64}$/i.test(root)) {
-        if (!isReplay) console.log(chalk.red('[LEDGER] Rejected CHECKPOINT: malformed Merkle root.'));
+      // verifies nothing, so every proof against it fails silently. So reject a transaction
+      // that carries a malformed root even when another root is fine — a half-valid
+      // commitment is a commitment nobody can trust.
+      const present = [tx.root, tx.checkpointRoot, tx.snapshotRoot, tx.pendingRoot]
+          .filter(r => r !== null && r !== undefined && r !== '');
+      if (present.length === 0 || !present.every(wellFormed)) {
+        if (!isReplay) console.log(chalk.red('[LEDGER] Rejected CHECKPOINT: no well-formed Merkle root.'));
         return false;
       }
       return true;
@@ -406,6 +434,58 @@ class State {
       // ⚠️ ALWAYS TRUE. Never refuse a deploy for insufficient funds the way the transfer
       // path does: the exe applies it regardless (its balance floor is the Math.max(0, …)
       // in _adjustBalance), so a refusal here would drop a transaction the exe keeps.
+      return true;
+    }
+
+    // RECEIPT — the verified-work receipts for one epoch (M1, roadmap 13_BUILD_ROADMAP).
+    //
+    // Moves NO value: it records WHO did verified work and HOW MUCH, and the epoch driver
+    // turns that into TRANSFERs later. Handled before the ledger lock for the same reason
+    // as CHECKPOINT and NODE_ANNOUNCE — the lock rejects amount <= 0.
+    //
+    // WHY THIS IS ON THE CHAIN. A receipt causes SYR to be paid. If nodes learned receipts
+    // from gossip instead, two nodes could hold different sets, settle different amounts,
+    // and build different blocks — a fork over money. On-chain, the receipt set for an
+    // epoch is whatever the chain says it is.
+    //
+    // ⚠️ CONSENSUS NOTE (as CHECKPOINT / NODE_ANNOUNCE / TOKEN_DEPLOY above): a node
+    // without this branch falls through to `return false`, drops the transaction, and
+    // builds a DIFFERENT block. Mirrored in Exe/core/state-db.js; the parity between the
+    // two is pinned by Exe/tests/state-parity.test.mjs. Safe to ship today only because
+    // epoch settlement is dormant (epoch.js EPOCH_1_HEIGHT = MAX_SAFE_INTEGER) and nothing
+    // emits one yet.
+    if (String(type).toUpperCase() === 'RECEIPT') {
+      const epoch = Number(tx.epoch);
+      const list = Array.isArray(tx.receipts) ? tx.receipts : null;
+
+      const batch = validateReceiptBatch({ epoch, receipts: list });
+      if (!batch.ok) {
+        if (!isReplay) console.log(chalk.red(`[LEDGER] Rejected RECEIPT: ${batch.reason}.`));
+        return false;
+      }
+
+      // THE QUORUM IS THE WHOLE SECURITY PROPERTY. Several distinct verifiers must have
+      // signed this exact batch, so a host cannot pay itself — it cannot produce other
+      // people's signatures. verifyAttestations counts one vote per key, so the same
+      // verifier signing repeatedly does not reach quorum on its own.
+      const quorum = verifyReceiptAttestations({
+        epoch, receipts: list, attestations: tx.attestations
+      });
+      if (!quorum.ok) {
+        if (!isReplay) {
+          console.log(chalk.red(`[LEDGER] Rejected RECEIPT for epoch ${epoch}: ${quorum.reason} ` +
+                                `(${quorum.signers.length} of ${quorum.required} verifiers).`));
+        }
+        return false;
+      }
+
+      // Keyed by epoch, so a later corrected batch REPLACES an earlier one rather than
+      // both counting. receiptsForEpoch() reads newest-first for the same reason.
+      this.epochReceipts[epoch] = {
+        receipts: list,
+        verifiers: quorum.signers,
+        at: Number(tx.timestamp) || 0
+      };
       return true;
     }
 
@@ -578,6 +658,11 @@ class State {
         if (snap.tokens          && typeof snap.tokens === 'object')          this.tokens = snap.tokens;
         if (snap.openTokens      && typeof snap.openTokens === 'object')      this.openTokens = snap.openTokens;
         if (snap.openTokenSupply && typeof snap.openTokenSupply === 'object') this.openTokenSupply = snap.openTokenSupply;
+        // Receipts are fully re-derivable from RECEIPT transactions, unlike the token
+        // registries above. Restoring them anyway means a node that has pruned old blocks
+        // still knows what past epochs credited — and a replay simply overwrites, since
+        // every write here is keyed on epoch.
+        if (snap.epochReceipts   && typeof snap.epochReceipts === 'object')   this.epochReceipts = snap.epochReceipts;
         const n = Object.keys(this.tokens).length + Object.keys(this.openTokens).length;
         if (n > 0) console.log(chalk.cyan(`[STATE] Loaded ${n} token registry record(s) from snapshot.`));
     } catch (e) {
@@ -631,7 +716,8 @@ class State {
         this.usd_balances = {};
         this.liquidityPools = {};
 
-        // ⚠️ `tokens`, `openTokens` AND `openTokenSupply` ARE DELIBERATELY NOT CLEARED.
+        // ⚠️ `tokens`, `openTokens`, `openTokenSupply` AND `epochReceipts` ARE DELIBERATELY
+        // NOT CLEARED.
         // Same invariant as Exe/core/state-db.js rebuildFromChain (:677-691), which is
         // explicit that no `DELETE FROM token_metadata` may ever be added there: tokens
         // that predate TOKEN_DEPLOY exist only in the snapshot, so clearing would erase
@@ -690,6 +776,9 @@ class State {
               tokens: this.tokens,
               openTokens: this.openTokens,
               openTokenSupply: this.openTokenSupply,
+              // Verified-work receipts by epoch. Re-derivable from RECEIPT transactions, but
+              // persisted so a node that prunes old blocks keeps the credit history.
+              epochReceipts: this.epochReceipts,
               lastIndex
           };
           const tempFile = this.snapshotFile + '.tmp';

@@ -24,6 +24,7 @@
 // ════════════════════════════════════════════════════════════════════════════════
 
 import { buildEpochBatch, PRIORITY } from './treasury.js';
+import { receiptsForEpoch, pendingRoot } from './receipts.js';
 
 /**
  * A checkpoint root is only committed if it is a well-formed 32-byte hash.
@@ -60,13 +61,21 @@ export function epochNumber(height) {
 /**
  * Verified-work receipts for an epoch: [{ address, f, q, u, home }].
  *
- * NOT IMPLEMENTED YET — this is the M0/F16 hand-off. Receipts must be produced by the
- * worker protocol (verified FLOPs f, honesty q from audit challenges, uptime u from
- * heartbeats) and committed on-ledger so every node reads the SAME set. Returning []
- * keeps settlement a no-op, which is why the feature is safe to ship dormant.
+ * Read straight off the CHAIN, so every node settling this epoch reads the same set — the
+ * property M1 named as missing. The receipts are produced by verify.js (F6 redundancy, F16
+ * credit, the honesty rule) and committed by a verifier quorum in a RECEIPT transaction;
+ * this is only the reader.
+ *
+ * Returns [] when the epoch has no committed batch, which keeps settlement a no-op — the
+ * same safe default the stub had, now for a real reason rather than for lack of an
+ * implementation.
+ *
+ * ⚠️ Still gated by EPOCH_1_HEIGHT. Committing and reading receipts is deliberately
+ * SEPARATE from paying on them: turning payouts on needs rollout margin and real worker
+ * output from M0, so isEpochBoundary() stays false until that decision is made.
  */
-export function getVerifiedWorkReceipts(/* chain, epoch */) {
-    return [];
+export function getVerifiedWorkReceipts(chain, epoch) {
+    return receiptsForEpoch(chain, epoch);
 }
 
 /**
@@ -120,7 +129,20 @@ export function buildEpochTransactions({ height, treasuryBalance = 0, treasuryAd
     // rejected. It carries no value and is validated by state.js on its own terms.
     const commitment = normaliseRoot(checkpointRoot);
     const stateCommitment = normaliseRoot(snapshotRoot);
-    if (commitment || stateCommitment) {
+
+    // ── THE PENDING QUEUE'S ROOT ───────────────────────────────────────────────────
+    // The queue of debts this epoch could not cover used to live ONLY in memory
+    // (datachain.js treasuryPending) — never persisted, never in the snapshot, never
+    // rebuilt on replay. A restart reset it to empty, so two nodes with different uptimes
+    // carried different debts and would build different blocks. Committing its root makes
+    // the queue verifiable: a node can be handed the list by any peer and reject it unless
+    // it hashes to what the chain says.
+    //
+    // Computed from the batch's OUTPUT pending list, so the commitment describes the state
+    // the epoch actually ended in.
+    const pendingCommitment = pendingRoot(batch.pending);
+
+    if (commitment || stateCommitment || pendingCommitment) {
         txs.unshift({
             from: treasuryAddress,
             to: treasuryAddress,
@@ -136,13 +158,18 @@ export function buildEpochTransactions({ height, treasuryBalance = 0, treasuryAd
             // not a peer. Without this, the first sync has to trust whoever answers.
             snapshotRoot: stateCommitment || null,
             checkpointRoot: commitment || null,
+            // The PENDING-PAYMENT QUEUE root. null is a real value meaning "nothing is
+            // owed", not "unknown" — verifyPendingList treats an empty list and a null root
+            // as agreeing, so a node cannot be handed phantom debts for a settled epoch.
+            pendingRoot: pendingCommitment || null,
             epoch,
             timestamp: 0,
             isSystemGenerated: true,
             description: (commitment && stateCommitment)
                 ? "Model Checkpoint + State Root (epoch " + epoch + ")"
                 : (commitment ? "Model Checkpoint Root (epoch " + epoch + ")"
-                              : "State Snapshot Root (epoch " + epoch + ")")
+                              : (stateCommitment ? "State Snapshot Root (epoch " + epoch + ")"
+                                                 : "Pending Queue Root (epoch " + epoch + ")"))
         });
     }
 
@@ -154,10 +181,19 @@ export function buildEpochTransactions({ height, treasuryBalance = 0, treasuryAd
         // The CHECKPOINT tx carries no debt, so a null is held in its slot to keep this
         // index-aligned with `txs`. Without the placeholder every obligation would be
         // shifted by one and a rejected payout would re-queue the WRONG host's debt.
-        obligations: (commitment || stateCommitment) ? [null].concat(batch.payouts) : batch.payouts,
+        // ⚠️ COUNT THE PREPENDED TRANSACTIONS, DO NOT HARD-CODE ONE.
+        // This used to test a single condition and prepend a single null. The moment a
+        // second commitment transaction could be unshifted, every obligation shifted by one
+        // and a rejected payout re-queued the WRONG host's debt — money moved to the wrong
+        // account with nothing to show it had gone astray. Deriving the placeholder count
+        // from the same condition that builds the transactions keeps them in step.
+        obligations: (commitment || stateCommitment || pendingCommitment)
+            ? [null].concat(batch.payouts)
+            : batch.payouts,
         pending: batch.pending,
         checkpointRoot: commitment,
         snapshotRoot: stateCommitment,
+        pendingRoot: pendingCommitment,
         summary: {
             epoch,
             height: Number(height),
@@ -194,10 +230,14 @@ export function latestCommittedRoots(chain) {
             if (!tx || String(tx.type).toUpperCase() !== 'CHECKPOINT') continue;
             const snap = normaliseRoot(tx.snapshotRoot);
             const cp = normaliseRoot(tx.checkpointRoot) || normaliseRoot(tx.root);
-            if (snap || cp) {
+            const pend = normaliseRoot(tx.pendingRoot);
+            if (snap || cp || pend) {
                 return {
                     snapshotRoot: snap,
                     checkpointRoot: cp,
+                    // The pending-queue commitment. A node restoring its treasury debts
+                    // checks a peer-supplied list against THIS before trusting a single row.
+                    pendingRoot: pend,
                     epoch: Number(tx.epoch) || 0,
                     height: Number(block.index) || i
                 };

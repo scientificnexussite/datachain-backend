@@ -57,9 +57,23 @@ const receipts = [
         height: 8640, treasuryAddress: TREASURY, treasuryBalance: 0,
         epochPool: EPOCH_BLOCKS * 13, receipts
     });
-    A(r.txs.length === 0, 'an empty treasury emits no payout transactions');
+    // NOTE: `txs` is not empty any more, and that is the point. Nothing is PAID, but the
+    // two carried debts are committed via the pending-queue root — the state a restarting
+    // node must be able to recover. Assert on payouts specifically.
+    A(r.txs.filter(t => t.type === 'TRANSFER').length === 0,
+        'an empty treasury emits no payout transactions');
     A(r.pending.length === 2, 'both obligations are carried to the next epoch');
     A(r.summary.balanceAfter === 0, 'balance stays at zero, never negative');
+
+    // The queue is only recoverable if its root is on-chain. Without this the debts live
+    // in one node's memory, and two nodes with different uptimes build different blocks.
+    A(typeof r.pendingRoot === 'string' && /^[0-9a-f]{64}$/.test(r.pendingRoot),
+        'a carried queue commits its root on-chain');
+    const cp = r.txs.find(t => t.type === 'CHECKPOINT');
+    A(cp && cp.pendingRoot === r.pendingRoot, 'the root is carried in the CHECKPOINT tx');
+    A(cp && cp.amount === 0, 'the commitment moves no value');
+    A(r.obligations.length === r.txs.length && r.obligations[0] === null,
+        'the prepended commitment holds a null obligation slot, keeping the index aligned');
 }
 {
     // no treasury address configured -> safe no-op, queue preserved

@@ -65,7 +65,17 @@ class Validator {
 
   // ── Transaction payload validation ─────────────────────────────────────────
   validateTransactionPayload(tx) {
-    if (!tx.from || !tx.to || !tx.amount || !tx.type) return false;
+    if (!tx || !tx.from || !tx.to || !tx.type) return false;
+
+    // ZERO-VALUE COMMITMENT TYPES. `!tx.amount` is true for 0, so the original single-line
+    // guard rejected every transaction that legitimately moves nothing: CHECKPOINT (commits
+    // Merkle roots), NODE_ANNOUNCE (publishes a node address) and RECEIPT (records verified
+    // work). state.js ACCEPTS all three above the ledger lock, so rejecting them here would
+    // put this node on a different chain from one that applied them — the same class of
+    // divergence as the coinbase-type fork.
+    const type = String(tx.type).toUpperCase();
+    const ZERO_VALUE = type === 'CHECKPOINT' || type === 'NODE_ANNOUNCE' || type === 'RECEIPT';
+    if (!ZERO_VALUE && !tx.amount) return false;
 
     if (tx.isSystemGenerated) return true;
 

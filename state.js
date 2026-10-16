@@ -12,6 +12,8 @@ import {
 // F6 security bonds. Same reasoning as receipts: ONE definition of "is this bond valid",
 // shared by the ledger, the registry and the tests.
 import { validateBond, canRelease, BOND_DEFAULTS } from './bonds.js';
+// GOV_ROLE governance records (11 §9B): the SHAPE check, shared with Exe/core/gov-record.js.
+import { isWellFormedGovRole } from './gov-record.js';
 
 const fixDust = (num) => Number(Number(num).toFixed(8));
 
@@ -312,6 +314,20 @@ class State {
     // to `return false`, drops the transaction, and builds a DIFFERENT block. Every node must
     // run this build BEFORE the first NODE_ANNOUNCE is emitted. That is why announcing is
     // gated behind a settings flag that ships OFF — see Exe/core/announce.js.
+    // GOV_ROLE (2026-10-16; 11 §9B) — a governance appointment / removal / ban, signed by the
+    // appointer. Moves no value. Accepted when WELL-FORMED (gov-record.js, the same check the
+    // exe's state-db.js uses); who may make it, and whether the signature is genuine, is decided
+    // where the role list is rebuilt from blocks (Exe/core/gov-registry.js), so an unauthorised
+    // record changes nothing. ⚠️ CONSENSUS NOTE: as above, every node needs this branch before
+    // the first GOV_ROLE is mined, or it builds a different block.
+    if (String(type).toUpperCase() === 'GOV_ROLE') {
+      if (!isWellFormedGovRole(tx)) {
+        if (!isReplay) console.log(chalk.red('[LEDGER] Rejected GOV_ROLE: malformed record.'));
+        return false;
+      }
+      return true;
+    }
+
     if (String(type).toUpperCase() === 'NODE_ANNOUNCE') {
       const url = typeof tx.url === 'string' ? tx.url.trim() : '';
       const owner = from || to;

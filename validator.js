@@ -75,6 +75,7 @@ class Validator {
     // divergence as the coinbase-type fork.
     const type = String(tx.type).toUpperCase();
     const ZERO_VALUE = type === 'CHECKPOINT' || type === 'NODE_ANNOUNCE' || type === 'RECEIPT'
+                   || type === 'GOV_ROLE'      // a governance record (11 §9B) moves nothing; see gov-record.js
                    // A bond WITHDRAWAL carries no amount: UNBOND only starts a timer, and
                    // RELEASE returns a sum the ledger recorded rather than one the sender
                    // supplied. VERIFIER_BOND is absent on purpose — it moves value.

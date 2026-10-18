@@ -46,7 +46,10 @@ export const SNAPSHOT_TABLES = [
     'token_metadata',
     'open_tokens',
     'state_liquidity_pools',
-    'orders'
+    'orders',
+    // The on-chain trading book (Step 4, dex.js): ONE row, {id: 1, book: <JSON>}. A node that restores
+    // a snapshot and replays only the blocks above it needs the markets and open orders as they were.
+    'dex_book'
 ];
 
 // DELIBERATELY NOT SNAPSHOTTED, and why — both were verified against the live primary:

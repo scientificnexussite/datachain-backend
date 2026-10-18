@@ -8,6 +8,10 @@ import * as powpolicy from './powpolicy.js';
 import * as epoch from './epoch.js';
 import * as receipts from './receipts.js';
 import State from './state.js';
+// Consensus validation (step 4.3): the transaction rules (twin of Exe/core/txrules.js) and how
+// this node applies them on every path that accepts a block.
+import * as txrules from './txrules.js';
+import { cloneState, txFromRow, blocksFromRows, filterCandidates, verifyBranch } from './chain-rules.js';
 import config from './config.json' with { type: "json" };
 import pool from './db.js'; 
 import { Worker } from 'worker_threads'; 
@@ -68,6 +72,13 @@ pool.query(`
 pool.query(`
     ALTER TABLE transactions ADD COLUMN IF NOT EXISTS price_usd DOUBLE PRECISION;
 `).catch(err => console.warn('[DB] price_usd migration warning (safe to ignore if column exists):', err.message));
+
+// Consensus step 4.3 (2026-10-17): every transaction is also stored EXACTLY as it went into its
+// block. The mapped columns above lose fields (url, targetKey, boundKey, nonce, hash …) and add
+// empty ones, so a block loaded back from them no longer carries verifiable signatures.
+pool.query(`
+    ALTER TABLE transactions ADD COLUMN IF NOT EXISTS tx_json TEXT;
+`).catch(err => console.warn('[DB] tx_json migration warning:', err.message));
 
 class Block {
   constructor(index, timestamp, data, previousHash = '') {
@@ -146,6 +157,10 @@ class DataChain {
     this.chain = [];
     this.difficulty = 2;
     this.state = new State();
+    // Consensus step 4.3: minimal blocks (index, timestamp, transactions) for the WHOLE chain —
+    // this node keeps block bodies in memory for only its last 10 blocks, but the rules need every
+    // transaction ever mined (replay protection) and every key registration.
+    this._ruleBlocks = [];
     this.priceHistoryCache = [];
     this.blockCount = 0;
     
@@ -192,19 +207,12 @@ class DataChain {
             const txsByBlock = {};
             txRes.rows.forEach(tx => {
                 if (!txsByBlock[tx.block_index]) txsByBlock[tx.block_index] = [];
-                const parsedTx = {
-                    from: tx.from_address, to: tx.to_address, amount: parseFloat(tx.amount),
-                    type: tx.type, tokenSymbol: tx.token_symbol, timestamp: parseInt(tx.timestamp_ms)
-                };
-                if (tx.amount_usd) parsedTx.amountUsd = parseFloat(tx.amount_usd);
-                if (tx.price_usd) parsedTx.priceUsd = parseFloat(tx.price_usd);
-                if (tx.is_system_generated) parsedTx.isSystemGenerated = true;
-                if (tx.signature) parsedTx.signature = tx.signature;
-                if (tx.public_key) parsedTx.publicKey = tx.public_key;
-                if (tx.platform_type) parsedTx.platformType = tx.platform_type;
-                if (tx.description) parsedTx.description = tx.description;
-                txsByBlock[tx.block_index].push(parsedTx);
+                // tx_json when stored (step 4.3): the transaction exactly as mined.
+                txsByBlock[tx.block_index].push(txFromRow(tx));
             });
+            // The rule index needs EVERY transaction, not just the last 10 blocks' (step 4.3).
+            const allTx = await pool.query('SELECT * FROM transactions ORDER BY block_index ASC, id ASC');
+            this._ruleBlocks = blocksFromRows(allTx.rows);
 
             this.chain = blockRes.rows.map(b => {
                 const isRecent = (this.blockCount - b.index) <= 10;
@@ -235,6 +243,8 @@ class DataChain {
                 return block;
             });
             this.blockCount = this.chain.length;
+            this._ruleBlocks = this.chain.filter(b => Array.isArray(b.data))
+                .map(b => ({ index: b.index, timestamp: b.timestamp, data: b.data }));
             
             await this.state.loadSnapshot(this.chain);
             await this.rebuildPriceHistory();
@@ -315,7 +325,21 @@ class DataChain {
     }
   }
 
+  /** Add an accepted block to the rule index (step 4.3). */
+  _indexBlock(block) {
+      if (block && Array.isArray(block.data)) this._ruleBlocks.push({ index: block.index, timestamp: block.timestamp, data: block.data });
+  }
+
   async resolveConflict(newBlocks) {
+      // Peers send plain JSON; the validator needs real blocks (calculateHash). The merkle root
+      // and hash stay what the peer sent, so a body that does not match them is caught.
+      newBlocks = (Array.isArray(newBlocks) ? newBlocks : []).map(b => {
+          if (b instanceof Block) return b;
+          const block = new Block(b.index, b.timestamp, b.data, b.previousHash);
+          block.nonce = b.nonce; block.hash = b.hash;
+          if (b.merkleRoot) block.merkleRoot = b.merkleRoot;
+          return block;
+      });
       if (newBlocks.length <= this.blockCount) {
           console.log(chalk.yellow('[NETWORK] Received chain is not longer than current chain. Rejecting fork.'));
           return false;
@@ -330,9 +354,25 @@ class DataChain {
           }
       }
       
+      // From txrules.RULES_1_HEIGHT the peer's branch must pass the rules and the overspend floor
+      // (step 4.3). This node has no ledger journal, so a fork that would REPLACE rules-era blocks
+      // cannot be verified here and is refused — fail closed, never trusted.
+      let forkAt = Math.min(this.chain.length, newBlocks.length);
+      for (let i = 0; i < forkAt; i++) {
+          if (!newBlocks[i] || this.chain[i].hash !== newBlocks[i].hash) { forkAt = i; break; }
+      }
+      const verdict = verifyBranch({ blocks: newBlocks, forkAt, ourLength: this.chain.length,
+                                     ruleBlocks: this._ruleBlocks, state: this.state, StateClass: State });
+      if (!verdict.ok) {
+          console.log(chalk.red(`[RULES] Refusing the peer chain at block #${verdict.block}: ${verdict.why}`));
+          return false;
+      }
+
       console.log(chalk.green.bold('[NETWORK] Chain Reorganization Triggered! Adopting longest P2P chain.'));
       this.chain = newBlocks;
       this.blockCount = newBlocks.length;
+      this._ruleBlocks = newBlocks.filter(b => Array.isArray(b.data))
+          .map(b => ({ index: b.index, timestamp: b.timestamp, data: b.data }));
       await pool.query('TRUNCATE blocks, transactions CASCADE');
       await this.syncAllToDB();
       await this.state.loadSnapshot(this.chain);
@@ -354,8 +394,8 @@ class DataChain {
               if (typeof block.data !== 'string') {
                   for (const tx of block.data) {
                       await client.query(
-                          `INSERT INTO transactions (block_index, from_address, to_address, amount, amount_usd, price_usd, type, token_symbol, timestamp_ms, is_system_generated, signature, public_key, platform_type, description) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
-                          [block.index, tx.from, tx.to, tx.amount, tx.amountUsd || 0, tx.priceUsd || 0, tx.type, tx.tokenSymbol || 'SYR', tx.timestamp, !!tx.isSystemGenerated, tx.signature || '', tx.publicKey || '', tx.platformType || '', tx.description || '']
+                          `INSERT INTO transactions (block_index, from_address, to_address, amount, amount_usd, price_usd, type, token_symbol, timestamp_ms, is_system_generated, signature, public_key, platform_type, description, tx_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+                          [block.index, tx.from, tx.to, tx.amount, tx.amountUsd || 0, tx.priceUsd || 0, tx.type, tx.tokenSymbol || 'SYR', tx.timestamp, !!tx.isSystemGenerated, tx.signature || '', tx.publicKey || '', tx.platformType || '', tx.description || '', JSON.stringify(tx)]
                       );
                   }
               }
@@ -404,8 +444,8 @@ class DataChain {
               if (parseInt(txCheck.rows[0].count) === 0) {
                   for (const tx of latestBlock.data) {
                       await client.query(
-                          `INSERT INTO transactions (block_index, from_address, to_address, amount, amount_usd, price_usd, type, token_symbol, timestamp_ms, is_system_generated, signature, public_key, platform_type, description) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
-                          [latestBlock.index, tx.from, tx.to, tx.amount, tx.amountUsd || 0, tx.priceUsd || 0, tx.type, tx.tokenSymbol || 'SYR', tx.timestamp, !!tx.isSystemGenerated, tx.signature || '', tx.publicKey || '', tx.platformType || '', tx.description || '']
+                          `INSERT INTO transactions (block_index, from_address, to_address, amount, amount_usd, price_usd, type, token_symbol, timestamp_ms, is_system_generated, signature, public_key, platform_type, description, tx_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+                          [latestBlock.index, tx.from, tx.to, tx.amount, tx.amountUsd || 0, tx.priceUsd || 0, tx.type, tx.tokenSymbol || 'SYR', tx.timestamp, !!tx.isSystemGenerated, tx.signature || '', tx.publicKey || '', tx.platformType || '', tx.description || '', JSON.stringify(tx)]
                       );
                   }
               }
@@ -485,6 +525,21 @@ class DataChain {
       }
   }
 
+  /**
+   * SYR in circulation: every positive balance except `system`, the keyless mint authority.
+   * SYR is UNCAPPED (owner's 18B decision D4, 2026-10-16), so this is the supply figure — there
+   * is no maximum and nothing "remaining". (Its frozen ~6B row is retired at block 1,200, D1.)
+   */
+  getCirculatingSupply(tokenSymbol = "SYR") {
+    const balances = this.state.balances[tokenSymbol] || {};
+    let total = 0;
+    for (const address in balances) {
+      if (address !== "system" && balances[address] > 0) total += balances[address];
+    }
+    return total;
+  }
+
+  /** LEGACY (12B display basis) — no longer used for any figure the API reports (D4). */
   getRemainingSupply(tokenSymbol = "SYR") {
     if (tokenSymbol !== "SYR") return 0;
     
@@ -615,9 +670,20 @@ class DataChain {
         description: "AI Treasury Emission"
     };
 
-    const tempState = new State();
-    tempState.balances = JSON.parse(JSON.stringify(this.state.balances));
-    tempState.usd_balances = { ...this.state.usd_balances };
+    // A FULL copy (step 4.3): the old copy carried only balances and USD balances and then
+    // REPLACED the live state, dropping pools, nodes, registries, receipts and bonds from memory.
+    const tempState = cloneState(this.state, State);
+    // One-time ledger corrections for this height, before any transaction (step 4.4, D1).
+    tempState.applyCorrections(this.blockCount);
+
+    // From txrules.RULES_1_HEIGHT only transactions the rules accept go in (step 4.3).
+    const rulesOn = txrules.rulesActive(this.blockCount);
+    const ruleIx = rulesOn ? txrules.ruleIndex(this._ruleBlocks) : null;
+    if (rulesOn) {
+        const f = filterCandidates(transactions, { height: this.blockCount, timestamp: Date.now(), ctx: ruleIx.ctx() });
+        f.dropped.forEach(d => console.log(chalk.red(`[RULES] Left out ${d.tx && d.tx.from} -> ${d.tx && d.tx.to}: ${d.why}`)));
+        transactions = f.kept;
+    }
 
     const validTransactions = [];
     if (minerReward > 0)    { tempState.applyTransaction(rewardTx, currentPrice, false);   validTransactions.push(rewardTx); }
@@ -684,7 +750,7 @@ class DataChain {
           continue; // Instantly skip this transaction, permanently dropping it from the chain
       }
 
-      if (tempState.applyTransaction(tx, currentPrice, false)) {
+      if (tempState.applyTransaction(tx, currentPrice, false, { floor: rulesOn, height: this.blockCount })) {
         validTransactions.push(tx);
       } else {
         console.log(chalk.red(`[VALIDATION] Tx dropped due to insufficient funds/conflict: ${tx.from} -> ${tx.to}`));
@@ -696,10 +762,19 @@ class DataChain {
     await newBlock.mineBlock(this.difficulty, powpolicy.targetHexForHeight(this.chain, newBlock.index)); 
 
     if (!validator.validateBlock(newBlock, this.getLatestBlock(), this.difficulty, this.chain)) return false;
+    // The block this node built must pass the same rules every node applies (step 4.3).
+    if (rulesOn) {
+        const r = txrules.checkBlock(newBlock, ruleIx.ctx());
+        if (!r.ok) {
+            console.log(chalk.red('[RULES] This node built a block the rules refuse: ' + r.errors.map(e => e.why).join('; ')));
+            return false;
+        }
+    }
 
     this.chain.push(newBlock);
     this.blockCount++;
     this.state = tempState;
+    this._indexBlock(newBlock);
     
     this.adjustDifficulty();
     await this.appendPriceHistory(newBlock); 

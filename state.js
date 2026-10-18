@@ -14,6 +14,16 @@ import {
 import { validateBond, canRelease, BOND_DEFAULTS } from './bonds.js';
 // GOV_ROLE governance records (11 §9B): the SHAPE check, shared with Exe/core/gov-record.js.
 import { isWellFormedGovRole } from './gov-record.js';
+// KEY_REGISTER key-registry records (09/R116, D3): the SHAPE check, shared with Exe/core/key-record.js.
+import { isWellFormedKeyRegister } from './key-record.js';
+// One-time ledger corrections (consensus step 4.4, D1), shared with Exe/core/txrules.js.
+import { correctionsAt, txId, rules2Active, RULES_DEFAULTS } from './txrules.js';
+// On-chain trading (seven-phase plan Step 4): ONE engine for both ledgers (Exe/core/dex.js is its mirror).
+import * as dex from './dex.js';
+import { canonicalSpki } from './gov-record.js';
+import { OWNER_KEY } from './key-record.js';
+// Escrow (consensus step 4.5): where locked coins wait, shared with Exe/core/escrow.js.
+import { ESCROW_ADDRESS } from './escrow.js';
 
 const fixDust = (num) => Number(Number(num).toFixed(8));
 
@@ -113,11 +123,33 @@ class State {
     // back, or bonding reads as a burn.
     this.bonds = {};
 
+    // ── ON-CHAIN TRADING (Step 4, dex.js) ────────────────────────────────────────────
+    // The book: markets, open orders, the ticker book, SDTX issuance. Derived from blocks like
+    // balances; persisted with them. rules2Height / dexOwnerKey are instance values so tests can
+    // switch RULES_2 on and use their own owner key (Exe/core/state-db.js does the same).
+    this.dex = dex.emptyBook();
+    this.rules2Height = RULES_DEFAULTS.RULES_2_HEIGHT;
+    this.dexOwnerKey = OWNER_KEY;
+
     const volumeDir = process.env.RAILWAY_VOLUME_MOUNT_PATH || '/app/data';
     this.snapshotFile = path.join(volumeDir, 'state_snapshot.json');
     
     this.isSaving = false;
     this.saveQueue = false;
+  }
+
+  // ── on-chain trading helpers (Step 4) ─────────────────────────────────────────────
+  _rules2(height) { return height !== null && height !== undefined && rules2Active(height, { RULES_2_HEIGHT: this.rules2Height }); }
+
+  _dexCtx(tx, height) {
+    return { height, id: txId(tx), signerKey: canonicalSpki(tx.publicKey), ownerKey: this.dexOwnerKey,
+             balanceOf: (a, t) => (this.balances[t] || {})[a] || 0 };
+  }
+
+  /** A trading balance change, applied exactly as Exe/core/state-db.js _applyUnits applies it. */
+  _setUnits(address, token, delta) {
+    if (!this.balances[token]) this.balances[token] = {};
+    this.balances[token][address] = dex.applyUnits(this.balances[token][address] || 0, delta);
   }
 
   getUsd(address) { 
@@ -219,6 +251,32 @@ class State {
    * transfer path below skips crediting it for exactly the same reason. Crediting it here
    * would invent a balance the exe does not have.
    */
+  /**
+   * One-time LEDGER CORRECTIONS (consensus step 4.4; txrules.LEDGER_CORRECTIONS): applied when
+   * block `height` is applied, BEFORE its transactions — the same in Exe/core/state-db.js. Every
+   * path that applies or replays a block calls this (datachain.js addBlock, chain-rules.js
+   * applyBlockTo, the replays in loadSnapshot).
+   */
+  applyCorrections(height) {
+    for (const c of correctionsAt(height)) {
+      if (!this.balances[c.token]) this.balances[c.token] = {};
+      this.balances[c.token][c.address] = c.setTo;
+    }
+  }
+
+  /** Can `payer` afford this deploy's fees (the same amounts _applyDeployFees debits)? */
+  _canPayDeployFees(payer, chain, meta) {
+    const bal = (t) => (this.balances[t] && this.balances[t][payer]) || 0;
+    if (chain === 'openchain') {
+      if (bal('SDX') < OPENCHAIN_PLATFORM_FEE_SDX) return false;
+      const networkFee = Number(meta.networkFeeSyr) || 0;
+      if (networkFee > 0 && String(meta.networkFeeTo || '') && bal('SYR') < networkFee) return false;
+      return true;
+    }
+    const feeSyr = Number(meta.feeSyr) || 0;
+    return !(feeSyr > 0 && bal('SYR') < feeSyr);
+  }
+
   _payDeployFee(payer, tokenSymbol, amount, to) {
     if (!(amount > 0)) return;
     this._adjustBalance(payer, tokenSymbol, -amount);
@@ -258,8 +316,20 @@ class State {
     }
   }
 
-    applyTransaction(tx, currentPrice = 0, isReplay = false) {
+    // `floor` (consensus step 4.3): true for blocks from txrules.RULES_1_HEIGHT on — see TOKEN_DEPLOY.
+    applyTransaction(tx, currentPrice = 0, isReplay = false, { floor = false, height = null } = {}) {
     let { from, to, type } = tx;
+
+    // ON-CHAIN TRADING (Step 4): the engine decides — the same one Exe/core/state-db.js uses. Valid
+    // only from RULES_2 (txrules), so a caller that does not say the height gets a refusal.
+    if (dex.DEX_TYPES.includes(type)) {
+      if (!this._rules2(height)) return false;
+      const r = dex.applyDexTx(this.dex, tx, this._dexCtx(tx, height));
+      if (!r.ok) { console.log(chalk.red(`[LEDGER] Rejected ${type}: ${r.why}`)); return false; }
+      for (const [a, t, d] of r.deltas) this._setUnits(a, t, d);
+      this.dex = r.book;
+      return true;
+    }
 
     // CHECKPOINT (F15) — commits the epoch's model-checkpoint Merkle root on-chain, so every
     // node agrees on the one true model and can verify any chunk against it. It moves NO
@@ -323,6 +393,20 @@ class State {
     if (String(type).toUpperCase() === 'GOV_ROLE') {
       if (!isWellFormedGovRole(tx)) {
         if (!isReplay) console.log(chalk.red('[LEDGER] Rejected GOV_ROLE: malformed record.'));
+        return false;
+      }
+      return true;
+    }
+
+    // KEY_REGISTER (2026-10-17; 09/R116, D3) — binds a weak address to the full key it was cut
+    // from, signed by that key AND co-signed by the owner. Moves no value. Accepted when
+    // WELL-FORMED (key-record.js, the same check the exe's state-db.js uses); whether both
+    // signatures are genuine and the address was still free is decided where the registry is
+    // rebuilt from blocks and, from RULES_1_HEIGHT, by txrules.js for the whole block.
+    // ⚠️ CONSENSUS NOTE: as above, every node needs this branch before the first one is mined.
+    if (type === 'KEY_REGISTER') {
+      if (!isWellFormedKeyRegister(tx)) {
+        if (!isReplay) console.log(chalk.red('[LEDGER] Rejected KEY_REGISTER: malformed record.'));
         return false;
       }
       return true;
@@ -404,14 +488,37 @@ class State {
         ? 'openchain' : 'delchain';
 
       // ── FEES, DEBITED INSIDE THE TRANSACTION ─────────────────────────────────────
-      this._applyDeployFees(creator, chain, meta);
+      // The overspend floor (consensus step 4.3, 2026-10-17): FROM txrules.RULES_1_HEIGHT a deploy
+      // whose creator cannot pay its fee is refused, like any other overspend. Below that height
+      // the fee is still debited without a floor (old blocks must replay as they were mined), so
+      // the caller says which applies: `floor` is set by datachain.js / api.js for rules-era
+      // blocks only. Mirrored in Exe/core/state-db.js strictCheck (parity-tested).
+      // THE TICKER BOOK, AND FROM RULES_2 THE FEE (Step 4, dex.js; as Exe/core/state-db.js): every
+      // deploy is recorded (first one wins). From RULES_2 the ticker must be new and the fee is the
+      // engine's; before it, the fee the transaction carries is charged as it always was.
+      const rules2 = this._rules2(height);
+      const dep = dex.applyDeploy(this.dex, tx, this._dexCtx(tx, height), { rules2 });
+      if (!dep.ok) { console.log(chalk.red(`[LEDGER] Rejected TOKEN_DEPLOY: ${dep.why}`)); return false; }
+      if (rules2) {
+        for (const [payer, t, u, feeTo] of dep.fees) {
+          this._setUnits(payer, t, -u);
+          if (feeTo !== 'system') this._setUnits(feeTo, t, u);
+        }
+      } else {
+        if (!isReplay && floor && !this._canPayDeployFees(creator, chain, meta)) {
+          console.log(chalk.red('[LEDGER] Rejected TOKEN_DEPLOY: the creator cannot pay the deploy fee.'));
+          return false;
+        }
+        this._applyDeployFees(creator, chain, meta);
+      }
+      this.dex = dep.book;
 
       if (chain === 'openchain') {
         // The supply goes to a hidden, network-held address — NOT the creator's wallet
         // (api.js:4082-4099). The address is carried in the transaction because it is
         // generated randomly at creation: regenerating it here would put the supply
         // somewhere new on every replay.
-        const supplyTo = String(meta.supplyTo || '') ||
+        const supplyTo = (rules2 && dep.supplyTo) || String(meta.supplyTo || '') ||
                          ('nx_open_' + ticker.toLowerCase() + '_system');
         this.openTokens[ticker] = {
           ticker,
@@ -709,6 +816,24 @@ class State {
       return true;
     }
 
+    // ── ESCROW (consensus step 4.5, escrow.js) ──────────────────────────────────
+    // Below the ledger lock: these move value. LOCK seller -> the keyless escrow address;
+    // RELEASE escrow -> the buyer; REFUND escrow -> back to the seller. Which escrow, and whether
+    // it may close, is judged by txrules.js against the escrow book; this only moves the coins,
+    // refusing an overspend like a transfer. Mirrored in Exe/core/state-db.js (parity-tested).
+    if (type === 'ESCROW_LOCK' || type === 'ESCROW_RELEASE' || type === 'ESCROW_REFUND') {
+      const src = type === 'ESCROW_LOCK' ? from : ESCROW_ADDRESS;
+      const dst = type === 'ESCROW_LOCK' ? ESCROW_ADDRESS : (type === 'ESCROW_RELEASE' ? to : from);
+      const bal = this.balances[tokenSymbol][src] || 0;
+      if (!isReplay && bal < amount) {
+        console.log(chalk.red(`[LEDGER] Rejected ${type}: insufficient ${tokenSymbol}.`));
+        return false;
+      }
+      this.balances[tokenSymbol][src] = fixDust(bal - amount);
+      this.balances[tokenSymbol][dst] = fixDust((this.balances[tokenSymbol][dst] || 0) + amount);
+      return true;
+    }
+
     let sender = from;
     let receiver = to;
 
@@ -792,6 +917,8 @@ class State {
         // restart would silently destroy that money — the balance is already gone from the
         // balances map, so nothing else remembers it exists.
         if (snap.bonds           && typeof snap.bonds === 'object')           this.bonds = snap.bonds;
+        // The trading book (Step 4): open orders hold locked coins; like bonds, it must survive.
+        if (snap.dex             && typeof snap.dex === 'object')             this.dex = dex.readBook(snap.dex);
         const n = Object.keys(this.tokens).length + Object.keys(this.openTokens).length;
         if (n > 0) console.log(chalk.cyan(`[STATE] Loaded ${n} token registry record(s) from snapshot.`));
     } catch (e) {
@@ -816,6 +943,12 @@ class State {
             if (!this.balances[row.token_symbol]) this.balances[row.token_symbol] = {};
             this.balances[row.token_symbol][row.address] = parseFloat(row.balance);
         }
+
+        // The trading book (Step 4): one row, as the snapshot route serves it (dex_book).
+        try {
+            const dexRes = await pool.query('SELECT book FROM dex_book WHERE id = 1');
+            if (dexRes.rows.length) this.dex = dex.readBook(dexRes.rows[0].book);
+        } catch (dexErr) { /* no table yet: the book from the file (or a new one) stands */ }
 
         // Task B — Load persisted liquidity pool reserves from DB.
         try {
@@ -844,6 +977,7 @@ class State {
         this.balances = { "SYR": {} };
         this.usd_balances = {};
         this.liquidityPools = {};
+        this.dex = dex.emptyBook();                // chain-derived: the replay below rebuilds it
 
         // ⚠️ `tokens`, `openTokens`, `openTokenSupply`, `epochReceipts` AND `bonds` ARE
         // DELIBERATELY NOT CLEARED.
@@ -857,20 +991,28 @@ class State {
 
         try {
             const allTxs = await pool.query("SELECT * FROM transactions ORDER BY block_index ASC, timestamp_ms ASC, id ASC");
+            let atBlock = null;
             for (const row of allTxs.rows) {
-                const tx = {
+                // Step 4.4: a block's one-time corrections come before its first transaction.
+                if (row.block_index !== atBlock) { atBlock = row.block_index; this.applyCorrections(Number(atBlock)); }
+                // The transaction exactly as mined (tx_json, step 4.3) when stored: a trading record
+                // rebuilt from columns alone would have lost its side, price, deadline and keys.
+                let tx = null;
+                if (typeof row.tx_json === 'string' && row.tx_json) { try { tx = JSON.parse(row.tx_json); } catch (e) { tx = null; } }
+                if (!tx || typeof tx !== 'object') tx = {
                     from: row.from_address, to: row.to_address, amount: parseFloat(row.amount),
                     amountUsd: parseFloat(row.amount_usd), type: row.type, tokenSymbol: row.token_symbol,
                     priceUsd: parseFloat(row.price_usd)
                 };
-                this.applyTransaction(tx, 0, true); 
+                this.applyTransaction(tx, 0, true, { height: Number(row.block_index) });
             }
         } catch(dbErr) {
              console.log(chalk.red("[STATE] DB Replay failed. Attempting memory object fallback..."));
              for (let i = 0; i < chain.length; i++) {
                 const block = chain[i];
+                this.applyCorrections(block.index);          // step 4.4
                 if (typeof block.data === 'string') continue;
-                for (const tx of block.data) this.applyTransaction(tx, 0, true); 
+                for (const tx of block.data) this.applyTransaction(tx, 0, true, { height: block.index });
              }
         }
         
@@ -911,6 +1053,8 @@ class State {
               // F6 security bonds. MUST be persisted: the SYR has already been debited from
               // the balances map, so this record is the only thing that knows it is owed back.
               bonds: this.bonds,
+              // The trading book (Step 4): open orders hold locked coins, markets hold reserves.
+              dex: this.dex,
               lastIndex
           };
           const tempFile = this.snapshotFile + '.tmp';
@@ -923,6 +1067,9 @@ class State {
           await client.query('BEGIN');
           
           await client.query('INSERT INTO state_meta (id, last_index) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET last_index = $1', [lastIndex]);
+          // The trading book (Step 4), one row: what api.js's snapshot route serves as `dex_book`.
+          await client.query('CREATE TABLE IF NOT EXISTS dex_book (id INT PRIMARY KEY, book TEXT NOT NULL)');
+          await client.query('INSERT INTO dex_book (id, book) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET book = $1', [JSON.stringify(this.dex)]);
           
           const usdAddresses = Object.keys(this.usd_balances);
           const usdBalances = Object.values(this.usd_balances);

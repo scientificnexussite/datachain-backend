@@ -16,12 +16,17 @@ import pool from './db.js';
 import mempool from './mempool.js';
 import { DataChain, Block } from './datachain.js';
 import validator from './validator.js';
+// Consensus validation (step 4.3): /submit-block checks a block on a COPY of the ledger.
+import State from './state.js';
+import * as txrules from './txrules.js';
+import { checkBlockOn } from './chain-rules.js';
+import { admitSigned, txStatus } from './relay.js';   // Step 3: the relay of browser-signed transactions
 import menuBook, { processReferralBonus } from './menubook.js'; // IMPROVEMENT 4 Ã¢â‚¬â€ static import
 import { initP2P, broadcastP2P } from './p2p.js';
 import config from './config.json' with { type: 'json' };
 import { autoban, sanitize, anomalyDetect, bruteForceGuard, guardWebSocket, logSecurityEvent } from './security.js';
 import { acquireTradeLock, releaseTradeLock, checkAntiSandwich, initVirtualReserves, getEffectivePrice, checkGraduation } from './amm.js';
-import { startNoiseTrader, recordHumanTrade } from './noise-trader.js';
+import { recordHumanTrade } from './noise-trader.js';
 import { updateTWAP, getTWAP } from './twap.js';
 // Stripe removed Ã¢â‚¬â€ KYC verification system disabled. No USA address/number required.
 
@@ -1690,7 +1695,7 @@ app.get('/tokens', readLimiter, async (req, res) => {
                     if (bal > 0) totalHolders++;
                 }
             }
-            const supply    = ticker === 'SYR' ? (MAX_SUPPLY - nexusChain.getRemainingSupply('SYR')) : totalCirculating;
+            const supply    = ticker === 'SYR' ? nexusChain.getCirculatingSupply('SYR') : totalCirculating;   // D4: uncapped
             const lastPrice = menuBook.books[ticker]?.lastTradePrice || 0;
             const meta      = mintDataMap.get(ticker) || { description: '', platformType: '', owner: '', initialPrice: 0, isVerified: false, logoUrl: '' };
 
@@ -2336,7 +2341,7 @@ app.post('/menubook/market', txLimiter, requireWeb3Auth, async (req, res) => {
 
                 // Bootstrap pool on first trade if reserves are empty
                 if (lp.tokenReserve <= 0 || lp.usdReserve <= 0) {
-                    const circulatingSupply = MAX_SUPPLY - nexusChain.getRemainingSupply('SYR');
+                    const circulatingSupply = nexusChain.getCirculatingSupply('SYR');
                     lp.tokenReserve = Math.max(5_000_000, circulatingSupply * 0.05);
                     lp.usdReserve = lp.tokenReserve * currentPrice;
                 }
@@ -2759,14 +2764,21 @@ app.get('/stats', async (req, res) => {
             apiCache.stats.data.priceChange24h = price24hAgo > 0 ? parseFloat((((currentPrice - price24hAgo) / price24hAgo) * 100).toFixed(2)) : 0;
             return res.json(apiCache.stats.data);
         }
-        const remaining = nexusChain.getRemainingSupply('SYR');
+        // UNCAPPED (owner's 18B decision D4, 2026-10-16; F23): a flat 15 SYR per block (2 miner +
+        // 13 AI treasury) forever, so there is no maxSupply and nothing remaining — the old
+        // '12B / remaining' pair described a cap that does not exist. Same contract as the exe.
+        const circulating = nexusChain.getCirculatingSupply('SYR');
         priceChange24h = price24hAgo > 0 ? parseFloat((((currentPrice - price24hAgo) / price24hAgo) * 100).toFixed(2)) : 0;
         apiCache.stats.data = {
-            maxSupply: MAX_SUPPLY,
-            remainingSupply: remaining,
-            circulatingSupply: MAX_SUPPLY - remaining,
+            maxSupply: null,
+            supplyCapped: false,
+            emissionPerBlock: { total: 15, miner: 2, treasury: 13 },
+            remainingSupply: null,
+            circulatingSupply: circulating,
+            totalSupply: circulating,
+            systemBalance: nexusChain.getBalance('system', 'SYR') || 0,
             currentPrice,
-            marketCap: (MAX_SUPPLY - remaining) * currentPrice,
+            marketCap: circulating * currentPrice,
             volume24h,
             priceChange24h,
             lastTradeTimestamp
@@ -2868,10 +2880,31 @@ app.get('/quick-stats/:ticker', readLimiter, (req, res) => {
     res.json({ ticker, supply, handlerSupply, holders, lastPrice, ownerAddress });
 });
 
-app.get('/supply',        (req, res) => res.json({ remainingSupply: nexusChain.getRemainingSupply('SYR') }));
+app.get('/supply',        (req, res) => res.json({ circulatingSupply: nexusChain.getCirculatingSupply('SYR'), supplyCapped: false, remainingSupply: null }));   // D4
 app.get('/miner-balance', (req, res) => res.json({ address: config.blockchain.miner_address, balance: nexusChain.getBalance(config.blockchain.miner_address, 'SYR') }));
 
 // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Transaction Submission Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// ── Step 3 (2026-10-18): the relay of BROWSER-SIGNED transactions ─────────────────────────
+// The twin of Exe local-api POST /api/tx/submit. The visitor's browser signs; this node holds no
+// key and signs nothing. relay.js admits it with txadmit.js (mirrored in the exe): the block rules
+// at the next height, replay, the ledger floor plus what the sender already has waiting.
+const relayLimiter = rateLimit({ windowMs: 60000, max: 30, standardHeaders: true, legacyHeaders: false,
+    message: { success: false, code: 'rate-limited', why: 'too many transactions from this connection: wait a minute' } });
+app.post('/api/tx/submit', relayLimiter, async (req, res) => {
+    try {
+        const syrBook = menuBook.books && menuBook.books['SYR'];
+        const r = await admitSigned(req.body, { source: 'relay', nexusChain, price: (syrBook && syrBook.lastTradePrice) || 0, broadcast: broadcastP2P });
+        if (!r.success) return res.status(r.status || 400).json({ success: false, code: r.code, why: r.why, error: r.why, message: r.why });
+        res.status(r.status).json(Object.assign(r, { message: r.already ? 'Already waiting for a block.' : 'Accepted. It waits for the next block.' }));
+    } catch (e) {
+        res.status(500).json({ success: false, code: 'error', why: 'this node could not check the transaction', message: 'this node could not check the transaction' });
+    }
+});
+app.get('/api/tx/:hash/status', async (req, res) => {
+    const s = await txStatus(req.params.hash, { nexusChain });
+    res.status(s.status === 'invalid' ? 400 : 200).json(s);
+});
+
 app.post('/tx/new', txLimiter, requireWeb3Auth, async (req, res) => {
     try {
         const { signature, publicKey, uid, ...payloadData } = req.body;
@@ -6647,18 +6680,23 @@ app.get('/p2p/my-trades', readLimiter, requireWeb3Auth, async (req, res) => {
                 return res.status(400).json({ error: 'Block failed validation (proof of work, hash or merkle root).' });
             }
 
-            // Apply the block's transactions to state. A transaction the ledger refuses is
-            // fatal for the whole block: accepting it partially would leave this node's
-            // state disagreeing with the block it just stored.
+            // Apply the block's transactions to a COPY of the state (step 4.3). A transaction the
+            // ledger refuses is fatal for the whole block — and because the copy is thrown away,
+            // a refusal halfway through no longer leaves the live state partly changed. From
+            // txrules.RULES_1_HEIGHT the block must also pass the transaction rules and the
+            // overspend floor.
             const price = await nexusChain.getLastMarketPrice(0.50);
-            for (const tx of block.data) {
-                if (!nexusChain.state.applyTransaction(tx, price, false)) {
-                    return res.status(400).json({ error: 'Block contains a transaction the ledger rejected.' });
-                }
+            const checked = checkBlockOn(block, { index: txrules.ruleIndex(nexusChain._ruleBlocks || []), state: nexusChain.state,
+                                                  StateClass: State, price, replayBelowRules: false });
+            if (!checked.ok) {
+                return res.status(400).json({ error: 'Block refused: ' +
+                    checked.errors.map(e => (e.index >= 0 ? `tx ${e.index}: ` : '') + e.why).join('; ') });
             }
+            nexusChain.state = checked.state;
 
             nexusChain.chain.push(block);
             nexusChain.blockCount = nexusChain.chain.length;
+            if (typeof nexusChain._indexBlock === 'function') nexusChain._indexBlock(block);
             await nexusChain.saveChain();
             await nexusChain.state.saveSnapshot(nexusChain.blockCount - 1);
             broadcastP2P({ type: 'BROADCAST_BLOCK', data: block });
@@ -6738,8 +6776,8 @@ app.get('/p2p/my-trades', readLimiter, requireWeb3Auth, async (req, res) => {
     server.listen(port, '0.0.0.0', () => {
         console.log(chalk.blue.bold(`--- SCIENTIFIC NEXUS API RUNNING ON PORT ${port} ---`));
 
-        // Start background systems
-        startNoiseTrader(nexusChain.state, wss);
+        // The NOISE TRADER is not started (owner, 2026-10-17): prices move only from real trades
+        // — on-chain from RULES_2 (dex.js). noise-trader.js stays for its recordHumanTrade helper.
 
         // Ledger self-check. ~70,300 SYR sat unexplained in the balances snapshot for
         // MONTHS because nothing ever compared balances against their own transaction

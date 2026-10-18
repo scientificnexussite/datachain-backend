@@ -128,6 +128,9 @@ class State {
     // balances; persisted with them. rules2Height / dexOwnerKey are instance values so tests can
     // switch RULES_2 on and use their own owner key (Exe/core/state-db.js does the same).
     this.dex = dex.emptyBook();
+    // This block's swaps and fills (Step 5, NOT consensus, not in STATE_FIELDS): a copy starts empty, so
+    // the copy a block produced holds exactly that block's trades; dextrades.js files them at commit.
+    this.dexEvents = [];
     this.rules2Height = RULES_DEFAULTS.RULES_2_HEIGHT;
     this.dexOwnerKey = OWNER_KEY;
 
@@ -328,6 +331,10 @@ class State {
       if (!r.ok) { console.log(chalk.red(`[LEDGER] Rejected ${type}: ${r.why}`)); return false; }
       for (const [a, t, d] of r.deltas) this._setUnits(a, t, d);
       this.dex = r.book;
+      for (const e of r.events) {
+        if (e.kind === 'swap' || e.kind === 'fill') this.dexEvents.push({ event: e, txHash: tx.hash || null, timestamp: Number(tx.timestamp) || null });
+      }
+      if (this.dexEvents.length > 5000) this.dexEvents.splice(0, this.dexEvents.length - 5000);
       return true;
     }
 

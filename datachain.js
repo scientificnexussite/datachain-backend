@@ -12,6 +12,7 @@ import State from './state.js';
 // this node applies them on every path that accepts a block.
 import * as txrules from './txrules.js';
 import { cloneState, txFromRow, blocksFromRows, filterCandidates, verifyBranch } from './chain-rules.js';
+import { recordBlockTrades } from './dextrades.js';      // Step 5: each block's market trades
 import config from './config.json' with { type: "json" };
 import pool from './db.js'; 
 import { Worker } from 'worker_threads'; 
@@ -774,6 +775,7 @@ class DataChain {
     this.chain.push(newBlock);
     this.blockCount++;
     this.state = tempState;
+    recordBlockTrades(newBlock.index, this.state);          // Step 5: this block's market trades (dextrades.js)
     this._indexBlock(newBlock);
     
     this.adjustDifficulty();

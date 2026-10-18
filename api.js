@@ -21,6 +21,10 @@ import State from './state.js';
 import * as txrules from './txrules.js';
 import { checkBlockOn } from './chain-rules.js';
 import { admitSigned, txStatus } from './relay.js';   // Step 3: the relay of browser-signed transactions
+// Step 5: the on-chain trading read routes — the same views the exe uses, the same shapes.
+import * as dexview from './dexview.js';
+import { DEX } from './dex.js';
+import { recordBlockTrades, recentTrades, loadRecentTrades } from './dextrades.js';
 import menuBook, { processReferralBonus } from './menubook.js'; // IMPROVEMENT 4 Ã¢â‚¬â€ static import
 import { initP2P, broadcastP2P } from './p2p.js';
 import config from './config.json' with { type: 'json' };
@@ -1218,8 +1222,62 @@ app.post('/alert/email', async (req, res) => {
 });
 
 // Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ Menu Book Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+// ── Step 5: ON-CHAIN TRADING read routes (twin of Exe local-api; both answer through dexview.js) ──
+const dexHeight = () => nexusChain.blockCount;                       // the next block's index
+const dexBook = () => (nexusChain.state && nexusChain.state.dex) || null;
+const dexActive = () => !!(nexusChain.state && typeof nexusChain.state._rules2 === 'function' && nexusChain.state._rules2(dexHeight()));
+loadRecentTrades().catch(() => {});
+app.get('/dex/status', (req, res) => {
+    const h = nexusChain.state && nexusChain.state.rules2Height;
+    res.json({ active: dexActive(), nextHeight: dexHeight(), rules2Height: Number.isSafeInteger(h) && h < Number.MAX_SAFE_INTEGER ? h : null,
+               markets: Object.keys((dexBook() || { pools: {} }).pools).length, fee: DEX.FEE_BPS / 10000 });
+});
+app.get('/dex/pools', (req, res) => res.json({ height: dexHeight(), pools: dexview.poolsView(dexBook()) }));
+app.get('/dex/pool/:token', (req, res) => {
+    const p = dexview.poolView(dexBook(), String(req.params.token).toUpperCase());
+    if (!p) return res.status(404).json({ success: false, code: 'no-market', message: 'This token has no on-chain market yet.' });
+    res.json(Object.assign({ height: dexHeight() }, p));
+});
+app.get('/dex/book/:token', (req, res) => {
+    const levels = Math.min(Math.max(1, parseInt(req.query.levels, 10) || 20), 100);
+    res.json(Object.assign({ height: dexHeight() }, dexview.bookView(dexBook(), String(req.params.token).toUpperCase(), { maxLevels: levels })));
+});
+app.get('/dex/orders/:address', (req, res) => {
+    const address = String(req.params.address || '');
+    res.json({ address, height: dexHeight(), orders: dexview.ordersOf(dexBook(), address) });
+});
+app.get('/dex/order/:id', (req, res) => {
+    const id = String(req.params.id || '').toLowerCase();
+    if (!/^[0-9a-f]{64}$/.test(id)) return res.status(400).json({ success: false, message: 'Not an order id.' });
+    const o = dexview.findOrder(dexBook(), id);
+    if (!o) return res.status(404).json({ success: false, code: 'no-such-order', message: 'No open order with this id (filled, cancelled, expired, or not mined yet).' });
+    res.json(o);
+});
+app.get('/dex/trades/:token', (req, res) => {
+    const token = String(req.params.token).toUpperCase();
+    res.json({ token, trades: recentTrades(token, parseInt(req.query.limit, 10) || 50).map(r => dexview.tradeView(r.event, { txHash: r.txHash, timestamp: r.timestamp })) });
+});
+app.get('/dex/quote', (req, res) => {
+    const q = dexview.quote(dexBook(), {
+        token: String(req.query.token || '').toUpperCase(), side: String(req.query.side || '').toLowerCase(),
+        amount: Number(req.query.amount), height: dexHeight(),
+        slippageBps: req.query.slippageBps === undefined ? 100 : Number(req.query.slippageBps),
+        deadlineBlocks: req.query.deadlineBlocks === undefined ? 30 : Number(req.query.deadlineBlocks) });
+    res.status(q.ok ? 200 : 400).json(Object.assign({ active: dexActive() }, q));
+});
+app.get('/dex/sdtx', (req, res) => res.json(dexview.sdtxView(dexBook(), { height: dexHeight() })));
+app.get('/dex/ticker/:ticker', (req, res) => {
+    const t = dexview.tickerView(dexBook(), String(req.params.ticker).toUpperCase());
+    if (!t) return res.status(404).json({ success: false, code: 'unknown-token', message: 'Not in the ticker book.' });
+    res.json(t);
+});
+
 app.get('/menubook', async (req, res) => {
     const token = req.query.token || 'SYR';
+    // Step 5: a token with an ON-CHAIN market is served from the chain's book (the exe's shape);
+    // the legacy menu book below answers only for tokens without one.
+    const onChain = dexview.poolView(dexBook(), String(token).toUpperCase());
+    if (onChain) return res.json(dexview.menubookView(dexBook(), String(token).toUpperCase()));
     await menuBook.ensureLoaded();
     const now = Date.now();
     const cached = apiCache.menubook.get(token);
@@ -6693,6 +6751,7 @@ app.get('/p2p/my-trades', readLimiter, requireWeb3Auth, async (req, res) => {
                     checked.errors.map(e => (e.index >= 0 ? `tx ${e.index}: ` : '') + e.why).join('; ') });
             }
             nexusChain.state = checked.state;
+            recordBlockTrades(block.index, nexusChain.state);       // Step 5: this block's market trades
 
             nexusChain.chain.push(block);
             nexusChain.blockCount = nexusChain.chain.length;

@@ -64,10 +64,10 @@ import { DEX, DEX_TYPES, dexShapeWhy, deployShapeWhy } from './dex.js';
 export const RULES_1_HEIGHT = 1200;
 
 // ON-CHAIN TRADING (seven-phase plan Step 4, dex.js): the trading types, the RULES_2 deploy rules
-// and the end of LIQUIDITY_INIT / LIQUIDITY_DEPOSIT. DORMANT: a sentinel until the owner confirms
-// the height (Step 6) — at least 2,000 blocks above the chain then, after node1 and every exe run
-// this build. Tests switch it on through ctx.params.RULES_2_HEIGHT (and the ledgers' rules2Height).
-export const RULES_2_HEIGHT = Number.MAX_SAFE_INTEGER;
+// and the end of LIQUIDITY_INIT / LIQUIDITY_DEPOSIT. Owner's choice 2026-10-18: block 4,000 (the
+// chain was at 1,705; at least 2,000 blocks of notice). Every node must run this build before it.
+// Tests may still move it through ctx.params.RULES_2_HEIGHT (and the ledgers' rules2Height).
+export const RULES_2_HEIGHT = 4000;
 
 export const RULES_DEFAULTS = {
     MINER_REWARD: 2,                       // datachain.js / Exe chain.js: flat 2 SYR to the miner

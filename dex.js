@@ -232,6 +232,27 @@ export function emptyBook() {
 
 const clone = (b) => JSON.parse(JSON.stringify(b));
 
+// COPY-ON-WRITE (2026-10-18). A transaction copies only what it changes and SHARES the rest with the
+// book it was given, so its cost no longer grows with the whole history (refs, every market's
+// orders). The rule that makes sharing safe: nothing here mutates an object it did not copy first.
+// Ledgers rely on it — Exe/core/state-db.js keeps earlier books BY REFERENCE (block journal, dry
+// runs) — and tests/dex-engine.test.js checks the input book is byte-identical after every call.
+function cow(book) {
+    return Object.assign({}, book, { pools: Object.assign({}, book.pools), orders: Object.assign({}, book.orders),
+        tickers: Object.assign({}, book.tickers), netFees: Object.assign({}, book.netFees),
+        sdtx: Object.assign({}, book.sdtx), issuers: Object.assign({}, book.issuers) });
+}
+/** Take a private copy of one token's market and orders before changing them. */
+function ownToken(book, T) {
+    if (book.pools[T]) book.pools[T] = Object.assign({}, book.pools[T]);
+    book.orders[T] = (book.orders[T] || []).map(o => Object.assign({}, o));
+}
+/** …of one issuer key's record (its window log included). */
+function ownIssuer(book, key) {
+    const i = key ? book.issuers[key] : null;
+    if (i) book.issuers[key] = Object.assign({}, i, { log: i.log.map(e => e.slice()) });
+}
+
 /** A book as stored by a ledger (a JSON string, an object, or nothing yet). */
 export function readBook(stored) {
     if (!stored) return emptyBook();
@@ -372,8 +393,10 @@ function authIssuer(book, ctx) {
 
 const HANDLERS = {
     SWAP(book, tx, ctx, out) {
-        const T = tx.tokenSymbol, pool = book.pools[T];
-        if (!pool) return `${T} has no market yet`;
+        const T = tx.tokenSymbol;
+        if (!book.pools[T]) return `${T} has no market yet`;
+        ownToken(book, T);
+        const pool = book.pools[T];
         if (ctx.height > tx.deadline) return 'the swap’s deadline has passed';
         expireOrders(book, T, ctx.height, out);
         const g = toUnits(tx.amount), minOut = toUnits(tx.minOut || 0);
@@ -410,6 +433,7 @@ const HANDLERS = {
         if (!(tx.expiry >= ctx.height && tx.expiry <= ctx.height + DEX.MAX_EXPIRY_BLOCKS)) {
             return `the expiry must be a block from ${ctx.height} to ${ctx.height + DEX.MAX_EXPIRY_BLOCKS}`;
         }
+        ownToken(book, T);
         expireOrders(book, T, ctx.height, out);
         const all = Object.values(book.orders).reduce((n, l) => n + l.filter(o => o.owner === tx.from).length, 0);
         if (all >= DEX.MAX_ORDERS_PER_ADDRESS) return `at most ${DEX.MAX_ORDERS_PER_ADDRESS} open orders per address`;
@@ -429,7 +453,8 @@ const HANDLERS = {
 
     ORDER_CANCEL(book, tx, ctx, out) {
         const T = tx.tokenSymbol;
-        const o = (book.orders[T] || []).find(x => x.id === tx.orderId);
+        ownToken(book, T);
+        const o = book.orders[T].find(x => x.id === tx.orderId);
         if (!o) return 'no such open order (filled, cancelled or expired)';
         if (o.owner !== tx.from) return 'only the order’s owner can cancel it';
         closeOrder(book, T, o, out);
@@ -458,15 +483,17 @@ const HANDLERS = {
         move(out, source, DEX.POOL, T, tok);
         move(out, tx.from, DEX.POOL, 'SDTX', sdtx);
         book.pools[T] = { tok: tok.toString(), sdtx: sdtx.toString(), virt: virt.toString(), creator: tx.from, at: ctx.height };
-        book.orders[T] = book.orders[T] || [];
+        book.orders[T] = (book.orders[T] || []).slice();
         out.events.push({ kind: 'pool', token: T, sdtx: sdtx.toString(), tokens: tok.toString(), virtual: virt.toString(),
                           price: poolPriceE18(book, T).toString(), by: tx.from, height: ctx.height });
         return null;
     },
 
     POOL_ADD(book, tx, ctx, out) {
-        const T = tx.tokenSymbol, pool = book.pools[T];
-        if (!pool) return `${T} has no market yet`;
+        const T = tx.tokenSymbol;
+        if (!book.pools[T]) return `${T} has no market yet`;
+        ownToken(book, T);
+        const pool = book.pools[T];
         const t = book.tickers[T];
         if (T === 'SYR' ? (!ctx.signerKey || ctx.signerKey !== ctx.ownerKey) : !isCreator(t, tx)) return `only ${T}’s creator can add to its market`;
         expireOrders(book, T, ctx.height, out);
@@ -487,6 +514,7 @@ const HANDLERS = {
     },
 
     SDTX_ISSUE(book, tx, ctx, out) {
+        ownIssuer(book, ctx.signerKey);
         const a = authIssuer(book, ctx);
         if (!a) return 'only the owner key or an appointed issuer key can issue SDTX';
         if (Object.prototype.hasOwnProperty.call(book.sdtx.refs, tx.ref)) return `payment ${tx.ref} was already issued`;
@@ -497,7 +525,7 @@ const HANDLERS = {
             if (used + amt > units(a.iss.cap)) return `over this issuer key’s cap: ${fromUnits(units(a.iss.cap) - used)} SDTX left in the last ${DEX.ISSUER_WINDOW} blocks`;
             a.iss.log.push([ctx.height, amt.toString()]);
         }
-        book.sdtx.refs[tx.ref] = ctx.height;
+        book.sdtx.refs = Object.assign({}, book.sdtx.refs, { [tx.ref]: ctx.height });
         book.sdtx.issued = (units(book.sdtx.issued) + amt).toString();
         out.deltas.push([tx.to, 'SDTX', amt]);
         out.events.push({ kind: 'issue', token: 'SDTX', sdtx: amt.toString(), to: tx.to, ref: tx.ref, by: tx.from, height: ctx.height });
@@ -509,7 +537,7 @@ const HANDLERS = {
         if (Object.prototype.hasOwnProperty.call(book.sdtx.burnRefs, tx.ref)) return `payout ${tx.ref} was already burned`;
         const amt = toUnits(tx.amount);
         if (ctxHave(ctx, out, tx.from, 'SDTX') < amt) return `insufficient SDTX: needs ${fromUnits(amt)}`;
-        book.sdtx.burnRefs[tx.ref] = ctx.height;
+        book.sdtx.burnRefs = Object.assign({}, book.sdtx.burnRefs, { [tx.ref]: ctx.height });
         book.sdtx.burned = (units(book.sdtx.burned) + amt).toString();
         out.deltas.push([tx.from, 'SDTX', -amt]);
         out.events.push({ kind: 'burn', token: 'SDTX', sdtx: amt.toString(), ref: tx.ref, by: tx.from, height: ctx.height });
@@ -520,12 +548,13 @@ const HANDLERS = {
         if (!ctx.signerKey || ctx.signerKey !== ctx.ownerKey) return 'only the owner key appoints an issuer key';
         if (tx.key === ctx.ownerKey) return 'the owner key needs no appointment';
         const prev = book.issuers[tx.key];
-        book.issuers[tx.key] = { cap: toUnits(tx.dailyCap).toString(), since: ctx.height, revoked: null, log: prev ? prev.log : [] };
+        book.issuers[tx.key] = { cap: toUnits(tx.dailyCap).toString(), since: ctx.height, revoked: null, log: prev ? prev.log.map(e => e.slice()) : [] };
         return null;
     },
 
     ISSUER_REVOKE(book, tx, ctx) {
         if (!ctx.signerKey || ctx.signerKey !== ctx.ownerKey) return 'only the owner key revokes an issuer key';
+        ownIssuer(book, tx.key);
         const iss = book.issuers[tx.key];
         if (!iss || iss.revoked !== null) return 'this key is not an active issuer';
         iss.revoked = ctx.height;
@@ -556,7 +585,7 @@ const HANDLERS = {
 export function applyDexTx(book, tx, ctx) {
     const handler = tx && HANDLERS[tx.type];
     if (!handler) return { ok: false, why: 'not a trading transaction' };
-    const b = clone(book);
+    const b = cow(book);
     const out = { deltas: [], events: [] };
     let why;
     try { why = handler(b, tx, ctx, out); } catch (e) { why = 'malformed: ' + e.message; }
@@ -574,7 +603,7 @@ export function applyDexTx(book, tx, ctx) {
  *          fees: [payer, token, units, to]; `to` 'system' means destroyed.
  */
 export function applyDeploy(book, tx, ctx, { rules2 = false } = {}) {
-    const b = clone(book);
+    const b = cow(book);
     const T = String(tx.tokenSymbol || '');
     const meta = (tx.token && typeof tx.token === 'object') ? tx.token : {};
     const chain = String(meta.chain || '').toLowerCase() === 'openchain' ? 'openchain' : 'delchain';

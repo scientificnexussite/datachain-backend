@@ -7,6 +7,7 @@ import chalk from 'chalk';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import crypto from 'crypto';
+import dns from 'dns';
 import fs from 'fs';
 import path from 'path';
 import { createServer } from 'http';
@@ -1270,6 +1271,21 @@ app.get('/dex/ticker/:ticker', (req, res) => {
     const t = dexview.tickerView(dexBook(), String(req.params.ticker).toUpperCase());
     if (!t) return res.status(404).json({ success: false, code: 'unknown-token', message: 'Not in the ticker book.' });
     res.json(t);
+});
+// Step 7: the deploy wizards. Every coin the ticker book knows (OpenChain's network list:
+// ?chain=delchain), and what a deploy costs at the next block (the engine's own fee).
+app.get('/dex/tickers', (req, res) => {
+    const b = dexBook(), chain = String(req.query.chain || '').toLowerCase();
+    const tickers = Object.keys((b && b.tickers) || {}).sort().map(t => dexview.tickerView(b, t)).filter(t => !chain || t.chain === chain);
+    res.json({ height: dexHeight(), tickers });
+});
+app.get('/dex/deploy-fee', (req, res) => {
+    const b = dexBook();
+    if (!b) return res.status(503).json({ success: false, message: 'This node has not built its trading book yet.' });
+    const chain = String(req.query.chain || '').toLowerCase() === 'openchain' ? 'openchain' : 'delchain';
+    const parent = req.query.parent ? String(req.query.parent).toUpperCase() : null;
+    const q = dexview.deployFeeQuote(b, { chain, parent, height: dexHeight() });
+    res.status(q.ok ? 200 : 400).json(Object.assign({ active: dexActive(), chain, parent }, q));
 });
 
 app.get('/menubook', async (req, res) => {
@@ -2961,6 +2977,77 @@ app.post('/api/tx/submit', relayLimiter, async (req, res) => {
 app.get('/api/tx/:hash/status', async (req, res) => {
     const s = await txStatus(req.params.hash, { nexusChain });
     res.status(s.status === 'invalid' ? 400 : 200).json(s);
+});
+
+// ── Step 7 (2026-10-21): DNS proof of a DelChain website for a BROWSER wallet ───────────────
+// The twin of Exe local-api /api/token/domain-challenge + /api/token/verify-domain. The TXT record
+// _syrpts-verify.<domain> = datachain-verify=<address> IS the proof (it names the wallet), so a caller
+// can only make this node look it up. A proof is kept per (wallet, domain) in domain_verifications,
+// which relay.js reads before relaying the deploy.
+const claimedAddress = (a) => {
+    const s = String(a || '').trim();
+    return /^(nx_[0-9a-f]{40}|nx_[A-Za-z0-9]{39}|MFkw[A-Za-z0-9+/=]{20,120})$/.test(s) ? s : '';
+};
+const bareHostname = (raw) => {
+    const s = String(raw || '').trim();
+    if (!s) return '';
+    try {
+        const h = new URL(/^https?:\/\//i.test(s) ? s : 'https://' + s).hostname.toLowerCase();
+        return /^[a-z0-9.-]+\.[a-z]{2,}$/.test(h) ? h : '';
+    } catch (e) { return ''; }
+};
+async function domainProvenFor(uid, domain) {
+    try {
+        const r = await pool.query(`SELECT website_url FROM domain_verifications WHERE uid = $1 AND status IN ('verified', 'used')`, [uid]);
+        return r.rows.some(row => bareHostname(row.website_url) === domain);
+    } catch (e) { return false; }
+}
+const tickerCreator = (ticker) => { const b = dexBook(); const t = b && b.tickers && b.tickers[ticker]; return t ? t.creator : ''; };
+app.get('/api/token/domain-challenge/:ticker', async (req, res) => {
+    const ticker = String(req.params.ticker || '').toUpperCase();
+    const creator = tickerCreator(ticker) || claimedAddress(req.query.address);
+    if (!creator) return res.status(400).json({ success: false, message: 'Say which wallet will create the token: ?address=nx_…' });
+    const domain = bareHostname(req.query.domain);
+    if (!domain) return res.status(400).json({ success: false, message: 'Say which domain you are claiming: ?domain=example.com' });
+    res.json({ success: true, ticker, domain, exists: !!tickerCreator(ticker), record: '_syrpts-verify.' + domain, type: 'TXT',
+               value: 'datachain-verify=' + creator, verified: await domainProvenFor(creator, domain),
+               instructions: 'Add this TXT record at your DNS provider, then POST /api/token/verify-domain with ' +
+                             `{"ticker":"${ticker}","domain":"${domain}","address":"${creator}"}. DNS can take a few minutes to propagate.` });
+});
+const domainHits = new Map();
+app.post('/api/token/verify-domain', async (req, res) => {
+    const ip = String(req.ip || (req.socket && req.socket.remoteAddress) || '');
+    const now = Date.now();
+    const hits = (domainHits.get(ip) || []).filter(t => now - t < 10 * 60 * 1000);
+    if (hits.length >= 20) return res.status(429).json({ success: false, message: 'Too many checks from this address. Try again in a few minutes.' });
+    hits.push(now); domainHits.set(ip, hits);
+    if (domainHits.size > 5000) domainHits.clear();
+    const b = req.body || {};
+    const ticker = String(b.ticker || '').toUpperCase();
+    const creator = tickerCreator(ticker) || claimedAddress(b.address);
+    if (!creator) return res.status(400).json({ success: false, message: 'Send the wallet that will create the token: {"address":"nx_…"}' });
+    const domain = bareHostname(b.domain);
+    if (!domain) return res.status(400).json({ success: false, message: 'Send the domain you are claiming, for example {"domain":"example.com"}.' });
+    const record = '_syrpts-verify.' + domain, expected = 'datachain-verify=' + creator;
+    let found = [];
+    try { found = (await dns.promises.resolveTxt(record)).map(r => (Array.isArray(r) ? r.join('') : String(r))); }
+    catch (e) {
+        const missing = e.code === 'ENOTFOUND' || e.code === 'ENODATA';
+        return res.json({ success: false, verified: false, domain, record, expected, found: [],
+                          message: missing ? `No ${record} TXT record found yet. DNS changes can take a few minutes.` : 'Could not check DNS: ' + e.message });
+    }
+    if (!found.some(v => v.trim() === expected)) {
+        return res.json({ success: false, verified: false, domain, record, expected, found,
+                          message: `The record ${record} does not contain "${expected}". It must name the wallet that will create the token, exactly.` });
+    }
+    try {
+        if (!(await domainProvenFor(creator, domain))) {
+            await pool.query(`INSERT INTO domain_verifications (uid, website_url, verification_key, status, created_at, verified_at) VALUES ($1, $2, $3, 'verified', $4, $4)`,
+                             [creator, domain, 'dns-txt', now]);
+        }
+    } catch (e) { return res.status(500).json({ success: false, message: 'Verified, but this node could not record it.' }); }
+    res.json({ success: true, verified: true, domain, creator, exists: !!tickerCreator(ticker),
+               message: `${domain} is verified for this wallet. You can now create ${ticker || 'a DelChain token'} on it.` });
 });
 
 app.post('/tx/new', txLimiter, requireWeb3Auth, async (req, res) => {

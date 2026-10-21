@@ -564,6 +564,10 @@ class State {
           // encoded and every reader would find `website` undefined.
           logo: typeof meta.logo === 'string' ? meta.logo : null,
           website: typeof meta.website === 'string' ? meta.website : null,
+          // What the coin is for, as the deploy wizard said (Step 7): website / android / ios /
+          // steam / standalone, and its store or download page. Display only; the twin of state-db.
+          platformType: ['website', 'android', 'ios', 'steam', 'standalone'].includes(meta.platformType) ? meta.platformType : 'website',
+          storeUrl: typeof meta.storeUrl === 'string' && /^https:\/\/[^\s"'<>]{3,300}$/.test(meta.storeUrl) ? meta.storeUrl : null,
           // Recorded but NOT trusted: a domain counts as verified only once a proof has
           // been checked, and DNS can change after the fact — so the flag is never written
           // to the chain, it is re-derived locally. See local-api /api/token/verify-domain.
